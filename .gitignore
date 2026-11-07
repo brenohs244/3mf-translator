@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.superpowers/
+.ua/
+graphify-out/
+build/
+dist/
+*.spec
+*.3mf
+*.gcode
+*.log
+*.tmp
+

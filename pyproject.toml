@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maker-elegoo"
+version = "0.1.0"
+description = "Conversor local de projetos MakerWorld para ELEGOO Slicer"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+maker-elegoo = "maker_elegoo.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
