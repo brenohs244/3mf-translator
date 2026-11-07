@@ -6,9 +6,11 @@ import queue
 import subprocess
 import threading
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
+from .ai import Suggestion, apply_suggestions, suggest_equivalences
 from .converter import ConversionResult, convert_project
 from .mapping import ConversionPlan, build_conversion
 from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles
@@ -64,10 +66,13 @@ class MakerElegooApp(tk.Tk):
         self.project: ProjectInfo | None = None
         self.install: SlicerInstall | None = None
         self.result: ConversionResult | None = None
+        self.last_plan: ConversionPlan | None = None
+        self.ai_approved: list[Suggestion] = []
         self.process_profiles: list[Profile] = []
         self.filament_profiles: list[Profile] = []
         self.filament_vars: list[tk.StringVar] = []
         self.worker_queue: queue.Queue = queue.Queue()
+        self.ai_queue: queue.Queue = queue.Queue()
 
         self.file_var = tk.StringVar()
         self.nozzle_var = tk.StringVar(value=self.preferences["nozzle"])
@@ -75,8 +80,10 @@ class MakerElegooApp(tk.Tk):
         self.status_var = tk.StringVar(value="Selecione um projeto 3MF para começar")
         self._build_layout()
         self.nozzle_var.trace_add("write", lambda *_: self._refresh_profiles())
+        self.process_var.trace_add("write", lambda *_: self._clear_ai_approval())
         self._refresh_profiles()
         self.after(150, self._poll_worker)
+        self.after(150, self._poll_ai)
 
     def _build_layout(self):
         outer = ttk.Frame(self, padding=18)
@@ -111,6 +118,8 @@ class MakerElegooApp(tk.Tk):
         self.convert_button.pack(side="left")
         self.open_button = ttk.Button(actions, text="Abrir no ELEGOO Slicer", command=self._open_result, state="disabled")
         self.open_button.pack(side="left", padx=(10, 0))
+        self.ai_button = ttk.Button(actions, text="Analisar com IA (opcional)", command=self._analyze_ai, state="disabled")
+        self.ai_button.pack(side="left", padx=(10, 0))
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
 
         report_frame = ttk.LabelFrame(outer, text="3  Análise e relatório", padding=8)
@@ -137,6 +146,7 @@ class MakerElegooApp(tk.Tk):
             self._refresh_profiles()
 
     def _refresh_profiles(self):
+        self._clear_ai_approval()
         try:
             custom = self.preferences.get("slicer_exe")
             self.install = discover_slicer(executable=Path(custom) if custom else None)
@@ -164,6 +174,11 @@ class MakerElegooApp(tk.Tk):
     def _inspect_file(self):
         try:
             self.project = inspect_project(Path(self.file_var.get()))
+            self.result = None
+            self.last_plan = None
+            self._clear_ai_approval()
+            self.ai_button.configure(state="disabled")
+            self.open_button.configure(state="disabled")
             self._set_report(format_project_summary(self.project))
             self._render_filaments()
             self.status_var.set("Projeto analisado")
@@ -212,21 +227,27 @@ class MakerElegooApp(tk.Tk):
             messagebox.showerror("Perfil ausente", "Escolha um processo e um perfil para cada filamento.")
             return
         self.convert_button.configure(state="disabled")
+        self.ai_button.configure(state="disabled")
         self.status_var.set("Convertendo e fatiando... pode levar alguns minutos")
+        project = self.project
+        install = self.install
+        approved = tuple(self.ai_approved)
 
         def work():
             try:
-                plan = build_conversion(self.project, self.install, machine, process, filaments)
-                result = convert_project(self.project, plan, Path(destination), SlicerCLI(self.install.executable))
-                self.worker_queue.put((result, plan, None))
+                plan = build_conversion(project, install, machine, process, filaments)
+                if approved:
+                    plan = replace(plan, process_settings=apply_suggestions(plan.process_settings, list(approved)))
+                result = convert_project(project, plan, Path(destination), SlicerCLI(install.executable))
+                self.worker_queue.put((result, plan, approved, None))
             except Exception as exc:
-                self.worker_queue.put((None, None, exc))
+                self.worker_queue.put((None, None, approved, exc))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _poll_worker(self):
         try:
-            result, plan, error = self.worker_queue.get_nowait()
+            result, plan, approved, error = self.worker_queue.get_nowait()
         except queue.Empty:
             pass
         else:
@@ -236,11 +257,94 @@ class MakerElegooApp(tk.Tk):
                 self._set_report(str(error))
             else:
                 self.result = result
-                self._set_report(format_conversion_report(result, plan))
+                self.last_plan = plan
+                report = format_conversion_report(result, plan)
+                if approved:
+                    report += "\n\nSugestões IA aprovadas e aplicadas:\n" + "\n".join(
+                        f"  • {item.target_key} = {item.value}: {item.reason}" for item in approved)
+                self._set_report(report)
                 self.status_var.set("Concluído" if result.success else "Falha; confira o relatório")
                 if result.destination.exists():
                     self.open_button.configure(state="normal")
+                if result.output_project:
+                    self.ai_button.configure(state="normal")
         self.after(150, self._poll_worker)
+
+    def _clear_ai_approval(self):
+        self.ai_approved = []
+
+    def _analyze_ai(self):
+        if not self.result or not self.last_plan or not self.result.output_project:
+            messagebox.showinfo("IA opcional", "Converta o projeto uma vez antes de analisar campos não traduzidos.")
+            return
+        key = simpledialog.askstring("Gemini", "Chave de API Gemini (não será salva):", show="*", parent=self)
+        if not key:
+            return
+        consent = messagebox.askyesno(
+            "Autorizar envio ao Gemini",
+            "Enviar até 30 nomes e valores curtos de configurações ao Gemini?\n\n"
+            "O arquivo 3MF, a malha e o G-code não serão enviados. A camada gratuita do Gemini "
+            "pode usar os dados enviados para melhorar os serviços do Google.", parent=self)
+        if not consent:
+            return
+        self.ai_button.configure(state="disabled")
+        self.status_var.set("Consultando Gemini...")
+        unmapped = dict(self.result.unmapped)
+        target = dict(self.last_plan.process_settings)
+        context = {name: self.project.source_settings.get(name) for name in
+                   ("printer_model", "filament_type", "nozzle_diameter")}
+
+        def work():
+            try:
+                suggestions = suggest_equivalences(unmapped, target, context, key)
+                self.ai_queue.put((suggestions, None))
+            except Exception as exc:
+                self.ai_queue.put((None, exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_ai(self):
+        try:
+            suggestions, error = self.ai_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self.ai_button.configure(state="normal")
+            if error:
+                self.status_var.set("IA indisponível")
+                messagebox.showerror("Gemini", str(error))
+            elif not suggestions:
+                self.status_var.set("Nenhuma equivalência segura encontrada")
+                messagebox.showinfo("Gemini", "Nenhuma sugestão passou pela validação de segurança e compatibilidade.")
+            else:
+                self._review_suggestions(suggestions)
+        self.after(150, self._poll_ai)
+
+    def _review_suggestions(self, suggestions: list[Suggestion]):
+        dialog = tk.Toplevel(self)
+        dialog.title("Revisar sugestões do Gemini")
+        dialog.geometry("780x470")
+        dialog.transient(self)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Selecione somente as sugestões que deseja aplicar na próxima exportação.",
+                  wraplength=720).pack(anchor="w", pady=(0, 10))
+        listing = tk.Listbox(frame, selectmode="multiple", font=("Consolas", 10))
+        listing.pack(fill="both", expand=True)
+        for item in suggestions:
+            label = "Equivalência" if item.kind == "mapping" else "Recurso ELEGOO"
+            listing.insert("end", f"{label}: {item.source_key or 'extra'} → {item.target_key} = {item.value} [{item.confidence}] — {item.reason}")
+
+        def approve():
+            self.ai_approved = [suggestions[index] for index in listing.curselection()]
+            self.status_var.set(f"{len(self.ai_approved)} sugestões aprovadas; converta novamente para aplicá-las")
+            dialog.destroy()
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="Aplicar selecionadas na próxima conversão", command=approve).pack(side="left")
+        ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="right")
 
     def _open_result(self):
         if self.result and self.result.destination.exists() and self.install:
