@@ -1,0 +1,34 @@
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from maker_elegoo.settings import load_settings, save_settings, settings_path
+
+
+class SettingsTests(unittest.TestCase):
+    def test_configuration_directory_can_be_overridden_for_portable_use(self):
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"MAKER_ELEGOO_CONFIG_DIR": directory}):
+            self.assertEqual(settings_path(), Path(directory) / "settings.json")
+
+    def test_saves_preferences_but_never_api_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "prefs.json"
+            save_settings({"nozzle": "0.8", "last_dir": "C:/models", "api_key": "SECRET"}, path)
+            raw = path.read_text(encoding="utf-8")
+            settings = load_settings(path)
+        self.assertNotIn("SECRET", raw)
+        self.assertEqual(settings["nozzle"], "0.8")
+        self.assertEqual(settings["last_dir"], "C:/models")
+
+    def test_invalid_json_returns_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "prefs.json"
+            path.write_text("broken", encoding="utf-8")
+            settings = load_settings(path)
+        self.assertEqual(settings["nozzle"], "0.4")
