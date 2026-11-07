@@ -40,7 +40,7 @@ def format_conversion_report(result: ConversionResult, plan: ConversionPlan) -> 
     lines.extend(["", f"Parâmetros de processo transferidos: {len(plan.transferred)}",
                   f"Campos sem equivalência confirmada: {len(result.unmapped)}"])
     if result.geometry:
-        lines.append("Malhas: " + ("iguais na comparação geométrica" if result.geometry.unchanged
+        lines.append("Malhas: " + ("preservadas (tolerância de 0,0001 mm)" if result.geometry.unchanged
                                      else "diferenças detectadas; confira antes de imprimir"))
     if result.validation:
         lines.append(f"Fatiamento: {result.validation.plate_count} placas verificadas")

@@ -62,9 +62,59 @@ def _geometry_hashes(path: Path) -> dict[str, str]:
     return result
 
 
+def _mesh_shapes(path: Path) -> list[tuple[list[tuple[float, float, float]], str]]:
+    """Read mesh coordinates for the slicer's tiny floating point rewrites."""
+    shapes = []
+    with ZipFile(path) as archive:
+        for name in archive.namelist():
+            if not (name.startswith("3D/") and name.endswith(".model")):
+                continue
+            vertices: list[tuple[float, float, float]] = []
+            triangles = hashlib.sha256()
+            triangle_count = 0
+            with archive.open(name) as stream:
+                for _, element in ElementTree.iterparse(stream, events=("end",)):
+                    tag = element.tag.rsplit("}", 1)[-1]
+                    if tag == "vertex":
+                        vertices.append(tuple(float(element.get(axis, "nan"))
+                                              for axis in ("x", "y", "z")))
+                    elif tag == "triangle":
+                        indices = tuple(int(element.get(key, "-1"))
+                                        for key in ("v1", "v2", "v3"))
+                        triangles.update(f"{indices[0]},{indices[1]},{indices[2]};".encode())
+                        triangle_count += 1
+                    element.clear()
+            if vertices or triangle_count:
+                shapes.append((vertices, triangles.hexdigest()))
+    return shapes
+
+
+def _same_meshes_within_tolerance(source: Path, target: Path,
+                                  tolerance: float = 0.0001) -> bool:
+    try:
+        before = _mesh_shapes(source)
+        after = _mesh_shapes(target)
+    except (ElementTree.ParseError, ValueError, OverflowError):
+        return False
+    if len(before) != len(after) or not before:
+        return False
+    remaining = list(after)
+    for vertices, triangles in before:
+        match = next((index for index, (candidate, digest) in enumerate(remaining)
+                      if digest == triangles and len(candidate) == len(vertices)
+                      and all(abs(a - b) <= tolerance
+                              for left, right in zip(vertices, candidate)
+                              for a, b in zip(left, right))), None)
+        if match is None:
+            return False
+        remaining.pop(match)
+    return True
+
+
 def compare_geometry(source: Path, target: Path) -> GeometryComparison:
     before, after = _geometry_hashes(source), _geometry_hashes(target)
-    if Counter(before.values()) == Counter(after.values()):
+    if (Counter(before.values()) == Counter(after.values())
+            or _same_meshes_within_tolerance(source, target)):
         return GeometryComparison(True, ())
     changed = tuple(sorted(name for name in before.keys() | after.keys()
                            if before.get(name) != after.get(name)))
@@ -92,5 +142,9 @@ def convert_project(project: ProjectInfo, plan: ConversionPlan, destination: Pat
     validation = slicer.validate(exported.destination, len(output.plates))
     unmapped = {key: value for key, value in project.source_settings.items()
                 if key not in output.source_settings}
-    return ConversionResult(validation.success, exported.destination, validation.message,
+    success = validation.success and geometry.unchanged
+    message = validation.message if geometry.unchanged else (
+        f"{validation.message}; a geometria mudou durante a exportação"
+    )
+    return ConversionResult(success, exported.destination, message,
                             exported, validation, geometry, output, unmapped)

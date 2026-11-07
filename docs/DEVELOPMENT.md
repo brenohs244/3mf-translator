@@ -1,0 +1,38 @@
+# Desenvolvimento e manutenção
+
+## Executar
+
+No Windows com Python 3.11 ou superior:
+
+```powershell
+$env:PYTHONPATH = 'src'
+python -m maker_elegoo
+python -m unittest discover -s tests -v
+```
+
+O ELEGOO Slicer deve estar instalado e ter os perfis da Centauri Carbon 2. É possível definir `ELEGOO_SLICER_EXE` para um caminho personalizado. Para preferências portáteis, defina `MAKER_ELEGOO_CONFIG_DIR`.
+
+## Distribuir
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python -m pip install pyinstaller
+.\scripts\build.ps1
+python .\scripts\smoke_exe.py
+```
+
+`dist/MakerElegoo.exe` é portátil. `dist/MakerElegoo-Windows.zip` inclui um instalador por usuário (`install.ps1`) e instruções. O executável procura o ELEGOO Slicer no computador de destino; o fatiador não é incluído no pacote.
+
+## Superpowers, Graphify, Understand Anything e Find Skills
+
+- Superpowers: seguir a especificação em `docs/superpowers/specs/` e o plano em `docs/superpowers/plans/`; usar TDD, verificação e revisão antes de declarar compatibilidade.
+- Graphify Local oficial: pacote Python `graphifyy`, comando `graphify`. O projeto contém a habilidade em `.codex/skills/graphify/`; para atualizar o grafo após mudanças, execute `graphify update .`. O resultado local fica em `graphify-out/` e não entra no Git.
+- Understand Anything: execute a habilidade `/understand --language pt-BR` depois de mudanças relevantes. Seu grafo local fica em `.ua/knowledge-graph.json` e pode ser aberto com `/understand-dashboard`. Artefatos gerados não entram no Git.
+- Find Skills: avaliar novas habilidades pela fonte, manutenção e relevância antes de instalar. A primeira busca encontrou o Graphify oficial; não adotamos habilidades genéricas de CAD para substituir a validação no fatiador.
+
+## Limites técnicos
+
+- `--allow-newer-file` permite que a CLI ELEGOO 2.4.2 leia projetos Bambu 2.6, mas alguns valores novos (`raft_first_layer_expansion` e `tree_support_wall_count` iguais a `-1`) precisam ser normalizados em uma cópia temporária. Os originais não são alterados.
+- O perfil ELEGOO define temperatura, limites da máquina e velocidades. Transferimos apenas uma lista explícita de parâmetros de intenção do projeto.
+- A malha é comparada por vértices e triângulos, com tolerância numérica de 0,0001 mm para arredondamentos do fatiador; mudanças maiores bloqueiam o estado de sucesso. O fatiador pode alterar a posição na mesa para caber na Centauri Carbon 2. Confira visualmente cores, suportes e posição antes da impressão.
+- A API Gemini é opcional. Não se envia arquivo, malha ou G-code. O usuário aprova cada sugestão antes da nova exportação, e o fatiamento automático valida o resultado.
