@@ -64,6 +64,51 @@ def apply_suggestions(process_settings: dict, approved: list[Suggestion]) -> dic
     return updated
 
 
+def build_manual_prompt(unmapped: dict, process_settings: dict, context: dict,
+                        priority: str, purpose: str, notes: str) -> str:
+    """Create a text-only prompt that the user may copy into any AI chat."""
+    source, target, safe_context = _safe_inputs(unmapped, process_settings, context)
+    payload = {"source_unmapped": source, "elegoo_safe_process_options": target,
+               "context": safe_context, "priority": priority[:80],
+               "purpose": purpose[:120], "notes": notes[:500]}
+    return ("Analise este projeto 3MF para a ELEGOO Centauri Carbon 2. "
+            "Sugira ajustes para o objetivo informado. Responda APENAS JSON no formato "
+            '{"suggestions":[{"kind":"mapping|feature","source_key":"",'
+            '"target_key":"","value":"","reason":"","confidence":"low|medium|high"}]}. '
+            "Use apenas chaves e valores compatíveis em elegoo_safe_process_options. "
+            "Não sugira G-code, temperatura, firmware ou limites da máquina. "
+            "Para kind=feature, deixe source_key vazio. Se não houver ajuste seguro, retorne lista vazia.\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def parse_manual_response(raw_text: str, unmapped: dict, process_settings: dict) -> list[Suggestion]:
+    """Keep only known, bounded process changes from a pasted AI response."""
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AIError(f"Resposta não é JSON válido: {exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("suggestions"), list):
+        raise AIError("Resposta deve conter uma lista 'suggestions'")
+    accepted = []
+    for item in data["suggestions"][:30]:
+        if not isinstance(item, dict):
+            continue
+        suggestion = Suggestion(*(str(item.get(key, "")) for key in
+                                  ("kind", "source_key", "target_key", "value", "reason", "confidence")))
+        if suggestion.kind == "mapping" and suggestion.source_key not in unmapped:
+            continue
+        if suggestion.kind == "feature" and suggestion.source_key:
+            continue
+        if suggestion.confidence not in {"low", "medium", "high"}:
+            continue
+        if validate_suggestion(suggestion, process_settings):
+            accepted.append(suggestion)
+    return accepted
+
+
 def _safe_inputs(unmapped: dict, elegoo_keys: dict, context: dict) -> tuple[dict, dict, dict]:
     forbidden = ("gcode", "script", "password", "token", "key", "path", "file")
     source = {str(key): str(value) for key, value in sorted(unmapped.items())

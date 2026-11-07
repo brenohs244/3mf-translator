@@ -5,7 +5,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from maker_elegoo.ai import AIError, Suggestion, apply_suggestions, suggest_equivalences, validate_suggestion
+from maker_elegoo.ai import (AIError, Suggestion, apply_suggestions, build_manual_prompt,
+                             parse_manual_response, suggest_equivalences, validate_suggestion)
 
 
 class FakeResponse:
@@ -23,6 +24,24 @@ class FakeResponse:
 
 
 class AITests(unittest.TestCase):
+    def test_manual_prompt_and_response_keep_only_approved_process_fields(self):
+        options = {"wall_loops": "2", "machine_start_gcode": "G28"}
+        prompt = build_manual_prompt({"unknown_wall": "3", "machine_start_gcode": "SECRET"},
+                                     options, {"printer_model": "Bambu Lab P1S", "mesh": "GEOMETRY"},
+                                     "Resistência", "Funcional", "encaixe justo")
+        self.assertIn("Resistência", prompt)
+        self.assertNotIn("SECRET", prompt)
+        self.assertNotIn("GEOMETRY", prompt)
+        response = json.dumps({"suggestions": [
+            {"kind": "mapping", "source_key": "unknown_wall", "target_key": "wall_loops",
+             "value": "4", "reason": "Mais paredes", "confidence": "medium"},
+            {"kind": "feature", "source_key": "", "target_key": "machine_start_gcode",
+             "value": "M500", "reason": "Inseguro", "confidence": "high"},
+            {"kind": "mapping", "source_key": "invented", "target_key": "wall_loops",
+             "value": "5", "reason": "Campo ausente", "confidence": "high"}]})
+        suggestions = parse_manual_response(f"```json\n{response}\n```", {"unknown_wall": "3"}, options)
+        self.assertEqual([(s.target_key, s.value) for s in suggestions], [("wall_loops", "4")])
+
     def test_request_sends_only_short_text_settings_and_parses_json(self):
         captured = {}
 

@@ -12,3 +12,7 @@ Requer Python 3.11 ou superior e ELEGOO Slicer 1.5.3.5 ou versão compatível. E
 
 Os arquivos 3MF do usuário ficam locais e não entram no Git. O aplicativo nunca envia G-code para a impressora.
 
+## Ajuste guiado por IA, sem API
+
+Após a primeira conversão, abra **Ferramentas → Ajuste guiado por IA (sem API)**. Escolha a prioridade e o uso da peça, copie o resumo textual e cole em uma IA de sua preferência. Cole a resposta JSON no aplicativo; ele aceita somente parâmetros de processo presentes no perfil ELEGOO e dentro dos limites permitidos. Revise as sugestões e converta novamente para aplicar e fatiar o resultado. O 3MF, a malha e o G-code não são incluídos no resumo.
+

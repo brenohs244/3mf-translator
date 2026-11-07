@@ -10,7 +10,8 @@ from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
-from .ai import Suggestion, apply_suggestions, suggest_equivalences
+from .ai import (AIError, Suggestion, apply_suggestions, build_manual_prompt,
+                 parse_manual_response, suggest_equivalences)
 from .converter import ConversionResult, convert_project
 from .mapping import ConversionPlan, build_conversion
 from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles
@@ -86,6 +87,11 @@ class MakerElegooApp(tk.Tk):
         self.after(150, self._poll_ai)
 
     def _build_layout(self):
+        menu = tk.Menu(self)
+        tools_menu = tk.Menu(menu, tearoff=False)
+        tools_menu.add_command(label="Ajuste guiado por IA (sem API)", command=self._manual_ai)
+        menu.add_cascade(label="Ferramentas", menu=tools_menu)
+        self.configure(menu=menu)
         outer = ttk.Frame(self, padding=18)
         outer.pack(fill="both", expand=True)
         ttk.Label(outer, text="Maker → ELEGOO", font=("Segoe UI", 20, "bold")).pack(anchor="w")
@@ -272,6 +278,69 @@ class MakerElegooApp(tk.Tk):
 
     def _clear_ai_approval(self):
         self.ai_approved = []
+
+    def _manual_ai(self):
+        if not self.result or not self.last_plan or not self.project:
+            messagebox.showinfo("Ajuste guiado", "Converta o projeto uma vez antes de pedir sugestões.")
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Ajuste guiado por IA · sem chave de API")
+        dialog.geometry("850x680")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Escolha o objetivo, copie o resumo para sua IA e cole a resposta JSON.",
+                  wraplength=780).pack(anchor="w")
+        priority = tk.StringVar(value="Equilibrada")
+        purpose = tk.StringVar(value="Decorativa ou visual")
+        for label, variable, options in (
+            ("Prioridade", priority, ("Equilibrada", "Qualidade visual", "Resistência", "Velocidade", "Menos material")),
+            ("Uso da peça", purpose, ("Decorativa ou visual", "Funcional, uso leve", "Funcional, com esforço mecânico",
+                                      "Protótipo rápido", "Miniatura com muitos detalhes", "Acabamento para venda"))):
+            row = ttk.Frame(frame)
+            row.pack(fill="x", pady=(8, 0))
+            ttk.Label(row, text=label, width=17).pack(side="left")
+            ttk.Combobox(row, textvariable=variable, values=options, state="readonly").pack(side="left", fill="x", expand=True)
+        ttk.Label(frame, text="Observações sobre a peça (opcional)").pack(anchor="w", pady=(8, 0))
+        notes = ttk.Entry(frame)
+        notes.pack(fill="x")
+        ttk.Label(frame, text="Resumo para copiar").pack(anchor="w", pady=(8, 0))
+        prompt_box = scrolledtext.ScrolledText(frame, height=10, wrap="word")
+        prompt_box.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Resposta JSON da IA").pack(anchor="w", pady=(8, 0))
+        response_box = scrolledtext.ScrolledText(frame, height=8, wrap="word")
+        response_box.pack(fill="both", expand=True)
+
+        def make_prompt():
+            context = {key: self.project.source_settings.get(key) for key in
+                       ("printer_model", "filament_type", "nozzle_diameter")}
+            prompt = build_manual_prompt(self.result.unmapped, self.last_plan.process_settings,
+                                         context, priority.get(), purpose.get(), notes.get())
+            prompt_box.delete("1.0", "end")
+            prompt_box.insert("1.0", prompt)
+            self.clipboard_clear()
+            self.clipboard_append(prompt)
+            self.status_var.set("Resumo copiado; cole em sua IA e traga a resposta JSON")
+
+        def review():
+            try:
+                suggestions = parse_manual_response(response_box.get("1.0", "end"),
+                                                    self.result.unmapped, self.last_plan.process_settings)
+            except AIError as exc:
+                messagebox.showerror("Resposta inválida", str(exc), parent=dialog)
+                return
+            if not suggestions:
+                messagebox.showinfo("Sem ajustes aplicáveis", "Nenhuma sugestão passou pelos limites e perfis disponíveis.", parent=dialog)
+                return
+            dialog.destroy()
+            self._review_suggestions(suggestions)
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="Gerar e copiar resumo", command=make_prompt).pack(side="left")
+        ttk.Button(buttons, text="Validar resposta e revisar", command=review).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Fechar", command=dialog.destroy).pack(side="right")
+        make_prompt()
 
     def _analyze_ai(self):
         if not self.result or not self.last_plan or not self.result.output_project:
