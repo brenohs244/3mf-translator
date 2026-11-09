@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .materials import Finding, analyze_material_change
-from .profiles import Profile, SlicerInstall, resolve_profile
+from .profiles import Profile, SlicerInstall, machine_family_names, resolve_profile
 from .project import ProjectInfo
 
 
@@ -60,12 +60,13 @@ def build_conversion(project: ProjectInfo, install: SlicerInstall, machine: Prof
     if machine_settings.get("printer_model") != "Elegoo Centauri Carbon 2":
         raise ValueError("O perfil de máquina não é da Centauri Carbon 2")
     nozzle = str(machine_settings.get("nozzle_diameter", [""])[0])
+    compatible_machines = machine_family_names(machine, install)
     compatible = process_settings.get("compatible_printers", [])
-    if compatible and machine.name not in compatible:
+    if compatible and not compatible_machines.intersection(compatible):
         raise ValueError(f"Processo incompatível com o bico {nozzle}")
     for index, config in enumerate(filament_settings):
         compatible = config.get("compatible_printers", [])
-        if compatible and machine.name not in compatible:
+        if compatible and not compatible_machines.intersection(compatible):
             raise ValueError(f"Filamento {index + 1} incompatível com o bico {nozzle}")
     transferred = {}
     for key in TRANSFERABLE:

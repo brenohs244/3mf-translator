@@ -1,4 +1,5 @@
 import sys
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +12,35 @@ from maker_elegoo.project import FilamentInfo, PlateInfo, ProjectInfo
 
 
 class MappingTests(unittest.TestCase):
+    def test_custom_machine_accepts_profiles_compatible_with_its_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base_name = "Elegoo Centauri Carbon 2 0.4 nozzle"
+            entries = [
+                ("system/Elegoo/machine/ECC2/base.json", {"type": "machine", "name": base_name,
+                    "printer_model": "Elegoo Centauri Carbon 2", "nozzle_diameter": ["0.4"]}),
+                ("user/default/machine/custom.json", {"name": "PERFECT PET-G", "inherits": base_name}),
+                ("system/Elegoo/process/ECC2/standard.json", {"type": "process", "name": "Standard",
+                    "compatible_printers": [base_name]}),
+                ("user/default/process/custom.json", {"name": "Custom process", "inherits": "Standard"}),
+                ("system/Elegoo/filament/Generic/base.json", {"type": "filament", "name": "Generic PLA",
+                    "filament_type": ["PLA"], "compatible_printers": [base_name]}),
+                ("user/default/filament/custom.json", {"name": "ENDER PLA", "inherits": "Generic PLA"}),
+            ]
+            for relative, data in entries:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(data), encoding="utf-8")
+            install = SlicerInstall(root / "elegoo-slicer.exe", root)
+            machine = Profile("PERFECT PET-G", "machine", root / entries[1][0], entries[1][1])
+            process = Profile("Custom process", "process", root / entries[3][0], entries[3][1])
+            filament = Profile("ENDER PLA", "filament", root / entries[5][0], entries[5][1])
+            project = ProjectInfo(root / "source.3mf", {},
+                                  (FilamentInfo(1, "PLA", "#fff", ""),), (), (), (), ())
+            plan = build_conversion(project, install, machine, process, [filament])
+            self.assertEqual(plan.machine.name, "PERFECT PET-G")
+            self.assertEqual(plan.machine_settings["nozzle_diameter"], ["0.4"])
+
     def test_preserves_shared_process_choices_but_uses_elegoo_machine_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

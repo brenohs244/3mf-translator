@@ -14,7 +14,7 @@ from .ai import (AIError, Suggestion, apply_suggestions, build_manual_prompt,
                  parse_manual_response, suggest_equivalences)
 from .converter import ConversionResult, convert_project
 from .mapping import ConversionPlan, build_conversion
-from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles
+from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles, resolve_profile
 from .project import ProjectInfo, inspect_project
 from .settings import load_settings, save_settings
 from .slicer import SlicerCLI
@@ -69,6 +69,7 @@ class MakerElegooApp(tk.Tk):
         self.result: ConversionResult | None = None
         self.last_plan: ConversionPlan | None = None
         self.ai_approved: list[Suggestion] = []
+        self.machine_profiles: list[Profile] = []
         self.process_profiles: list[Profile] = []
         self.filament_profiles: list[Profile] = []
         self.filament_vars: list[tk.StringVar] = []
@@ -77,8 +78,10 @@ class MakerElegooApp(tk.Tk):
 
         self.file_var = tk.StringVar()
         self.nozzle_var = tk.StringVar(value=self.preferences["nozzle"])
+        self.machine_var = tk.StringVar(value=self.preferences["machine"])
         self.process_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Selecione um projeto 3MF para começar")
+        self._refreshing_profiles = False
         self._build_layout()
         self.nozzle_var.trace_add("write", lambda *_: self._refresh_profiles())
         self.process_var.trace_add("write", lambda *_: self._clear_ai_approval())
@@ -108,14 +111,19 @@ class MakerElegooApp(tk.Tk):
         target.pack(fill="x", pady=(0, 12))
         target.columnconfigure(1, weight=1)
         ttk.Label(target, text="Bico").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Combobox(target, textvariable=self.nozzle_var, values=("0.2", "0.4", "0.8"),
-                     state="readonly", width=8).grid(row=0, column=1, sticky="w")
-        ttk.Label(target, text="Processo").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
+        self.nozzle_combo = ttk.Combobox(target, textvariable=self.nozzle_var,
+                                         state="readonly", width=8)
+        self.nozzle_combo.grid(row=0, column=1, sticky="w")
+        ttk.Label(target, text="Impressora").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
+        self.machine_combo = ttk.Combobox(target, textvariable=self.machine_var, state="readonly")
+        self.machine_combo.grid(row=1, column=1, sticky="ew", pady=(10, 0))
+        self.machine_combo.bind("<<ComboboxSelected>>", lambda *_: self._refresh_dependents())
+        ttk.Label(target, text="Processo").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
         self.process_combo = ttk.Combobox(target, textvariable=self.process_var, state="readonly")
-        self.process_combo.grid(row=1, column=1, sticky="ew", pady=(10, 0))
-        ttk.Button(target, text="Localizar ELEGOO Slicer", command=self._choose_slicer).grid(row=0, column=2, rowspan=2, padx=(12, 0))
+        self.process_combo.grid(row=2, column=1, sticky="ew", pady=(10, 0))
+        ttk.Button(target, text="Localizar ELEGOO Slicer", command=self._choose_slicer).grid(row=0, column=2, rowspan=3, padx=(12, 0))
         self.filament_frame = ttk.Frame(target)
-        self.filament_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(12, 0))
+        self.filament_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         self.filament_frame.columnconfigure(1, weight=1)
 
         actions = ttk.Frame(outer)
@@ -142,6 +150,7 @@ class MakerElegooApp(tk.Tk):
 
     def _save_preferences(self):
         save_settings({"nozzle": self.nozzle_var.get(),
+                       "machine": self.machine_var.get(),
                        "last_dir": str(Path(self.file_var.get()).parent) if self.file_var.get() else self.preferences["last_dir"],
                        "slicer_exe": str(self.install.executable) if self.install else self.preferences["slicer_exe"]})
 
@@ -152,23 +161,66 @@ class MakerElegooApp(tk.Tk):
             self._refresh_profiles()
 
     def _refresh_profiles(self):
+        if self._refreshing_profiles:
+            return
+        self._refreshing_profiles = True
         self._clear_ai_approval()
         try:
             custom = self.preferences.get("slicer_exe")
             self.install = discover_slicer(executable=Path(custom) if custom else None)
+            available = list_profiles(self.install, "machine", None)
+            nozzles = sorted({str(resolve_profile(item, self.install)["nozzle_diameter"][0])
+                              for item in available}, key=float)
+            if not nozzles:
+                raise ProfileError("Nenhum perfil da Centauri Carbon 2 encontrado neste computador")
+            self.nozzle_combo["values"] = nozzles
+            if self.nozzle_var.get() not in nozzles:
+                self.nozzle_var.set(nozzles[0])
             nozzle = self.nozzle_var.get()
-            self.process_profiles = list_profiles(self.install, "process", nozzle)
-            self.filament_profiles = list_profiles(self.install, "filament", nozzle)
-            options = [profile.name for profile in self.process_profiles]
-            self.process_combo["values"] = options
-            if self.process_var.get() not in options:
-                self.process_var.set(next((name for name in options if "Standard" in name), options[0] if options else ""))
-            self._render_filaments()
+            self.machine_profiles = list_profiles(self.install, "machine", nozzle)
+            options = [profile.name for profile in self.machine_profiles]
+            self.machine_combo["values"] = options
+            if self.machine_var.get() not in options:
+                standard = f"Elegoo Centauri Carbon 2 {nozzle} nozzle"
+                self.machine_var.set(standard if standard in options else options[0])
+            self._refresh_dependents()
             self.status_var.set(f"Perfis carregados para bico {nozzle} mm")
             self._save_preferences()
         except (ProfileError, OSError) as exc:
             self.install = None
+            self.machine_profiles = []
+            self.process_profiles = []
+            self.filament_profiles = []
+            self.machine_combo["values"] = ()
+            self.process_combo["values"] = ()
             self.status_var.set(str(exc))
+        finally:
+            self._refreshing_profiles = False
+
+    def _refresh_dependents(self):
+        self._clear_ai_approval()
+        machine = next((item for item in self.machine_profiles if item.name == self.machine_var.get()), None)
+        if not self.install or machine is None:
+            self.process_profiles = []
+            self.filament_profiles = []
+        else:
+            nozzle = self.nozzle_var.get()
+            self.process_profiles = list_profiles(self.install, "process", nozzle, machine=machine)
+            self.filament_profiles = list_profiles(self.install, "filament", nozzle, machine=machine)
+        options = [profile.name for profile in self.process_profiles]
+        self.process_combo["values"] = options
+        if self.process_var.get() not in options:
+            self.process_var.set(next((name for name in options if "Standard" in name), options[0] if options else ""))
+        self._render_filaments()
+        if self.install:
+            self._save_preferences()
+
+    def _selected_profiles(self) -> tuple[Profile, Profile, list[Profile]]:
+        machine = next(item for item in self.machine_profiles if item.name == self.machine_var.get())
+        process = next(item for item in self.process_profiles if item.name == self.process_var.get())
+        filaments = [next(item for item in self.filament_profiles if item.name == variable.get())
+                     for variable in self.filament_vars]
+        return machine, process, filaments
 
     def _choose_file(self):
         filename = filedialog.askopenfilename(title="Projeto MakerWorld", initialdir=self.preferences.get("last_dir") or None,
@@ -225,10 +277,7 @@ class MakerElegooApp(tk.Tk):
             messagebox.showerror("Destino existente", "Escolha um nome novo para preservar arquivos existentes.")
             return
         try:
-            machine = list_profiles(self.install, "machine", self.nozzle_var.get())[0]
-            process = next(profile for profile in self.process_profiles if profile.name == self.process_var.get())
-            filaments = [next(profile for profile in self.filament_profiles if profile.name == variable.get())
-                         for variable in self.filament_vars]
+            machine, process, filaments = self._selected_profiles()
         except (IndexError, StopIteration):
             messagebox.showerror("Perfil ausente", "Escolha um processo e um perfil para cada filamento.")
             return

@@ -17,13 +17,81 @@ def profile(root, relative, values):
 
 
 class ProfileTests(unittest.TestCase):
+    def test_local_custom_profiles_follow_inherited_machine_and_nozzle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exe = root / "elegoo-slicer.exe"
+            exe.touch()
+            base_name = "Elegoo Centauri Carbon 2 0.4 nozzle"
+            profile(root, "system/Elegoo/machine/ECC2/base.json", {
+                "type": "machine", "name": base_name,
+                "printer_model": "Elegoo Centauri Carbon 2", "nozzle_diameter": ["0.4"]})
+            profile(root, "system/Elegoo/process/ECC2/standard.json", {
+                "type": "process", "name": "Standard 0.4",
+                "compatible_printers": [base_name]})
+            profile(root, "system/Elegoo/filament/Generic/pla.json", {
+                "type": "filament", "name": "Generic PLA",
+                "compatible_printers": [base_name]})
+            profile(root, "user/account-42/machine/custom.json", {
+                "name": "0.2 PERFECT PLA", "inherits": base_name})
+            profile(root, "user/account-42/process/custom.json", {
+                "name": "PERFECT PLA", "inherits": "Standard 0.4"})
+            profile(root, "user/account-42/filament/custom.json", {
+                "name": "ENDER PLA", "inherits": "Generic PLA"})
+            install = discover_slicer(executable=exe, data_dir=root)
+
+            machines = list_profiles(install, "machine", "0.4")
+            self.assertIn("0.2 PERFECT PLA", [item.name for item in machines])
+            self.assertNotIn("0.2 PERFECT PLA", [item.name for item in list_profiles(install, "machine", "0.2")])
+            custom = next(item for item in machines if item.name == "0.2 PERFECT PLA")
+            self.assertIn("PERFECT PLA", [item.name for item in list_profiles(install, "process", "0.4", machine=custom)])
+            self.assertIn("ENDER PLA", [item.name for item in list_profiles(install, "filament", "0.4", machine=custom)])
+
+    def test_local_profiles_exclude_other_printer_and_wrong_nozzle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            exe = root / "elegoo-slicer.exe"
+            exe.touch()
+            target = "Elegoo Centauri Carbon 2 0.4 nozzle"
+            other = "Elegoo Centauri Carbon 2 0.2 nozzle"
+            for name, nozzle in ((target, "0.4"), (other, "0.2")):
+                profile(root, f"system/Elegoo/machine/ECC2/{nozzle}.json", {
+                    "type": "machine", "name": name,
+                    "printer_model": "Elegoo Centauri Carbon 2", "nozzle_diameter": [nozzle]})
+            profile(root, "system/Elegoo/process/ECC2/wrong.json", {
+                "type": "process", "name": "Wrong process", "compatible_printers": [other]})
+            profile(root, "user/default/filament/wrong.json", {
+                "name": "Wrong filament", "compatible_printers": [other]})
+            profile(root, "user/default/machine/other.json", {
+                "name": "Other printer", "printer_model": "Other", "nozzle_diameter": ["0.4"]})
+            install = discover_slicer(executable=exe, data_dir=root)
+            self.assertEqual([item.name for item in list_profiles(install, "machine", "0.4")], [target])
+            self.assertNotIn("Wrong process", [item.name for item in list_profiles(install, "process", "0.4")])
+            self.assertNotIn("Wrong filament", [item.name for item in list_profiles(install, "filament", "0.4")])
+
+    def test_malformed_local_machine_nozzle_does_not_enter_available_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, value in (("missing", None), ("empty", []), ("text", ["unknown"])):
+                data = {"type": "machine", "name": name,
+                        "printer_model": "Elegoo Centauri Carbon 2"}
+                if value is not None:
+                    data["nozzle_diameter"] = value
+                profile(root, f"user/default/machine/{name}.json", data)
+            profile(root, "system/Elegoo/machine/ECC2/valid.json", {
+                "type": "machine", "name": "Valid CC2",
+                "printer_model": "Elegoo Centauri Carbon 2", "nozzle_diameter": ["0.4"]})
+            install = SlicerInstall(root / "elegoo-slicer.exe", root)
+            self.assertEqual([item.name for item in list_profiles(install, "machine", None)], ["Valid CC2"])
+
     def test_discovers_machine_process_and_user_filament(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             exe = root / "elegoo-slicer.exe"
             exe.touch()
             profile(root, "system/Elegoo/machine/ECC2/cc2.json", {
-                "type": "machine", "name": "Elegoo Centauri Carbon 2 0.4 nozzle", "nozzle_diameter": ["0.4"]})
+                "type": "machine", "name": "Elegoo Centauri Carbon 2 0.4 nozzle",
+                "printer_model": "Elegoo Centauri Carbon 2", "nozzle_diameter": ["0.4"]})
             profile(root, "system/Elegoo/process/ECC2/standard.json", {
                 "type": "process", "name": "Standard", "compatible_printers": ["Elegoo Centauri Carbon 2 0.4 nozzle"]})
             profile(root, "user/default/filament/custom.json", {

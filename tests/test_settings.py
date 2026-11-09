@@ -26,6 +26,14 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings["nozzle"], "0.8")
         self.assertEqual(settings["last_dir"], "C:/models")
 
+    def test_persists_locally_available_nozzle_and_machine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "prefs.json"
+            save_settings({"nozzle": "0.6", "machine": "My CC2"}, path)
+            settings = load_settings(path)
+        self.assertEqual(settings["nozzle"], "0.6")
+        self.assertEqual(settings["machine"], "My CC2")
+
     def test_invalid_json_returns_defaults(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "prefs.json"

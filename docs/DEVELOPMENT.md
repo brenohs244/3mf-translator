@@ -12,6 +12,8 @@ python -m unittest discover -s tests -v
 
 O ELEGOO Slicer deve estar instalado e ter os perfis da Centauri Carbon 2. É possível definir `ELEGOO_SLICER_EXE` para um caminho personalizado. Para preferências portáteis, defina `MAKER_ELEGOO_CONFIG_DIR`.
 
+Os perfis são descobertos automaticamente em `%APPDATA%\ElegooSlicer\system` e `%APPDATA%\ElegooSlicer\user\<conta>\{machine,process,filament}` no computador em que o programa roda. A lista de bicos vem dos perfis de máquina da Centauri Carbon 2 instalados. Os perfis personalizados são filtrados pela herança e pelos dados de compatibilidade resolvidos; o nome do perfil não determina o diâmetro do bico. O programa não importa perfis de outro computador nem altera os perfis do fatiador.
+
 ## Distribuir
 
 ```powershell
@@ -22,6 +24,7 @@ python .\scripts\smoke_exe.py
 ```
 
 `dist/MakerElegoo.exe` é portátil. `dist/MakerElegoo-Windows.zip` inclui um instalador por usuário (`install.ps1`) e instruções. O executável procura o ELEGOO Slicer no computador de destino; o fatiador não é incluído no pacote.
+O pacote também não contém perfis personalizados: cada computador mostra os perfis que existem no seu próprio ELEGOO Slicer.
 
 ## Superpowers, Graphify, Understand Anything e Find Skills
 

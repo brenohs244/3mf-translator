@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 
 
-DEFAULTS = {"nozzle": "0.4", "last_dir": "", "slicer_exe": ""}
+DEFAULTS = {"nozzle": "0.4", "machine": "", "last_dir": "", "slicer_exe": ""}
+
+
+def _valid_nozzle(value: str) -> bool:
+    try:
+        diameter = float(value)
+        return math.isfinite(diameter) and 0.1 <= diameter <= 2
+    except ValueError:
+        return False
 
 
 def settings_path() -> Path:
@@ -30,7 +39,7 @@ def load_settings(path: Path | None = None) -> dict:
     for key in DEFAULTS:
         if isinstance(raw.get(key), str):
             result[key] = raw[key]
-    if result["nozzle"] not in {"0.2", "0.4", "0.8"}:
+    if not _valid_nozzle(result["nozzle"]):
         result["nozzle"] = "0.4"
     return result
 
@@ -39,7 +48,7 @@ def save_settings(data: dict, path: Path | None = None) -> None:
     target = Path(path) if path else settings_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     clean = {key: str(data.get(key, default)) for key, default in DEFAULTS.items()}
-    if clean["nozzle"] not in {"0.2", "0.4", "0.8"}:
+    if not _valid_nozzle(clean["nozzle"]):
         clean["nozzle"] = "0.4"
     temporary = target.with_suffix(".tmp")
     temporary.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
