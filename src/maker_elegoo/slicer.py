@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -28,6 +29,26 @@ class ValidationResult:
     plate_count: int
     message: str
     warnings: tuple[str, ...] = ()
+    estimated_seconds: int | None = None
+    filament_grams: float | None = None
+
+
+def _gcode_metrics(path: Path) -> tuple[int | None, float | None]:
+    seconds = None
+    grams = None
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if line.startswith("; estimated printing time (normal mode) ="):
+                parts = re.findall(r"(\d+)\s*([hms])", line.partition("=")[2])
+                if parts:
+                    seconds = sum(int(value) * {"h": 3600, "m": 60, "s": 1}[unit]
+                                  for value, unit in parts)
+            elif line.startswith("; total filament used [g] ="):
+                try:
+                    grams = float(line.partition("=")[2].strip())
+                except ValueError:
+                    pass
+    return seconds, grams
 
 
 def _details(result: subprocess.CompletedProcess, folder: Path) -> str:
@@ -113,4 +134,8 @@ class SlicerCLI:
                                         f"G-code gerado para {len(gcodes)} de {plate_count} placas")
             warnings = tuple(line for line in (result.stderr or "").splitlines()
                              if "warning" in line.lower() or "aviso" in line.lower())
-            return ValidationResult(True, len(gcodes), "Todas as placas foram fatiadas", warnings)
+            metrics = [_gcode_metrics(path) for path in gcodes]
+            seconds = sum(item[0] for item in metrics) if all(item[0] is not None for item in metrics) else None
+            grams = sum(item[1] for item in metrics) if all(item[1] is not None for item in metrics) else None
+            return ValidationResult(True, len(gcodes), "Todas as placas foram fatiadas",
+                                    warnings, seconds, grams)

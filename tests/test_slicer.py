@@ -52,3 +52,21 @@ class SlicerTests(unittest.TestCase):
             result = SlicerCLI(Path("elegoo-slicer.exe"), runner=runner).validate(project, 2)
         self.assertTrue(result.success)
         self.assertEqual(result.plate_count, 2)
+
+    def test_validation_reads_time_and_material_from_real_gcode_headers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "converted.3mf"
+            project.touch()
+
+            def runner(args, **kwargs):
+                output = Path(args[args.index("--outputdir") + 1])
+                (output / "plate_1.gcode").write_text(
+                    "; total filament used [g] = 28.70\n"
+                    "; estimated printing time (normal mode) = 2h 18m 8s\nG1 X1\n",
+                    encoding="utf-8")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            result = SlicerCLI(Path("elegoo-slicer.exe"), runner=runner).validate(project, 1)
+        self.assertTrue(result.success)
+        self.assertEqual(result.estimated_seconds, 8288)
+        self.assertEqual(result.filament_grams, 28.70)

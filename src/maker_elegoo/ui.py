@@ -14,6 +14,9 @@ from .ai import (AIError, Suggestion, apply_suggestions, build_manual_prompt,
                  parse_manual_response, suggest_equivalences)
 from .converter import ConversionResult, convert_project
 from .mapping import ConversionPlan, build_conversion
+from .orientation import FRONTS, load_scene, render_front_views
+from .orientation_service import (OrientationAnalysis, apply_orientation,
+                                  evaluate_orientations)
 from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles, resolve_profile
 from .project import ProjectInfo, inspect_project
 from .settings import load_settings, save_settings
@@ -57,6 +60,38 @@ def format_conversion_report(result: ConversionResult, plan: ConversionPlan) -> 
     return "\n".join(lines)
 
 
+def format_orientation_analysis(analysis: OrientationAnalysis) -> str:
+    def describe(entry):
+        candidate, result = entry.candidate, entry.result
+        validation = result.validation
+        lines = [f"{candidate.label}: {'fatiamento validado' if result.success else 'falha no fatiamento'}",
+                 f"  Apoio estimado: {candidate.contact_mm2:.0f} mm²; risco frontal estimado: {candidate.front_overhang_mm2:.0f} mm²"]
+        if validation and validation.estimated_seconds is not None:
+            minutes = round(validation.estimated_seconds / 60)
+            lines.append(f"  Tempo estimado: {minutes // 60}h {minutes % 60:02d}min")
+        else:
+            lines.append("  Tempo estimado: indisponível")
+        if validation and validation.filament_grams is not None:
+            lines.append(f"  Filamento estimado: {validation.filament_grams:.2f} g")
+        else:
+            lines.append("  Filamento estimado: indisponível")
+        if not result.success:
+            lines.append(f"  Motivo: {result.message}")
+        return lines
+
+    lines = [f"Frente selecionada: {analysis.front}",
+             f"Recomendação: {analysis.recommended.label}", analysis.reason, "",
+             "Posição atual:", *describe(analysis.current)]
+    for entry in analysis.alternatives:
+        lines.extend(["", "Alternativa:", *describe(entry)])
+    if analysis.rejected:
+        lines.extend(["", "Posições descartadas na triagem geométrica:"])
+        lines.extend(f"  {item.label}: {item.reason}; apoio estimado {item.contact_mm2:.0f} mm²"
+                     for item in analysis.rejected)
+    lines.extend(["", "Confira rosto, suportes e prévia no ELEGOO Slicer antes de imprimir."])
+    return "\n".join(lines)
+
+
 class MakerElegooApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -75,6 +110,12 @@ class MakerElegooApp(tk.Tk):
         self.filament_vars: list[tk.StringVar] = []
         self.worker_queue: queue.Queue = queue.Queue()
         self.ai_queue: queue.Queue = queue.Queue()
+        self.orientation_queue: queue.Queue = queue.Queue()
+        self.orientation_cancel = threading.Event()
+        self.orientation_dialog: tk.Toplevel | None = None
+        self.orientation_analysis: OrientationAnalysis | None = None
+        self.orientation_plan: ConversionPlan | None = None
+        self.orientation_generation = 0
 
         self.file_var = tk.StringVar()
         self.nozzle_var = tk.StringVar(value=self.preferences["nozzle"])
@@ -86,13 +127,23 @@ class MakerElegooApp(tk.Tk):
         self.nozzle_var.trace_add("write", lambda *_: self._refresh_profiles())
         self.process_var.trace_add("write", lambda *_: self._clear_ai_approval())
         self._refresh_profiles()
-        self.after(150, self._poll_worker)
-        self.after(150, self._poll_ai)
+        self._worker_after = self.after(150, self._poll_worker)
+        self._ai_after = self.after(150, self._poll_ai)
+        self._orientation_after = self.after(150, self._poll_orientation)
+
+    def destroy(self):
+        self.orientation_cancel.set()
+        for name in ("_worker_after", "_ai_after", "_orientation_after"):
+            callback = getattr(self, name, None)
+            if callback is not None:
+                self.after_cancel(callback)
+        super().destroy()
 
     def _build_layout(self):
         menu = tk.Menu(self)
         tools_menu = tk.Menu(menu, tearoff=False)
         tools_menu.add_command(label="Ajuste guiado por IA (sem API)", command=self._manual_ai)
+        tools_menu.add_command(label="Analisar orientação de figura", command=self._orientation_open)
         menu.add_cascade(label="Ferramentas", menu=tools_menu)
         self.configure(menu=menu)
         outer = ttk.Frame(self, padding=18)
@@ -130,6 +181,9 @@ class MakerElegooApp(tk.Tk):
         actions.pack(fill="x", pady=(0, 12))
         self.convert_button = ttk.Button(actions, text="Converter e fatiar para validar", command=self._convert)
         self.convert_button.pack(side="left")
+        self.orientation_button = ttk.Button(actions, text="Orientação de figura", command=self._orientation_open,
+                                             state="disabled")
+        self.orientation_button.pack(side="left", padx=(10, 0))
         self.open_button = ttk.Button(actions, text="Abrir no ELEGOO Slicer", command=self._open_result, state="disabled")
         self.open_button.pack(side="left", padx=(10, 0))
         self.ai_button = ttk.Button(actions, text="Analisar com IA (opcional)", command=self._analyze_ai, state="disabled")
@@ -230,12 +284,20 @@ class MakerElegooApp(tk.Tk):
             self._inspect_file()
 
     def _inspect_file(self):
+        if getattr(self, "orientation_applying", False):
+            messagebox.showinfo("Orientação de figura", "Aguarde a criação da cópia terminar.")
+            return
+        if self.orientation_dialog and self.orientation_dialog.winfo_exists():
+            self._orientation_close()
         try:
             self.project = inspect_project(Path(self.file_var.get()))
             self.result = None
             self.last_plan = None
+            self.orientation_analysis = None
+            self.orientation_plan = None
             self._clear_ai_approval()
             self.ai_button.configure(state="disabled")
+            self.orientation_button.configure(state="normal")
             self.open_button.configure(state="disabled")
             self._set_report(format_project_summary(self.project))
             self._render_filaments()
@@ -243,6 +305,7 @@ class MakerElegooApp(tk.Tk):
             self._save_preferences()
         except Exception as exc:
             self.project = None
+            self.orientation_button.configure(state="disabled")
             messagebox.showerror("Não foi possível analisar", str(exc))
 
     def _render_filaments(self):
@@ -262,6 +325,215 @@ class MakerElegooApp(tk.Tk):
             ttk.Combobox(self.filament_frame, textvariable=variable, values=options,
                          state="readonly").grid(row=row, column=1, sticky="ew", pady=3)
             self.filament_vars.append(variable)
+
+    def _orientation_open(self):
+        if not self.project or not self.install:
+            messagebox.showinfo("Orientação de figura", "Analise um 3MF e localize o ELEGOO Slicer primeiro.")
+            return
+        if self.orientation_dialog and self.orientation_dialog.winfo_exists():
+            self.orientation_dialog.lift()
+            return
+        self.orientation_cancel = threading.Event()
+        self.orientation_generation += 1
+        generation = self.orientation_generation
+        self.orientation_analysis = None
+        self.orientation_plan = None
+        self.orientation_busy = False
+        self.orientation_applying = False
+        dialog = tk.Toplevel(self)
+        self.orientation_dialog = dialog
+        dialog.title("Analisar orientação de figura")
+        dialog.geometry("900x600")
+        dialog.minsize(700, 480)
+        dialog.transient(self)
+        dialog.protocol("WM_DELETE_WINDOW", self._orientation_close)
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Escolha a vista em que aparece o rosto e a frente da figura.",
+                  wraplength=820).pack(anchor="w")
+        self.orientation_front = tk.StringVar(value="-Y")
+        self.orientation_front.trace_add("write", lambda *_: self._orientation_front_changed())
+        previews = ttk.Frame(frame)
+        previews.pack(fill="x", pady=10)
+        self.orientation_preview_frame = previews
+        self.orientation_images = []
+        self.orientation_message = tk.StringVar(value="Lendo a malha localmente...")
+        ttk.Label(frame, textvariable=self.orientation_message).pack(anchor="w")
+        self.orientation_report = scrolledtext.ScrolledText(frame, height=12, wrap="word", state="disabled")
+        self.orientation_report.pack(fill="both", expand=True, pady=(8, 0))
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(10, 0))
+        self.orientation_analyze_button = ttk.Button(buttons, text="Comparar e fatiar", command=self._orientation_analyze,
+                                                     state="disabled")
+        self.orientation_analyze_button.pack(side="left")
+        self.orientation_apply_button = ttk.Button(buttons, text="Aplicar em cópia", command=self._orientation_apply,
+                                                   state="disabled")
+        self.orientation_apply_button.pack(side="left", padx=8)
+        ttk.Button(buttons, text="Fechar", command=self._orientation_close).pack(side="right")
+        project_path = self.project.path
+        cancel = self.orientation_cancel
+
+        def work():
+            try:
+                scene = load_scene(project_path)
+                if not cancel.is_set():
+                    self.orientation_queue.put((generation, "previews", render_front_views(scene)))
+            except Exception as exc:
+                self.orientation_queue.put((generation, "error", exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _orientation_close(self):
+        if getattr(self, "orientation_busy", False) and getattr(self, "orientation_applying", False):
+            self.orientation_message.set("Aguarde o fatiamento da cópia terminar.")
+            return
+        self.orientation_cancel.set()
+        if self.orientation_dialog and self.orientation_dialog.winfo_exists():
+            self.orientation_dialog.destroy()
+        self.orientation_dialog = None
+
+    def _orientation_front_changed(self):
+        analysis = self.orientation_analysis
+        if analysis is not None and analysis.front != self.orientation_front.get():
+            self.orientation_analysis = None
+            self.orientation_apply_button.configure(state="disabled")
+            self.orientation_message.set("A frente mudou. Compare e fatia novamente antes de aplicar.")
+
+    def _orientation_analyze(self):
+        if not self.project or not self.install or getattr(self, "orientation_busy", False):
+            return
+        try:
+            machine, process, filaments = self._selected_profiles()
+            plan = build_conversion(self.project, self.install, machine, process, filaments)
+        except Exception as exc:
+            messagebox.showerror("Perfis de destino", str(exc), parent=self.orientation_dialog)
+            return
+        self.orientation_plan = plan
+        self.orientation_analysis = None
+        self.orientation_busy = True
+        self.orientation_applying = False
+        self.orientation_analyze_button.configure(state="disabled")
+        self.orientation_apply_button.configure(state="disabled")
+        self.orientation_message.set("Comparando e fatiando as orientações... pode levar alguns minutos")
+        project, front, cancel = self.project, self.orientation_front.get(), self.orientation_cancel
+        generation = self.orientation_generation
+        install = self.install
+
+        def work():
+            try:
+                analysis = evaluate_orientations(
+                    project, plan, front, SlicerCLI(install.executable),
+                    progress=lambda label, index, total: self.orientation_queue.put(
+                        (generation, "progress", f"Fatiando {label} ({index}/{total})...")),
+                    cancelled=cancel.is_set)
+                self.orientation_queue.put((generation, "analysis", analysis))
+            except Exception as exc:
+                self.orientation_queue.put((generation, "error", exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _orientation_apply(self):
+        if not self.project or not self.install or not self.orientation_analysis or not self.orientation_plan:
+            return
+        candidate = self.orientation_analysis.recommended
+        if candidate.is_current or not candidate.valid:
+            return
+        destination = filedialog.asksaveasfilename(
+            title="Salvar cópia orientada", defaultextension=".3mf",
+            initialfile=self.project.path.stem + "_orientado_ELEGOO.3mf",
+            initialdir=str(self.project.path.parent), filetypes=[("Projeto 3MF", "*.3mf")],
+            parent=self.orientation_dialog)
+        if not destination:
+            return
+        if Path(destination).exists() or Path(destination).resolve() == self.project.path.resolve():
+            messagebox.showerror("Destino existente", "Escolha um novo nome para preservar os arquivos existentes.",
+                                 parent=self.orientation_dialog)
+            return
+        if not messagebox.askyesno(
+                "Confirmar orientação",
+                f"Aplicar '{candidate.label}' em uma nova cópia e fatiar no ELEGOO Slicer?\n\n"
+                "Confira rosto, suportes e prévia antes de imprimir.", parent=self.orientation_dialog):
+            return
+        self.orientation_busy = True
+        self.orientation_applying = True
+        self.orientation_apply_button.configure(state="disabled")
+        self.orientation_analyze_button.configure(state="disabled")
+        self.orientation_message.set("Criando e fatiando a cópia orientada...")
+        project, plan = self.project, self.orientation_plan
+        generation = self.orientation_generation
+        install = self.install
+
+        def work():
+            try:
+                result = apply_orientation(project, plan, candidate, Path(destination),
+                                           SlicerCLI(install.executable))
+                self.orientation_queue.put((generation, "applied", result))
+            except Exception as exc:
+                self.orientation_queue.put((generation, "error", exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_orientation(self):
+        try:
+            while True:
+                generation, kind, payload = self.orientation_queue.get_nowait()
+                dialog = self.orientation_dialog
+                if (generation != self.orientation_generation or not dialog or
+                        not dialog.winfo_exists() or self.orientation_cancel.is_set()):
+                    continue
+                if kind == "previews":
+                    for direction in FRONTS:
+                        photo = tk.PhotoImage(data=payload[direction], format="PPM")
+                        self.orientation_images.append(photo)
+                        box = ttk.Frame(self.orientation_preview_frame)
+                        box.pack(side="left", padx=5)
+                        ttk.Label(box, image=photo).pack()
+                        ttk.Radiobutton(box, text=direction, variable=self.orientation_front,
+                                        value=direction).pack()
+                    self.orientation_message.set("Selecione a frente e compare as posições.")
+                    self.orientation_analyze_button.configure(state="normal")
+                elif kind == "progress":
+                    self.orientation_message.set(payload)
+                elif kind == "analysis":
+                    self.orientation_busy = False
+                    if payload.front != self.orientation_front.get():
+                        self.orientation_message.set("A frente mudou durante a análise. Compare novamente.")
+                        self.orientation_analyze_button.configure(state="normal")
+                        continue
+                    self.orientation_analysis = payload
+                    self.orientation_report.configure(state="normal")
+                    self.orientation_report.delete("1.0", "end")
+                    self.orientation_report.insert("1.0", format_orientation_analysis(payload))
+                    self.orientation_report.configure(state="disabled")
+                    self.orientation_message.set(payload.reason)
+                    self.orientation_analyze_button.configure(state="normal")
+                    if not payload.recommended.is_current and payload.recommended.valid:
+                        self.orientation_apply_button.configure(state="normal")
+                elif kind == "applied":
+                    self.orientation_busy = False
+                    self.orientation_applying = False
+                    self.result = payload
+                    self.last_plan = self.orientation_plan
+                    report = format_conversion_report(payload, self.orientation_plan)
+                    self._set_report(report)
+                    self.orientation_report.configure(state="normal")
+                    self.orientation_report.delete("1.0", "end")
+                    self.orientation_report.insert("1.0", report)
+                    self.orientation_report.configure(state="disabled")
+                    self.orientation_message.set("Cópia validada" if payload.success else "Falha; confira o relatório")
+                    self.status_var.set(self.orientation_message.get())
+                    if payload.destination.exists():
+                        self.open_button.configure(state="normal")
+                    self.orientation_analyze_button.configure(state="normal")
+                elif kind == "error":
+                    self.orientation_busy = False
+                    self.orientation_applying = False
+                    self.orientation_analyze_button.configure(state="normal")
+                    self.orientation_message.set(str(payload))
+                    messagebox.showerror("Orientação de figura", str(payload), parent=dialog)
+        except queue.Empty:
+            pass
+        self._orientation_after = self.after(150, self._poll_orientation)
 
     def _convert(self):
         if not self.project or not self.install:
@@ -323,7 +595,7 @@ class MakerElegooApp(tk.Tk):
                     self.open_button.configure(state="normal")
                 if result.output_project:
                     self.ai_button.configure(state="normal")
-        self.after(150, self._poll_worker)
+        self._worker_after = self.after(150, self._poll_worker)
 
     def _clear_ai_approval(self):
         self.ai_approved = []
@@ -436,7 +708,7 @@ class MakerElegooApp(tk.Tk):
                 messagebox.showinfo("Gemini", "Nenhuma sugestão passou pela validação de segurança e compatibilidade.")
             else:
                 self._review_suggestions(suggestions)
-        self.after(150, self._poll_ai)
+        self._ai_after = self.after(150, self._poll_ai)
 
     def _review_suggestions(self, suggestions: list[Suggestion]):
         dialog = tk.Toplevel(self)

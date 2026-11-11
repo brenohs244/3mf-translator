@@ -35,6 +35,9 @@ O pacote também não contém perfis personalizados: cada computador mostra os p
 
 ## Limites técnicos
 
+- O assistente opcional de orientação lê a malha localmente, mostra quatro vistas para escolher a frente e compara a posição atual com eixos principais e pequenas inclinações. A triagem mede apoio na mesa e risco frontal aproximado; recomenda mudança apenas após validação pelo ELEGOO Slicer e ganho frontal claro. A primeira versão aceita uma placa e uma instância de malha. A aplicação pede confirmação, salva uma nova cópia e fatia novamente. O 3MF, as vistas e o G-code não são enviados à IA. Confira visualmente o rosto e os suportes no fatiador; as medidas geométricas não provam qualidade estética.
+- No exemplo local `Our+Lady+of+Guadalupe+Chibi.3mf`, com PLA, bico de 0,4 mm e processo 0,16 mm Optimal, a posição original passou na conversão e no fatiamento (2h18min03s; 28,69 g estimados). Uma rotação lateral também passou no fatiador (2h49min10s; 32,13 g), porém sua estimativa de apoio caiu de 1.216 para 5,4 mm². O assistente a rejeita e recomenda manter a figura em pé. Os valores são estimativas do fatiador instalado neste computador; a análise não prova acabamento melhor no rosto.
+
 - `--allow-newer-file` permite que a CLI ELEGOO 2.4.2 leia projetos Bambu 2.6, mas alguns valores novos (`raft_first_layer_expansion` e `tree_support_wall_count` iguais a `-1`) precisam ser normalizados em uma cópia temporária. Os originais não são alterados.
 - O perfil ELEGOO define temperatura, limites da máquina e velocidades. Transferimos apenas uma lista explícita de parâmetros de intenção do projeto.
 - A malha é comparada por vértices e triângulos, com tolerância numérica de 0,0001 mm para arredondamentos do fatiador; mudanças maiores bloqueiam o estado de sucesso. O fatiador pode alterar a posição na mesa para caber na Centauri Carbon 2. Confira visualmente cores, suportes e posição antes da impressão.
