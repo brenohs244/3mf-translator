@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import queue
+import json
 import subprocess
 import threading
 import tkinter as tk
@@ -13,6 +14,9 @@ from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from .ai import (AIError, Suggestion, apply_suggestions, build_manual_prompt,
                  parse_manual_response, suggest_equivalences)
 from .converter import ConversionResult, convert_project
+from .codex_cli import run_codex
+from .codex_evidence import (build_codex_evidence,
+                             validate_codex_recommendations, verify_process_recommendation)
 from .mapping import ConversionPlan, build_conversion
 from .orientation import FRONTS, load_scene, render_front_views
 from .orientation_service import (OrientationAnalysis, apply_orientation,
@@ -122,10 +126,11 @@ class MakerElegooApp(tk.Tk):
         self.machine_var = tk.StringVar(value=self.preferences["machine"])
         self.process_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Selecione um projeto 3MF para começar")
+        self.ai_provider_var = tk.StringVar(value="Codex")
         self._refreshing_profiles = False
         self._build_layout()
         self.nozzle_var.trace_add("write", lambda *_: self._refresh_profiles())
-        self.process_var.trace_add("write", lambda *_: self._clear_ai_approval())
+        self.process_var.trace_add("write", lambda *_: self._profiles_changed())
         self._refresh_profiles()
         self._worker_after = self.after(150, self._poll_worker)
         self._ai_after = self.after(150, self._poll_ai)
@@ -188,6 +193,8 @@ class MakerElegooApp(tk.Tk):
         self.open_button.pack(side="left", padx=(10, 0))
         self.ai_button = ttk.Button(actions, text="Analisar com IA (opcional)", command=self._analyze_ai, state="disabled")
         self.ai_button.pack(side="left", padx=(10, 0))
+        ttk.Combobox(actions, textvariable=self.ai_provider_var, values=("Codex", "Gemini"),
+                     state="readonly", width=8).pack(side="left", padx=(5, 0))
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
 
         report_frame = ttk.LabelFrame(outer, text="3  Análise e relatório", padding=8)
@@ -218,7 +225,7 @@ class MakerElegooApp(tk.Tk):
         if self._refreshing_profiles:
             return
         self._refreshing_profiles = True
-        self._clear_ai_approval()
+        self._profiles_changed()
         try:
             custom = self.preferences.get("slicer_exe")
             self.install = discover_slicer(executable=Path(custom) if custom else None)
@@ -252,7 +259,7 @@ class MakerElegooApp(tk.Tk):
             self._refreshing_profiles = False
 
     def _refresh_dependents(self):
-        self._clear_ai_approval()
+        self._profiles_changed()
         machine = next((item for item in self.machine_profiles if item.name == self.machine_var.get()), None)
         if not self.install or machine is None:
             self.process_profiles = []
@@ -322,6 +329,7 @@ class MakerElegooApp(tk.Tk):
             if not preferred:
                 preferred = next((name for name in options if filament.material.upper() in name.upper() and "@ECC2" in name), None)
             variable = tk.StringVar(value=preferred or (options[0] if options else ""))
+            variable.trace_add("write", lambda *_: self._profiles_changed())
             ttk.Combobox(self.filament_frame, textvariable=variable, values=options,
                          state="readonly").grid(row=row, column=1, sticky="ew", pady=3)
             self.filament_vars.append(variable)
@@ -600,6 +608,11 @@ class MakerElegooApp(tk.Tk):
     def _clear_ai_approval(self):
         self.ai_approved = []
 
+    def _profiles_changed(self):
+        self._clear_ai_approval()
+        self.orientation_analysis = None
+        self.orientation_plan = None
+
     def _manual_ai(self):
         if not self.result or not self.last_plan or not self.project:
             messagebox.showinfo("Ajuste guiado", "Converta o projeto uma vez antes de pedir sugestões.")
@@ -667,6 +680,9 @@ class MakerElegooApp(tk.Tk):
         if not self.result or not self.last_plan or not self.result.output_project:
             messagebox.showinfo("IA opcional", "Converta o projeto uma vez antes de analisar campos não traduzidos.")
             return
+        if self.ai_provider_var.get() == "Codex":
+            self._analyze_codex()
+            return
         key = simpledialog.askstring("Gemini", "Chave de API Gemini (não será salva):", show="*", parent=self)
         if not key:
             return
@@ -693,13 +709,107 @@ class MakerElegooApp(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _analyze_codex(self):
+        orientation = self.orientation_analysis
+        if orientation is not None and self.orientation_plan != self.last_plan:
+            self.orientation_analysis = None
+            orientation = None
+        if (len(self.project.plates) == 1 and len(self.project.objects) == 1
+                and orientation is None):
+            messagebox.showinfo("Orientação de figura",
+                                "Escolha a vista do rosto e conclua a comparação local. Depois, volte à análise com Codex.")
+            self._orientation_open()
+            return
+        evidence = build_codex_evidence(self.project, self.last_plan, self.result, orientation)
+        summary = json.dumps(evidence, ensure_ascii=False, indent=2)
+        dialog = tk.Toplevel(self)
+        dialog.title("Dados para análise com Codex")
+        dialog.geometry("760x600")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Leia o resumo abaixo. Somente este texto será enviado ao Codex após sua autorização.",
+                  wraplength=700).pack(anchor="w")
+        preview = scrolledtext.ScrolledText(frame, wrap="word", font=("Consolas", 9))
+        preview.pack(fill="both", expand=True, pady=8)
+        preview.insert("1.0", summary)
+        preview.configure(state="disabled")
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x")
+
+        def authorize():
+            dialog.destroy()
+            self.ai_button.configure(state="disabled")
+            self.status_var.set("Codex analisando o resumo aprovado...")
+            plan = self.last_plan
+            project = self.project
+            result = self.result
+            install = self.install
+
+            def work():
+                try:
+                    response = run_codex(summary)
+                    suggestions, candidate = validate_codex_recommendations(response, plan, orientation)
+                    observations = [str(item)[:300] for item in response["observations"][:10]]
+                    verified = []
+                    for suggestion in suggestions:
+                        comparison = verify_process_recommendation(
+                            project, plan, result, suggestion,
+                            SlicerCLI(install.executable))
+                        if not comparison["verified"]:
+                            observations.append(f"{suggestion.target_key}: hipótese sem validação; não aplicável.")
+                            continue
+                        observations.append(f"{suggestion.target_key}: fatiamento comparativo validado; "
+                                            f"base {comparison['baseline']['filament_grams']} g, "
+                                            f"proposta {comparison['proposal']['filament_grams']} g; "
+                                            f"avisos {comparison['baseline']['warning_count']} → "
+                                            f"{comparison['proposal']['warning_count']}.")
+                        verified.append(suggestion)
+                    self.ai_queue.put(("codex", tuple(verified), candidate, tuple(observations), None,
+                                       (project, plan, orientation)))
+                except Exception as exc:
+                    self.ai_queue.put(("codex", (), None, (), exc, (project, plan, orientation)))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        ttk.Button(buttons, text="Autorizar envio ao Codex", command=authorize).pack(side="left")
+        ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="right")
+
     def _poll_ai(self):
         try:
-            suggestions, error = self.ai_queue.get_nowait()
+            item = self.ai_queue.get_nowait()
         except queue.Empty:
             pass
         else:
             self.ai_button.configure(state="normal")
+            if item[0] == "codex_apply":
+                _, result, plan, error = item
+                if error:
+                    self.status_var.set("Falha ao aplicar orientação")
+                    messagebox.showerror("Orientação Codex", str(error))
+                else:
+                    self.result = result
+                    self.last_plan = plan
+                    self._set_report(format_conversion_report(result, plan))
+                    self.status_var.set("Cópia orientada validada" if result.success else "Falha; confira relatório")
+                    if result.success and result.destination.exists():
+                        self.open_button.configure(state="normal")
+                self._ai_after = self.after(150, self._poll_ai)
+                return
+            if len(item) == 6 and item[0] == "codex":
+                _, suggestions, candidate, observations, error, context = item
+                if (self.project, self.last_plan, self.orientation_analysis) != context:
+                    self.status_var.set("Projeto ou perfis mudaram; repita a análise com Codex")
+                    self._ai_after = self.after(150, self._poll_ai)
+                    return
+                if error:
+                    self.status_var.set("Codex indisponível")
+                    messagebox.showerror("Codex", str(error))
+                else:
+                    self._review_codex(suggestions, candidate, observations)
+                self._ai_after = self.after(150, self._poll_ai)
+                return
+            suggestions, error = item
             if error:
                 self.status_var.set("IA indisponível")
                 messagebox.showerror("Gemini", str(error))
@@ -710,9 +820,79 @@ class MakerElegooApp(tk.Tk):
                 self._review_suggestions(suggestions)
         self._ai_after = self.after(150, self._poll_ai)
 
-    def _review_suggestions(self, suggestions: list[Suggestion]):
+    def _review_codex(self, suggestions, candidate, observations):
+        project, plan, orientation = self.project, self.last_plan, self.orientation_analysis
         dialog = tk.Toplevel(self)
-        dialog.title("Revisar sugestões do Gemini")
+        dialog.title("Revisar análise do Codex")
+        dialog.geometry("800x500")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        report = scrolledtext.ScrolledText(frame, wrap="word", height=10)
+        report.pack(fill="both", expand=True)
+        lines = ["Observações do Codex (hipóteses; confira no fatiador):",
+                 *(f"• {item}" for item in observations)]
+        if candidate:
+            lines.extend(["", f"Orientação proposta e fatiada: {candidate.label}"])
+        if suggestions:
+            lines.extend(["", "Configurações propostas:",
+                          *(f"• {item.target_key} = {item.value}: {item.reason}" for item in suggestions)])
+        report.insert("1.0", "\n".join(lines))
+        report.configure(state="disabled")
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=8)
+        if candidate and self.orientation_analysis:
+            def orient():
+                if (self.project, self.last_plan, self.orientation_analysis) != (project, plan, orientation):
+                    messagebox.showerror("Análise desatualizada", "Projeto ou perfis mudaram. Repita a análise.")
+                    dialog.destroy()
+                    return
+                dialog.destroy()
+                self._apply_codex_orientation(candidate)
+            ttk.Button(buttons, text="Aplicar orientação em cópia", command=orient).pack(side="left")
+        if suggestions:
+            def settings():
+                if (self.project, self.last_plan, self.orientation_analysis) != (project, plan, orientation):
+                    messagebox.showerror("Análise desatualizada", "Projeto ou perfis mudaram. Repita a análise.")
+                    dialog.destroy()
+                    return
+                dialog.destroy()
+                self._review_suggestions(list(suggestions), single=True)
+            ttk.Button(buttons, text="Revisar configurações", command=settings).pack(side="left", padx=8)
+        ttk.Button(buttons, text="Fechar", command=dialog.destroy).pack(side="right")
+
+    def _apply_codex_orientation(self, candidate):
+        if not self.project or not self.last_plan or not self.install:
+            return
+        destination = filedialog.asksaveasfilename(
+            title="Salvar cópia orientada", defaultextension=".3mf",
+            initialfile=self.project.path.stem + "_Codex_ELEGOO.3mf",
+            initialdir=str(self.project.path.parent), filetypes=[("Projeto 3MF", "*.3mf")])
+        if not destination:
+            return
+        if Path(destination).exists() or Path(destination).resolve() == self.project.path.resolve():
+            messagebox.showerror("Destino existente", "Escolha um novo nome para preservar os arquivos existentes.")
+            return
+        if not messagebox.askyesno("Confirmar orientação",
+                                   f"Aplicar '{candidate.label}' em nova cópia e fatiar no ELEGOO Slicer?"):
+            return
+        self.status_var.set("Criando e fatiando a cópia orientada...")
+        project, plan, install = self.project, self.last_plan, self.install
+
+        def work():
+            try:
+                result = apply_orientation(project, plan, candidate, Path(destination),
+                                           SlicerCLI(install.executable))
+                self.ai_queue.put(("codex_apply", result, plan, None))
+            except Exception as exc:
+                self.ai_queue.put(("codex_apply", None, plan, exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _review_suggestions(self, suggestions: list[Suggestion], *, single: bool = False):
+        context = (self.project, self.last_plan, self.orientation_analysis)
+        dialog = tk.Toplevel(self)
+        dialog.title("Revisar sugestões de IA")
         dialog.geometry("780x470")
         dialog.transient(self)
         dialog.grab_set()
@@ -720,13 +900,17 @@ class MakerElegooApp(tk.Tk):
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="Selecione somente as sugestões que deseja aplicar na próxima exportação.",
                   wraplength=720).pack(anchor="w", pady=(0, 10))
-        listing = tk.Listbox(frame, selectmode="multiple", font=("Consolas", 10))
+        listing = tk.Listbox(frame, selectmode="single" if single else "multiple", font=("Consolas", 10))
         listing.pack(fill="both", expand=True)
         for item in suggestions:
             label = "Equivalência" if item.kind == "mapping" else "Recurso ELEGOO"
             listing.insert("end", f"{label}: {item.source_key or 'extra'} → {item.target_key} = {item.value} [{item.confidence}] — {item.reason}")
 
         def approve():
+            if single and (self.project, self.last_plan, self.orientation_analysis) != context:
+                messagebox.showerror("Análise desatualizada", "Projeto ou perfis mudaram. Repita a análise.")
+                dialog.destroy()
+                return
             self.ai_approved = [suggestions[index] for index in listing.curselection()]
             self.status_var.set(f"{len(self.ai_approved)} sugestões aprovadas; converta novamente para aplicá-las")
             dialog.destroy()

@@ -12,6 +12,9 @@ Maker → ELEGOO para Windows
    nova cópia após sua confirmação. A análise inicial aceita uma placa e uma figura.
 
 O aplicativo não requer Bambu Studio. A IA Gemini é opcional e requer uma chave própria.
+Codex é outra opção de IA: instale e autentique o Codex CLI neste computador.
+O resumo textual é mostrado antes do envio; confirme para consultar o modelo.
+Recomendações de suporte e orientação dependem de fatiamento local e sua aprovação.
 O G-code de validação é temporário; o aplicativo não envia arquivos à impressora.
 O pacote não inclui perfis de outro computador. Para vê-los aqui, eles precisam existir
 no ELEGOO Slicer instalado neste computador.

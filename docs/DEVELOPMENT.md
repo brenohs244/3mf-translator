@@ -35,6 +35,8 @@ O pacote também não contém perfis personalizados: cada computador mostra os p
 
 ## Limites técnicos
 
+- A opção Codex usa o CLI instalado e autenticado no próprio computador. O app mostra um resumo de campos permitidos e medições locais antes do consentimento, chama `codex exec` em diretório temporário vazio com sessão efêmera, sandbox de leitura e esquema JSON, e valida a resposta localmente. O 3MF, a malha, as vistas, o G-code e caminhos do projeto não entram no resumo. Recomendações de suporte são refatiadas antes de serem aplicáveis; orientação só aceita candidatas locais já fatiadas. A qualidade visual final ainda exige revisão no ELEGOO Slicer.
+
 - O assistente opcional de orientação lê a malha localmente, mostra quatro vistas para escolher a frente e compara a posição atual com eixos principais e pequenas inclinações. A triagem mede apoio na mesa e risco frontal aproximado; recomenda mudança apenas após validação pelo ELEGOO Slicer e ganho frontal claro. A primeira versão aceita uma placa e uma instância de malha. A aplicação pede confirmação, salva uma nova cópia e fatia novamente. O 3MF, as vistas e o G-code não são enviados à IA. Confira visualmente o rosto e os suportes no fatiador; as medidas geométricas não provam qualidade estética.
 - No exemplo local `Our+Lady+of+Guadalupe+Chibi.3mf`, com PLA, bico de 0,4 mm e processo 0,16 mm Optimal, a posição original passou na conversão e no fatiamento (2h18min03s; 28,69 g estimados). Uma rotação lateral também passou no fatiador (2h49min10s; 32,13 g), porém sua estimativa de apoio caiu de 1.216 para 5,4 mm². O assistente a rejeita e recomenda manter a figura em pé. Os valores são estimativas do fatiador instalado neste computador; a análise não prova acabamento melhor no rosto.
 
