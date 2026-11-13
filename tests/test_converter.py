@@ -15,6 +15,27 @@ from test_project import MODEL, SETTINGS, write_project
 
 
 class ConverterTests(unittest.TestCase):
+    def test_lost_plate_instance_prevents_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.3mf"
+            target = Path(directory) / "target.3mf"
+            write_project(source)
+            write_project(target, names=[
+                ("3D/3dmodel.model", MODEL),
+                ("Metadata/model_settings.config", SETTINGS.replace(
+                    b'<model_instance object_id="1"/>', b'')),
+                ("Metadata/project_settings.config", json.dumps({
+                    "printer_model": "Elegoo Centauri Carbon 2",
+                    "filament_type": ["PLA", "PETG"],
+                }).encode()),
+            ])
+            slicer = Mock()
+            slicer.export.return_value = ExportResult(True, target, "exportado")
+            result = convert_project(inspect_project(source), SimpleNamespace(unmapped={}), target, slicer)
+        self.assertFalse(result.success)
+        self.assertIn("Instâncias", result.message)
+        slicer.validate.assert_not_called()
+
     def test_geometry_comparison_tolerates_slicer_float_rounding(self):
         mesh_a = b'<model><mesh><vertices><vertex x="1.234567" y="0" z="0"/></vertices><triangles><triangle v1="0" v2="0" v3="0"/></triangles></mesh></model>'
         mesh_b = b'<model><mesh><vertices><vertex x="1.234575" y="0.000002" z="0"/></vertices><triangles><triangle v1="0" v2="0" v3="0"/></triangles></mesh></model>'

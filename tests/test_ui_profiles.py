@@ -54,3 +54,40 @@ class UIProfileTests(unittest.TestCase):
                                      ("PERFECT PET-G", "My process", "ENDER PLA"))
                 finally:
                     app.destroy()
+
+    def test_suggests_process_matching_source_layer_height_on_inspect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data_dir = root / "AppData" / "ElegooSlicer"
+            exe_dir = root / "ProgramFiles" / "ElegooSlicer"
+            exe_dir.mkdir(parents=True)
+            (exe_dir / "elegoo-slicer.exe").touch()
+            base = "Elegoo Centauri Carbon 2 0.4 nozzle"
+            entries = [
+                ("system/Elegoo/machine/ECC2/base.json", {"type": "machine", "name": base,
+                    "printer_model": "Elegoo Centauri Carbon 2", "nozzle_diameter": ["0.4"]}),
+                ("system/Elegoo/process/ECC2/std.json", {"type": "process", "name": "0.20mm Standard @Elegoo CC2 0.4 nozzle",
+                    "layer_height": "0.20", "compatible_printers": [base]}),
+                ("system/Elegoo/process/ECC2/fine.json", {"type": "process", "name": "0.12mm Fine @Elegoo CC2 0.4 nozzle",
+                    "layer_height": "0.12", "compatible_printers": [base]}),
+                ("system/Elegoo/filament/Generic/base.json", {"type": "filament", "name": "Elegoo PLA @ECC2",
+                    "compatible_printers": [base]}),
+            ]
+            for relative, data in entries:
+                path = data_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(data), encoding="utf-8")
+            env = {"APPDATA": str(root / "AppData"), "ProgramFiles": str(root / "ProgramFiles"),
+                   "MAKER_ELEGOO_CONFIG_DIR": str(root / "prefs")}
+            with patch.dict(os.environ, env):
+                app = MakerElegooApp()
+                try:
+                    self.assertEqual(app.process_var.get(), "0.20mm Standard @Elegoo CC2 0.4 nozzle")
+                    proj = ProjectInfo(root / "mini.3mf", {"layer_height": "0.12"},
+                                       (FilamentInfo(1, "PLA", "#fff", ""),), (), (), (), ())
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj):
+                        app.file_var.set(str(root / "mini.3mf"))
+                        app._inspect_file()
+                    self.assertEqual(app.process_var.get(), "0.12mm Fine @Elegoo CC2 0.4 nozzle")
+                finally:
+                    app.destroy()

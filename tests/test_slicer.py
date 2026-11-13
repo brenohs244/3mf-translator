@@ -10,6 +10,21 @@ from maker_elegoo.slicer import SlicerCLI
 
 
 class SlicerTests(unittest.TestCase):
+    def test_validation_rejects_wrong_plate_numbers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "converted.3mf"
+            project.touch()
+
+            def runner(args, **kwargs):
+                output = Path(args[args.index("--outputdir") + 1])
+                (output / "plate_1.gcode").write_text("G1 X1")
+                (output / "plate_3.gcode").write_text("G1 X3")
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            result = SlicerCLI(Path("elegoo-slicer.exe"), runner=runner).validate(project, 2)
+        self.assertFalse(result.success)
+        self.assertIn("2", result.message)
+
     def test_validation_rejects_zero_exit_without_gcode(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "converted.3mf"

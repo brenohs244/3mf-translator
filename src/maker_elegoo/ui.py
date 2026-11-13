@@ -4,61 +4,167 @@ from __future__ import annotations
 
 import queue
 import json
+import base64
 import subprocess
+import tempfile
 import threading
 import tkinter as tk
 from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
+from zipfile import ZipFile
 
 from .ai import (AIError, Suggestion, apply_suggestions, build_manual_prompt,
                  parse_manual_response, suggest_equivalences)
+from .ai_client import GeminiClient, GeminiClientError, advise_gemini
 from .converter import ConversionResult, convert_project
 from .codex_cli import run_codex
 from .codex_evidence import (build_codex_evidence,
                              validate_codex_recommendations, verify_process_recommendation)
-from .mapping import ConversionPlan, build_conversion
+from .credentials import clear_gemini_key, get_gemini_key, save_gemini_key
+from .labels import (
+    PRIORITY_LABELS,
+    PURPOSE_LABELS,
+    describe_change,
+    format_duration,
+    priority_code,
+    priority_label,
+    purpose_code,
+    purpose_label,
+)
+from .mapping import ConversionPlan, build_conversion, suggest_process
 from .orientation import FRONTS, load_scene, render_front_views
 from .orientation_service import (OrientationAnalysis, apply_orientation,
                                   evaluate_orientations)
+from .optimization import compare_objectives
+from .professor import Advice, PrintGoal, advise_offline, apply_advice
 from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles, resolve_profile
 from .project import ProjectInfo, inspect_project
+from .scale import RescaleResult, ScaleError, analyze_scale_risk, rescale_3mf
 from .settings import load_settings, save_settings
 from .slicer import SlicerCLI
 
 
+def format_plate_color_guide(plates: tuple | list, filaments: tuple | list) -> list[str]:
+    if not plates:
+        return []
+    fil_by_slot = {str(getattr(f, "slot", i)): f for i, f in enumerate(filaments, 1)}
+    lines = ["", "Guia por Placa & Troca de Cores:"]
+    for plate in plates:
+        slots = tuple(dict.fromkeys(
+            s for s in ((getattr(plate, "used_filament_slots", ()) or getattr(plate, "filament_slots", ())))
+            if s and s != "0"
+        ))
+        slot_desc = []
+        for slot in slots:
+            info = fil_by_slot.get(str(slot))
+            if info and hasattr(info, "material"):
+                slot_desc.append(f"{slot} ({info.material} {info.color})")
+            elif info and hasattr(info, "name"):
+                slot_desc.append(f"{slot} ({info.name})")
+            else:
+                slot_desc.append(str(slot))
+        paint_tag = " [pintura multicolorida]" if getattr(plate, "has_paint_color", False) else ""
+        color_text = ", ".join(slot_desc) if slot_desc else "padrão (slot 1)"
+        lines.append(f"  Placa {plate.number}: {plate.instance_count} instância(s) · Cores: {color_text}{paint_tag}")
+        if len(slots) > 4:
+            lines.append(f"    ⚠ Atenção: {len(slots)} cores na mesma placa (Canvas ECC2 aceita 4 automáticas; extras exigem troca manual).")
+    return lines
+
+
 def format_project_summary(project: ProjectInfo) -> str:
     lines = [f"Arquivo: {project.path.name}",
-             f"Origem: {project.source_settings.get('printer_model', 'desconhecida')}",
-             f"{len(project.plates)} placas · {len(project.objects)} objetos · {len(project.filaments)} filamentos",
-             "Filamentos:"]
-    lines.extend(f"  {filament.slot}. {filament.material} {filament.color} ({filament.profile or 'sem perfil'})"
-                 for filament in project.filaments)
+             f"Origem: {project.source_settings.get('printer_model', 'desconhecida')}"]
+    layer = project.source_settings.get("layer_height")
+    if layer:
+        lines.append(f"Altura de camada original: {layer} mm")
+    lines.extend([
+        f"{len(project.plates)} placas · {len(project.objects)} objetos · {len(project.filaments)} filamentos",
+        "Filamentos:",
+    ])
+    used = set(getattr(project, "used_filament_slots", ()) or ())
+    for filament in project.filaments:
+        unused_note = " (não usado nas placas)" if used and str(filament.slot) not in used else ""
+        lines.append(f"  {filament.slot}. {filament.material} {filament.color} ({filament.profile or 'sem perfil'}){unused_note}")
+    lines.extend(format_plate_color_guide(project.plates, project.filaments))
+    geom = getattr(project, "geometry_summary", None)
+    if geom is not None and getattr(geom, "triangle_count", 0) > 0:
+        lines.append(
+            f"Geometria: {geom.triangle_count:,} triângulos · "
+            f"{geom.size_x:.1f} × {geom.size_y:.1f} × {geom.size_z:.1f} mm · "
+            f"Apoio: {geom.contact_mm2:.0f} mm² · Overhang >45°: {geom.overhang_mm2:.0f} mm²"
+        )
+        if geom.has_slender_parts:
+            lines.append("  ⚠ Parte pequena/esguia detectada: atenção à adesão na mesa.")
+    advanced = getattr(project, "advanced_features", ())
+    if advanced:
+        lines.extend(["Recursos avançados detectados (confira após abrir no Slicer):",
+                      *(f"  • {item}" for item in advanced)])
     if project.warnings:
         lines.extend(["Avisos:", *(f"  • {warning}" for warning in project.warnings)])
     return "\n".join(lines)
 
 
-def format_conversion_report(result: ConversionResult, plan: ConversionPlan) -> str:
+def format_conversion_report(result: ConversionResult, plan: ConversionPlan,
+                             *, professor_advices: tuple | list = (),
+                             rescale_info: RescaleResult | None = None) -> str:
     lines = ["CONVERSÃO CONCLUÍDA" if result.success else "CONVERSÃO COM FALHA",
              result.message, "", f"Destino: {result.destination}",
              f"Máquina: {plan.machine.name}", f"Processo: {plan.process.name}",
              "Filamentos:"]
     lines.extend(f"  {index}. {profile.name}" for index, profile in enumerate(plan.filaments, 1))
+    if rescale_info is not None:
+        ox, oy, oz = rescale_info.original_size_mm
+        nx, ny, nz = rescale_info.new_size_mm
+        lines.extend([
+            "",
+            f"Redimensionamento uniforme: {rescale_info.scale_factor * 100:.1f}% "
+            f"({ox:.1f}×{oy:.1f}×{oz:.1f} mm → {nx:.1f}×{ny:.1f}×{nz:.1f} mm)",
+        ])
+        if rescale_info.removed_variable_layer:
+            lines.append("  • Curva antiga de altura variável removida por mudança de altura Z.")
+        lines.extend(f"  • Aviso de escala: {w}" for w in rescale_info.risk.warnings)
+    applied = [item for item in professor_advices if item.scope != "alert"]
+    alerts = [item for item in professor_advices if item.scope == "alert"]
+    if applied:
+        lines.extend(["", "O Professor ajustou:"])
+        for item in applied:
+            lines.append(f"  • {describe_change(item.key, item.current, item.proposed)}")
+            if item.why:
+                lines.append(f"    Por quê: {item.why}")
+    if alerts:
+        lines.extend(["", "Atenção (avisos do Professor):"])
+        for item in alerts:
+            lines.append(f"  • {item.title}: {item.why}")
     lines.extend(["", f"Parâmetros de processo transferidos: {len(plan.transferred)}",
                   f"Campos sem equivalência confirmada: {len(result.unmapped)}"])
     if result.geometry:
         lines.append("Malhas: " + ("preservadas (tolerância de 0,0001 mm)" if result.geometry.unchanged
                                      else "diferenças detectadas; confira antes de imprimir"))
+    if result.output_project:
+        lines.extend(["", "Placas e instâncias (origem → saída):"])
+        for original, converted in zip(getattr(result, "source_plates", ()) or (), result.output_project.plates):
+            lines.append(f"  Placa {original.number}: {original.instance_count} → {converted.instance_count}")
+            if original.object_ids and converted.object_ids:
+                lines.append(f"    IDs de objetos: {', '.join(original.object_ids)} → {', '.join(converted.object_ids)}")
+        lines.extend(format_plate_color_guide(result.output_project.plates, result.output_project.filaments))
+        lines.extend(["", "Filamentos (perfil selecionado → saída):"])
+        for original, converted in zip(plan.filaments, result.output_project.filaments):
+            lines.append(f"  {converted.slot}. {original.name} → {converted.material} {converted.color}")
+        lines.append("Pintura, suportes manuais e modificadores: conferência visual necessária no Slicer.")
     if result.validation:
         lines.append(f"Fatiamento: {result.validation.plate_count} placas verificadas")
+        if result.validation.estimated_seconds is not None:
+            lines.append(f"Tempo total estimado: {format_duration(result.validation.estimated_seconds)}")
+        if result.validation.filament_grams is not None:
+            lines.append(f"Material estimado: {result.validation.filament_grams:.2f} g")
         lines.extend(f"Aviso do fatiador: {warning}" for warning in result.validation.warnings)
     if plan.material_findings:
         lines.extend(["", "Mudanças de material/perfil:"])
-        lines.extend(f"  Filamento {item.slot}: {item.key} {item.source} → {item.target}"
+        lines.extend(f"  Filamento {item.slot}: {describe_change(item.key, item.source, item.target)}"
                      for item in plan.material_findings)
     if result.unmapped:
-        lines.extend(["", "Campos a revisar (primeiros 30):"])
+        lines.extend(["", "Detalhes técnicos (campos não mapeados - primeiros 30):"])
         lines.extend(f"  • {key}" for key in list(sorted(result.unmapped))[:30])
     lines.extend(["", "Confira a posição das peças, cores, suportes e prévia no ELEGOO Slicer antes de imprimir."])
     return "\n".join(lines)
@@ -114,12 +220,15 @@ class MakerElegooApp(tk.Tk):
         self.filament_vars: list[tk.StringVar] = []
         self.worker_queue: queue.Queue = queue.Queue()
         self.ai_queue: queue.Queue = queue.Queue()
+        self.professor_queue: queue.Queue = queue.Queue()
         self.orientation_queue: queue.Queue = queue.Queue()
+        self.comparison_queue: queue.Queue = queue.Queue()
         self.orientation_cancel = threading.Event()
         self.orientation_dialog: tk.Toplevel | None = None
         self.orientation_analysis: OrientationAnalysis | None = None
         self.orientation_plan: ConversionPlan | None = None
         self.orientation_generation = 0
+        self._pending_scale_advices: list[Advice] = []
 
         self.file_var = tk.StringVar()
         self.nozzle_var = tk.StringVar(value=self.preferences["nozzle"])
@@ -127,18 +236,31 @@ class MakerElegooApp(tk.Tk):
         self.process_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Selecione um projeto 3MF para começar")
         self.ai_provider_var = tk.StringVar(value="Codex")
+        self.mode_var = tk.StringVar(value=self.preferences.get("mode", "offline"))
+        self.purpose_var = tk.StringVar(value=purpose_label(self.preferences.get("purpose", "decorativa")))
+        self.priority_var = tk.StringVar(value=priority_label(self.preferences.get("priority", "equilibrio")))
+        self.ai_model_var = tk.StringVar(value=self.preferences.get("ai_model", "gemini-3.8-flash"))
+        self.scale_mode_var = tk.StringVar(value="Original (100%)")
+        self.scale_value_var = tk.StringVar(value="")
         self._refreshing_profiles = False
         self._build_layout()
         self.nozzle_var.trace_add("write", lambda *_: self._refresh_profiles())
         self.process_var.trace_add("write", lambda *_: self._profiles_changed())
+        self.mode_var.trace_add("write", lambda *_: self._save_preferences())
+        self.purpose_var.trace_add("write", lambda *_: self._save_preferences())
+        self.priority_var.trace_add("write", lambda *_: self._save_preferences())
+        self.ai_model_var.trace_add("write", lambda *_: self._save_preferences())
+        self.scale_mode_var.trace_add("write", lambda *_: self._on_scale_mode_changed())
         self._refresh_profiles()
         self._worker_after = self.after(150, self._poll_worker)
         self._ai_after = self.after(150, self._poll_ai)
+        self._professor_after = self.after(150, self._poll_professor)
         self._orientation_after = self.after(150, self._poll_orientation)
+        self._comparison_after = self.after(150, self._poll_comparison)
 
     def destroy(self):
         self.orientation_cancel.set()
-        for name in ("_worker_after", "_ai_after", "_orientation_after"):
+        for name in ("_worker_after", "_ai_after", "_professor_after", "_orientation_after", "_comparison_after"):
             callback = getattr(self, name, None)
             if callback is not None:
                 self.after_cancel(callback)
@@ -147,8 +269,13 @@ class MakerElegooApp(tk.Tk):
     def _build_layout(self):
         menu = tk.Menu(self)
         tools_menu = tk.Menu(menu, tearoff=False)
+        tools_menu.add_command(label="Configurar Chave Google Gemini", command=self._configure_gemini_key)
         tools_menu.add_command(label="Ajuste guiado por IA (sem API)", command=self._manual_ai)
         tools_menu.add_command(label="Analisar orientação de figura", command=self._orientation_open)
+        tools_menu.add_command(label="Prévia de compatibilidade", command=self._preview_compatibility)
+        tools_menu.add_command(label="Salvar relatório", command=self._save_report)
+        tools_menu.add_command(label="Comparar objetivos de impressão", command=self._compare_objectives)
+        tools_menu.add_command(label="Comparar placas antes/depois", command=self._show_plate_comparison)
         menu.add_cascade(label="Ferramentas", menu=tools_menu)
         self.configure(menu=menu)
         outer = ttk.Frame(self, padding=18)
@@ -182,6 +309,44 @@ class MakerElegooApp(tk.Tk):
         self.filament_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
         self.filament_frame.columnconfigure(1, weight=1)
 
+        consultant = ttk.LabelFrame(outer, text="3  Professor de Impressão (Uso e Ajustes)", padding=12)
+        consultant.pack(fill="x", pady=(0, 12))
+        consultant.columnconfigure(1, weight=1)
+        consultant.columnconfigure(3, weight=1)
+
+        ttk.Label(consultant, text="Modo:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        mode_box = ttk.Frame(consultant)
+        mode_box.grid(row=0, column=1, columnspan=3, sticky="w")
+        ttk.Radiobutton(mode_box, text="100% Offline (Regras Locais)", variable=self.mode_var, value="offline").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(mode_box, text="IA (Google Gemini)", variable=self.mode_var, value="ai").pack(side="left", padx=(0, 12))
+        ttk.Button(mode_box, text="Chave Gemini...", command=self._configure_gemini_key).pack(side="left")
+
+        ttk.Label(consultant, text="Uso da Peça:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
+        self.purpose_combo = ttk.Combobox(consultant, textvariable=self.purpose_var, state="readonly",
+                                          values=tuple(PURPOSE_LABELS.values()))
+        self.purpose_combo.grid(row=1, column=1, sticky="ew", pady=(10, 0), padx=(0, 12))
+
+        ttk.Label(consultant, text="Prioridade:").grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(10, 0))
+        self.priority_combo = ttk.Combobox(consultant, textvariable=self.priority_var, state="readonly",
+                                           values=tuple(PRIORITY_LABELS.values()))
+        self.priority_combo.grid(row=1, column=3, sticky="ew", pady=(10, 0))
+
+        ttk.Label(consultant, text="Tamanho:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
+        self.scale_mode_combo = ttk.Combobox(
+            consultant,
+            textvariable=self.scale_mode_var,
+            state="readonly",
+            values=("Original (100%)", "Escala (%)", "Altura Z (mm)"),
+        )
+        self.scale_mode_combo.grid(row=2, column=1, sticky="ew", pady=(10, 0), padx=(0, 12))
+
+        ttk.Label(consultant, text="Valor:").grid(row=2, column=2, sticky="w", padx=(0, 8), pady=(10, 0))
+        scale_val_box = ttk.Frame(consultant)
+        scale_val_box.grid(row=2, column=3, sticky="ew", pady=(10, 0))
+        self.scale_value_entry = ttk.Entry(scale_val_box, textvariable=self.scale_value_var, width=10, state="disabled")
+        self.scale_value_entry.pack(side="left")
+        ttk.Label(scale_val_box, text="ex.: 80 (mm) ou 50 (%)", foreground="#555555").pack(side="left", padx=(8, 0))
+
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=(0, 12))
         self.convert_button = ttk.Button(actions, text="Converter e fatiar para validar", command=self._convert)
@@ -197,7 +362,7 @@ class MakerElegooApp(tk.Tk):
                      state="readonly", width=8).pack(side="left", padx=(5, 0))
         ttk.Label(actions, textvariable=self.status_var).pack(side="right")
 
-        report_frame = ttk.LabelFrame(outer, text="3  Análise e relatório", padding=8)
+        report_frame = ttk.LabelFrame(outer, text="4  Análise e relatório", padding=8)
         report_frame.pack(fill="both", expand=True)
         self.report = scrolledtext.ScrolledText(report_frame, wrap="word", font=("Consolas", 10), state="disabled")
         self.report.pack(fill="both", expand=True)
@@ -209,11 +374,129 @@ class MakerElegooApp(tk.Tk):
         self.report.insert("1.0", content)
         self.report.configure(state="disabled")
 
+    def _save_report(self):
+        content = self.report.get("1.0", "end-1c")
+        destination = filedialog.asksaveasfilename(
+            title="Salvar relatório local", defaultextension=".txt",
+            filetypes=[("Texto", "*.txt")])
+        if destination:
+            Path(destination).write_text(content, encoding="utf-8")
+
+    def _preview_compatibility(self):
+        if not self.project or not self.install:
+            messagebox.showinfo("Dados incompletos", "Analise um 3MF e selecione os perfis primeiro.")
+            return
+        try:
+            machine, process, filaments = self._selected_profiles()
+            plan = build_conversion(self.project, self.install, machine, process, filaments)
+        except (ValueError, IndexError, StopIteration, ProfileError) as exc:
+            messagebox.showerror("Prévia", str(exc))
+            return
+        lines = ["PRÉVIA DE COMPATIBILIDADE", format_project_summary(self.project), "",
+                 f"Transferidos: {len(plan.transferred)}", *
+                 (f"  {key} = {value}" for key, value in sorted(plan.transferred.items())),
+                 f"Substituídos pelo perfil ELEGOO: {len(plan.replaced)}", *
+                 (f"  {key}" for key in sorted(plan.replaced)),
+                 f"Sem equivalência confirmada: {len(plan.unmapped)}", *
+                 (f"  {key}" for key in sorted(plan.unmapped))]
+        self._set_report("\n".join(lines))
+
+    def _compare_objectives(self):
+        if not self.project or not self.install:
+            messagebox.showinfo("Dados incompletos", "Analise um 3MF e selecione os perfis primeiro.")
+            return
+        folder = filedialog.askdirectory(title="Pasta nova para as variantes")
+        if not folder:
+            return
+        try:
+            machine, process, filaments = self._selected_profiles()
+            plan = build_conversion(self.project, self.install, machine, process, filaments)
+        except (ValueError, IndexError, StopIteration, ProfileError) as exc:
+            messagebox.showerror("Comparação", str(exc))
+            return
+        project, install = self.project, self.install
+        self.status_var.set("Fatiando variantes...")
+
+        def work():
+            try:
+                variants = compare_objectives(project, plan, Path(folder), SlicerCLI(install.executable))
+                self.comparison_queue.put((variants, None))
+            except Exception as exc:
+                self.comparison_queue.put((None, exc))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_plate_comparison(self):
+        if not self.project or not self.result or not self.result.output_project:
+            messagebox.showinfo("Comparação", "Converta um projeto para comparar as placas.")
+            return
+        window = tk.Toplevel(self)
+        window.title("Placas: origem e saída")
+        window.geometry("850x700")
+        previews = ttk.Frame(window)
+        previews.pack(fill="x", padx=12, pady=8)
+        window._plate_images = []
+        for row, plate in enumerate(self.project.plates):
+            for column, (label, project) in enumerate((("Origem", self.project),
+                                                        ("ELEGOO", self.result.output_project))):
+                ttk.Label(previews, text=f"Placa {plate.number} · {label}").grid(row=2 * row, column=column, padx=12)
+                try:
+                    with ZipFile(project.path) as archive:
+                        name = f"Metadata/plate_{plate.number}.png"
+                        if name in archive.namelist() and archive.getinfo(name).file_size <= 5_000_000:
+                            photo = tk.PhotoImage(data=base64.b64encode(archive.read(name)).decode("ascii"))
+                            factor = max(1, (max(photo.width(), photo.height()) + 249) // 250)
+                            photo = photo.subsample(factor)
+                            window._plate_images.append(photo)
+                            ttk.Label(previews, image=photo).grid(row=2 * row + 1, column=column, padx=12)
+                        else:
+                            ttk.Label(previews, text="Prévia indisponível").grid(row=2 * row + 1, column=column)
+                except (OSError, tk.TclError):
+                    ttk.Label(previews, text="Prévia indisponível").grid(row=2 * row + 1, column=column)
+        columns = ("placa", "origem", "saida", "estado")
+        table = ttk.Treeview(window, columns=columns, show="headings")
+        for column, label in zip(columns, ("Placa", "Origem", "ELEGOO", "Verificação")):
+            table.heading(column, text=label)
+            table.column(column, width=90 if column == "placa" else 230)
+        for before, after in zip(self.project.plates, self.result.output_project.plates):
+            table.insert("", "end", values=(before.number,
+                f"{before.instance_count} instâncias; IDs {', '.join(before.object_ids)}",
+                f"{after.instance_count} instâncias; IDs {', '.join(after.object_ids)}",
+                "contagem igual" if before.instance_count == after.instance_count else "diferença"))
+        table.pack(fill="both", expand=True, padx=12, pady=12)
+        ttk.Label(window, text="IDs podem mudar na exportação. Confira posição, pintura, cores e suportes no ELEGOO Slicer.").pack(padx=12, pady=(0, 12))
+
+    def _poll_comparison(self):
+        try:
+            variants, error = self.comparison_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if error:
+                self.status_var.set("Falha na comparação")
+                self._set_report(str(error))
+            else:
+                lines = ["COMPARAÇÃO DE OBJETIVOS", "Valores estimados pelo ELEGOO Slicer; confira cada variante antes de imprimir."]
+                for item in variants:
+                    validation = item.result.validation
+                    lines.extend(["", item.objective.upper(), item.result.message,
+                                  f"Ajustes: {item.changed or 'perfil original'}",
+                                  f"Tempo: {validation.estimated_seconds if validation else None} s",
+                                  f"Material: {validation.filament_grams if validation else None} g",
+                                  f"Arquivo: {item.result.destination}"])
+                self._set_report("\n".join(lines))
+                self.status_var.set("Comparação concluída")
+        self._comparison_after = self.after(150, self._poll_comparison)
+
     def _save_preferences(self):
         save_settings({"nozzle": self.nozzle_var.get(),
                        "machine": self.machine_var.get(),
                        "last_dir": str(Path(self.file_var.get()).parent) if self.file_var.get() else self.preferences["last_dir"],
-                       "slicer_exe": str(self.install.executable) if self.install else self.preferences["slicer_exe"]})
+                       "slicer_exe": str(self.install.executable) if self.install else self.preferences["slicer_exe"],
+                       "mode": self.mode_var.get(),
+                       "purpose": purpose_code(self.purpose_var.get()),
+                       "priority": priority_code(self.priority_var.get()),
+                       "ai_model": self.ai_model_var.get()})
 
     def _choose_slicer(self):
         filename = filedialog.askopenfilename(title="Localize elegoo-slicer.exe", filetypes=[("Executável", "*.exe")])
@@ -258,7 +541,7 @@ class MakerElegooApp(tk.Tk):
         finally:
             self._refreshing_profiles = False
 
-    def _refresh_dependents(self):
+    def _refresh_dependents(self, *, prefer_suggested: bool = False):
         self._profiles_changed()
         machine = next((item for item in self.machine_profiles if item.name == self.machine_var.get()), None)
         if not self.install or machine is None:
@@ -270,8 +553,14 @@ class MakerElegooApp(tk.Tk):
             self.filament_profiles = list_profiles(self.install, "filament", nozzle, machine=machine)
         options = [profile.name for profile in self.process_profiles]
         self.process_combo["values"] = options
-        if self.process_var.get() not in options:
-            self.process_var.set(next((name for name in options if "Standard" in name), options[0] if options else ""))
+        suggested = suggest_process(self.project.source_settings, self.process_profiles) if self.project else None
+        if prefer_suggested and suggested and suggested.name in options:
+            self.process_var.set(suggested.name)
+        elif self.process_var.get() not in options:
+            if suggested and suggested.name in options:
+                self.process_var.set(suggested.name)
+            else:
+                self.process_var.set(next((name for name in options if "Standard" in name), options[0] if options else ""))
         self._render_filaments()
         if self.install:
             self._save_preferences()
@@ -307,7 +596,7 @@ class MakerElegooApp(tk.Tk):
             self.orientation_button.configure(state="normal")
             self.open_button.configure(state="disabled")
             self._set_report(format_project_summary(self.project))
-            self._render_filaments()
+            self._refresh_dependents(prefer_suggested=True)
             self.status_var.set("Projeto analisado")
             self._save_preferences()
         except Exception as exc:
@@ -323,8 +612,10 @@ class MakerElegooApp(tk.Tk):
             ttk.Label(self.filament_frame, text="Os filamentos aparecerão após a análise do projeto.").grid(row=0, column=0, sticky="w")
             return
         options = [profile.name for profile in self.filament_profiles]
+        used_slots = set(getattr(self.project, "used_filament_slots", ()) or ())
         for row, filament in enumerate(self.project.filaments):
-            ttk.Label(self.filament_frame, text=f"Filamento {filament.slot}: {filament.material} {filament.color}").grid(row=row, column=0, sticky="w", padx=(0, 12), pady=3)
+            unused_tag = " (não usado nas placas)" if used_slots and str(filament.slot) not in used_slots else ""
+            ttk.Label(self.filament_frame, text=f"Filamento {filament.slot}: {filament.material} {filament.color}{unused_tag}").grid(row=row, column=0, sticky="w", padx=(0, 12), pady=3)
             preferred = next((name for name in options if name == f"Elegoo {filament.material} @ECC2"), None)
             if not preferred:
                 preferred = next((name for name in options if filament.material.upper() in name.upper() and "@ECC2" in name), None)
@@ -543,9 +834,113 @@ class MakerElegooApp(tk.Tk):
             pass
         self._orientation_after = self.after(150, self._poll_orientation)
 
+    def _configure_gemini_key(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Configurar Chave Google Gemini")
+        dialog.geometry("540x260")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        current_key = get_gemini_key()
+        status_text = "Status: Chave configurada e salva com segurança." if current_key else "Status: Nenhuma chave salva."
+        ttk.Label(frame, text="Chave de API do Google Gemini (salva criptografada via Windows DPAPI):", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        status_lbl = ttk.Label(frame, text=status_text, foreground="green" if current_key else "gray")
+        status_lbl.pack(anchor="w", pady=(4, 10))
+
+        key_var = tk.StringVar(value=current_key or "")
+        entry = ttk.Entry(frame, textvariable=key_var, show="*")
+        entry.pack(fill="x", pady=(0, 10))
+
+        model_frame = ttk.Frame(frame)
+        model_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(model_frame, text="Modelo:").pack(side="left", padx=(0, 8))
+        ttk.Combobox(model_frame, textvariable=self.ai_model_var, values=("gemini-3.8-flash", "gemini-3.5-flash-lite"),
+                     state="readonly", width=22).pack(side="left")
+
+        btn_box = ttk.Frame(frame)
+        btn_box.pack(fill="x", pady=(8, 0))
+
+        def save():
+            k = key_var.get().strip()
+            if k:
+                save_gemini_key(k)
+                messagebox.showinfo("Sucesso", "Chave salva com sucesso!", parent=dialog)
+                dialog.destroy()
+            else:
+                messagebox.showwarning("Aviso", "Informe uma chave de API válida.", parent=dialog)
+
+        def clear():
+            clear_gemini_key()
+            key_var.set("")
+            status_lbl.configure(text="Status: Chave removida.", foreground="gray")
+            messagebox.showinfo("Removida", "Chave apagada com sucesso.", parent=dialog)
+
+        def test_conn():
+            k = key_var.get().strip() or get_gemini_key() or ""
+            if not k:
+                messagebox.showwarning("Aviso", "Informe ou salve uma chave de API primeiro.", parent=dialog)
+                return
+            status_lbl.configure(text="Status: Testando conexão com o Google Gemini...", foreground="#555555")
+            test_btn.configure(state="disabled")
+
+            def work():
+                try:
+                    GeminiClient(api_key=k, model=self.ai_model_var.get()).test_connection()
+                    res = (True, "Conexão validada com sucesso!")
+                except GeminiClientError as exc:
+                    res = (False, str(exc))
+                if dialog.winfo_exists():
+                    dialog.after(0, lambda: done_test(res))
+
+            def done_test(res):
+                if not dialog.winfo_exists():
+                    return
+                test_btn.configure(state="normal")
+                ok, msg = res
+                status_lbl.configure(text=f"Status: {msg}", foreground="green" if ok else "#B00020")
+
+            threading.Thread(target=work, daemon=True).start()
+
+        ttk.Button(btn_box, text="Salvar Chave", command=save).pack(side="left", padx=(0, 8))
+        test_btn = ttk.Button(btn_box, text="Testar Conexão", command=test_conn)
+        test_btn.pack(side="left", padx=(0, 8))
+        ttk.Button(btn_box, text="Remover Chave", command=clear).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_box, text="Fechar", command=dialog.destroy).pack(side="right")
+
+    def _on_scale_mode_changed(self):
+        if hasattr(self, "scale_value_entry"):
+            if self.scale_mode_var.get() == "Original (100%)":
+                self.scale_value_var.set("")
+                self.scale_value_entry.configure(state="disabled")
+            else:
+                self.scale_value_entry.configure(state="normal")
+
+    def _parse_scale_request(self) -> tuple[float | None, float | None]:
+        mode = self.scale_mode_var.get()
+        if mode == "Original (100%)":
+            return None, None
+        raw = self.scale_value_var.get().strip().replace(",", ".")
+        if not raw:
+            raise ScaleError("Informe o valor de redimensionamento (ex.: 80 para 80 mm ou 50 para 50%).")
+        try:
+            num = float(raw)
+        except ValueError as exc:
+            raise ScaleError("Valor de escala inválido; use apenas números positivos.") from exc
+        if num <= 0:
+            raise ScaleError("O valor de escala deve ser maior que zero.")
+        if mode == "Escala (%)":
+            return num, None
+        return None, num
+
     def _convert(self):
         if not self.project or not self.install:
             messagebox.showinfo("Dados incompletos", "Analise um 3MF e localize o ELEGOO Slicer primeiro.")
+            return
+        try:
+            scale_percent, target_height_mm = self._parse_scale_request()
+        except ScaleError as exc:
+            messagebox.showerror("Escala inválida", str(exc))
             return
         destination = filedialog.asksaveasfilename(title="Salvar projeto ELEGOO", defaultextension=".3mf",
                                                     initialfile=self.project.path.stem + "_ELEGOO.3mf",
@@ -561,28 +956,252 @@ class MakerElegooApp(tk.Tk):
         except (IndexError, StopIteration):
             messagebox.showerror("Perfil ausente", "Escolha um processo e um perfil para cada filamento.")
             return
+
+        plan = build_conversion(self.project, self.install, machine, process, filaments)
+        goal = PrintGoal(
+            purpose=purpose_code(self.purpose_var.get()),
+            priority=priority_code(self.priority_var.get()),
+        )
+
+        scale_advices: list[Advice] = []
+        if scale_percent is not None or target_height_mm is not None:
+            geom = getattr(self.project, "geometry_summary", None)
+            if geom is not None and getattr(geom, "size_z", 0.0) > 1e-6:
+                factor = (target_height_mm / geom.size_z) if target_height_mm is not None else (scale_percent / 100.0)
+                nozzle = float(str(plan.machine_settings.get("nozzle_diameter", ["0.4"])[0]))
+                try:
+                    risk = analyze_scale_risk(factor, (geom.size_x, geom.size_y, geom.size_z),
+                                              nozzle_mm=nozzle, purpose=goal.purpose)
+                except ScaleError as exc:
+                    messagebox.showerror("Escala inválida", str(exc))
+                    return
+                for warn in risk.warnings:
+                    scale_advices.append(Advice("alert", None, "", "", "", "Alerta de Redimensionamento", warn, False))
+                if risk.recommend_finer_layer:
+                    cur_h = str(plan.process_settings.get("layer_height", "0.2"))
+                    try:
+                        if float(cur_h) > float(risk.recommend_finer_layer) + 0.01:
+                            scale_advices.append(Advice(
+                                "process", None, "layer_height", cur_h, risk.recommend_finer_layer,
+                                "Camada Mais Fina Para Peça Reduzida",
+                                "Compensa a redução de tamanho preservando contornos e detalhes com bico 0.4 mm.",
+                                True,
+                            ))
+                    except ValueError:
+                        pass
+
+        self._pending_scale_advices = scale_advices
+
+        # Obter conselhos do Professor (Offline ou IA em thread separada)
+        if self.mode_var.get() == "ai":
+            key = get_gemini_key()
+            if not key:
+                if messagebox.askyesno("Chave Ausente", "Nenhuma chave Gemini salva. Deseja configurar agora?"):
+                    self._configure_gemini_key()
+                    return
+                self.mode_var.set("offline")
+                advices = advise_offline(self.project, plan, goal)
+                self._finish_professor_lookup(plan, destination, advices)
+                return
+
+            consent = messagebox.askyesno(
+                "Autorizar envio ao Google Gemini",
+                "Enviar resumo textual (materiais de origem/destino, uso, prioridade, bico e parâmetros permitidos) ao Google Gemini?\n\n"
+                "O arquivo 3MF, a malha e o G-code NÃO serão enviados.",
+                parent=self,
+            )
+            if not consent:
+                self.status_var.set("Conversão cancelada pelo usuário")
+                return
+
+            self.convert_button.configure(state="disabled")
+            self.status_var.set("Consultando Professor IA (Google Gemini)...")
+            self._start_gemini_professor(self.project, plan, goal, destination, key, self.ai_model_var.get())
+            return
+
+        advices = advise_offline(self.project, plan, goal)
+        self._finish_professor_lookup(plan, destination, advices)
+
+    def _start_gemini_professor(self, project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal,
+                                destination: str, key: str, model_name: str):
+        self.convert_button.configure(state="disabled")
+        self.status_var.set(f"Consultando Professor IA ({model_name})...")
+
+        def work_ai():
+            try:
+                client = GeminiClient(api_key=key, model=model_name)
+                ai_advices = advise_gemini(client, project, plan, goal)
+                self.professor_queue.put((project, plan, goal, destination, model_name, ai_advices, None))
+            except Exception as exc:
+                self.professor_queue.put((project, plan, goal, destination, model_name, None, exc))
+
+        threading.Thread(target=work_ai, daemon=True).start()
+
+    def _finish_professor_lookup(self, plan: ConversionPlan, destination: str, advices: list[Advice]):
+        merged = list(advices) + list(getattr(self, "_pending_scale_advices", ()))
+        self._pending_scale_advices = []
+        if merged:
+            self._show_professor_dialog(plan, destination, merged)
+        else:
+            self._execute_conversion(plan, destination)
+
+    def _poll_professor(self):
+        try:
+            project, plan, goal, destination, model_name, advices, error = self.professor_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self.convert_button.configure(state="normal")
+            if error:
+                if (isinstance(error, GeminiClientError)
+                        and error.status_code == 429
+                        and model_name != "gemini-3.5-flash-lite"
+                        and (key := get_gemini_key())):
+                    if messagebox.askyesno(
+                        "Cota do Gemini excedida",
+                        f"O modelo {model_name} atingiu o limite de cota (HTTP 429).\n\n"
+                        "Deseja tentar automaticamente com o modelo mais leve (gemini-3.5-flash-lite)?",
+                        parent=self,
+                    ):
+                        self._start_gemini_professor(project, plan, goal, destination, key, "gemini-3.5-flash-lite")
+                        self._professor_after = self.after(150, self._poll_professor)
+                        return
+                if isinstance(error, GeminiClientError) and messagebox.askyesno(
+                    "IA Indisponível",
+                    f"{error}\n\nDeseja utilizar o Professor Offline (regras locais) nesta conversão?",
+                    parent=self,
+                ):
+                    offline_advices = advise_offline(project, plan, goal)
+                    self._finish_professor_lookup(plan, destination, offline_advices)
+                else:
+                    self.status_var.set("Falha ao consultar IA" if not isinstance(error, GeminiClientError) else "Conversão cancelada pelo usuário")
+                    if not isinstance(error, GeminiClientError):
+                        messagebox.showerror("Professor IA", str(error), parent=self)
+            else:
+                self._finish_professor_lookup(plan, destination, advices or [])
+        self._professor_after = self.after(150, self._poll_professor)
+
+    def _show_professor_dialog(self, plan: ConversionPlan, destination: str, advices: list[Advice]):
+        dialog = tk.Toplevel(self)
+        dialog.title("Professor de Impressão · Recomendações e Ajustes")
+        dialog.geometry("780x560")
+        dialog.transient(self)
+
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+
+        mode_name = "IA (Google Gemini)" if self.mode_var.get() == "ai" else "100% Offline (Engenharia)"
+        ttk.Label(frame, text=f"Conselhos do Professor — Modo {mode_name}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        ttk.Label(frame, text="Revise e selecione os ajustes recomendados para sua peça antes do fatiamento.",
+                  wraplength=740).pack(anchor="w", pady=(2, 10))
+
+        list_container = ttk.Frame(frame)
+        list_container.pack(fill="both", expand=True)
+
+        content_canvas = tk.Canvas(list_container, borderwidth=0, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=content_canvas.yview)
+        scrollable_frame = ttk.Frame(content_canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: content_canvas.configure(scrollregion=content_canvas.bbox("all"))
+        )
+        canvas_window = content_canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        content_canvas.bind(
+            "<Configure>",
+            lambda e: content_canvas.itemconfigure(canvas_window, width=e.width),
+        )
+        content_canvas.configure(yscrollcommand=scrollbar.set)
+        dialog.bind(
+            "<MouseWheel>",
+            lambda e: content_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units"),
+        )
+
+        content_canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        check_vars: list[tuple[Advice, tk.BooleanVar]] = []
+
+        # Listar conselhos
+        for adv in advices:
+            adv_box = ttk.LabelFrame(scrollable_frame, text=adv.title, padding=8)
+            adv_box.pack(fill="x", expand=True, pady=4, padx=4)
+
+            if adv.scope == "alert":
+                ttk.Label(adv_box, text=f"Aviso importante:\n{adv.why}", foreground="#B34700", wraplength=700).pack(anchor="w")
+            else:
+                var = tk.BooleanVar(value=adv.default_on)
+                chk = ttk.Checkbutton(
+                    adv_box,
+                    text=f"Aplicar: {adv.current} → {adv.proposed}",
+                    variable=var
+                )
+                chk.pack(anchor="w")
+                ttk.Label(adv_box, text=f"Por quê: {adv.why}", wraplength=700, foreground="#333333").pack(anchor="w", pady=(4, 0))
+                check_vars.append((adv, var))
+
+        btn_box = ttk.Frame(frame)
+        btn_box.pack(fill="x", pady=(12, 0))
+
+        alerts = [adv for adv in advices if adv.scope == "alert"]
+
+        def proceed():
+            approved = [adv for adv, var in check_vars if var.get()]
+            dialog.destroy()
+            final_plan = apply_advice(plan, approved)
+            self._execute_conversion(final_plan, destination, professor_advices=[*approved, *alerts])
+
+        def skip():
+            dialog.destroy()
+            self._execute_conversion(plan, destination, professor_advices=alerts)
+
+        ttk.Button(btn_box, text="Aplicar Selecionados e Converter", command=proceed).pack(side="left")
+        ttk.Button(btn_box, text="Converter Sem Ajustes", command=skip).pack(side="left", padx=8)
+        ttk.Button(btn_box, text="Cancelar", command=dialog.destroy).pack(side="right")
+
+    def _execute_conversion(self, plan: ConversionPlan, destination: str,
+                            *, professor_advices: list[Advice] | tuple[Advice, ...] = ()):
         self.convert_button.configure(state="disabled")
         self.ai_button.configure(state="disabled")
         self.status_var.set("Convertendo e fatiando... pode levar alguns minutos")
         project = self.project
         install = self.install
         approved = tuple(self.ai_approved)
+        prof_tuple = tuple(professor_advices)
+        scale_percent, target_height_mm = self._parse_scale_request()
+        purpose = purpose_code(self.purpose_var.get())
 
         def work():
+            rescale_info = None
             try:
-                plan = build_conversion(project, install, machine, process, filaments)
+                active_plan = plan
                 if approved:
-                    plan = replace(plan, process_settings=apply_suggestions(plan.process_settings, list(approved)))
-                result = convert_project(project, plan, Path(destination), SlicerCLI(install.executable))
-                self.worker_queue.put((result, plan, approved, None))
+                    active_plan = replace(active_plan, process_settings=apply_suggestions(active_plan.process_settings, list(approved)))
+                if scale_percent is not None or target_height_mm is not None:
+                    with tempfile.TemporaryDirectory(prefix="maker-elegoo-scale-") as tmp_dir:
+                        area = active_plan.machine_settings.get("printable_area", ["0x0", "256x0", "256x256", "0x256"])
+                        height = float(str(active_plan.machine_settings.get("printable_height", "256")))
+                        nozzle = float(str(active_plan.machine_settings.get("nozzle_diameter", ["0.4"])[0]))
+                        scaled_path = Path(tmp_dir) / project.path.name
+                        rescale_info = rescale_3mf(
+                            project.path, scaled_path,
+                            scale_percent=scale_percent, target_height_mm=target_height_mm,
+                            printable_area=area, printable_height=height,
+                            nozzle_mm=nozzle, purpose=purpose,
+                        )
+                        working_project = inspect_project(scaled_path, include_geometry=False)
+                        result = convert_project(working_project, active_plan, Path(destination), SlicerCLI(install.executable))
+                else:
+                    result = convert_project(project, active_plan, Path(destination), SlicerCLI(install.executable))
+                self.worker_queue.put((result, active_plan, approved, prof_tuple, rescale_info, None))
             except Exception as exc:
-                self.worker_queue.put((None, None, approved, exc))
+                self.worker_queue.put((None, None, approved, prof_tuple, rescale_info, exc))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _poll_worker(self):
         try:
-            result, plan, approved, error = self.worker_queue.get_nowait()
+            result, plan, approved, prof_tuple, rescale_info, error = self.worker_queue.get_nowait()
         except queue.Empty:
             pass
         else:
@@ -593,7 +1212,7 @@ class MakerElegooApp(tk.Tk):
             else:
                 self.result = result
                 self.last_plan = plan
-                report = format_conversion_report(result, plan)
+                report = format_conversion_report(result, plan, professor_advices=prof_tuple, rescale_info=rescale_info)
                 if approved:
                     report += "\n\nSugestões IA aprovadas e aplicadas:\n" + "\n".join(
                         f"  • {item.target_key} = {item.value}: {item.reason}" for item in approved)
@@ -646,8 +1265,12 @@ class MakerElegooApp(tk.Tk):
         response_box.pack(fill="both", expand=True)
 
         def make_prompt():
-            context = {key: self.project.source_settings.get(key) for key in
-                       ("printer_model", "filament_type", "nozzle_diameter")}
+            target_mats = [str(cfg.get("filament_type", [""])[0]) for cfg in self.last_plan.filament_settings]
+            context = {
+                "printer_model": self.last_plan.machine.name,
+                "filament_type": target_mats,
+                "nozzle_diameter": self.last_plan.machine_settings.get("nozzle_diameter"),
+            }
             prompt = build_manual_prompt(self.result.unmapped, self.last_plan.process_settings,
                                          context, priority.get(), purpose.get(), notes.get())
             prompt_box.delete("1.0", "end")
@@ -697,8 +1320,12 @@ class MakerElegooApp(tk.Tk):
         self.status_var.set("Consultando Gemini...")
         unmapped = dict(self.result.unmapped)
         target = dict(self.last_plan.process_settings)
-        context = {name: self.project.source_settings.get(name) for name in
-                   ("printer_model", "filament_type", "nozzle_diameter")}
+        target_mats = [str(cfg.get("filament_type", [""])[0]) for cfg in self.last_plan.filament_settings]
+        context = {
+            "printer_model": self.last_plan.machine.name,
+            "filament_type": target_mats,
+            "nozzle_diameter": self.last_plan.machine_settings.get("nozzle_diameter"),
+        }
 
         def work():
             try:

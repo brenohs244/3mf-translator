@@ -1,4 +1,4 @@
-﻿"""Allowlisted local evidence and strict Codex recommendation gates."""
+"""Allowlisted local evidence and strict Codex recommendation gates."""
 from __future__ import annotations
 
 import math
@@ -45,11 +45,19 @@ def build_codex_evidence(project, plan, result, orientation=None) -> dict:
     """Return only text and measurements safe for explicit review and consent."""
     nozzle = plan.machine_settings.get('nozzle_diameter', [])
     nozzle = nozzle[0] if isinstance(nozzle, (list, tuple)) and nozzle else nozzle
-    materials = sorted({item.material.upper() for item in project.filaments
-                        if item.material.upper() in _MATERIALS})
+    source_materials = sorted({item.material.upper() for item in project.filaments
+                               if item.material.upper() in _MATERIALS})
+    target_filaments = getattr(plan, 'filament_settings', None) or ()
+    target_materials = sorted({
+        str((cfg.get('filament_type') or [''])[0] if isinstance(cfg.get('filament_type'), (list, tuple))
+            else cfg.get('filament_type', '')).upper()
+        for cfg in target_filaments
+    } & _MATERIALS)
+    materials = target_materials or source_materials
     evidence = {'printer_model': 'Elegoo Centauri Carbon 2',
                 'nozzle_mm': str(nozzle) if _SAFE_VALUE.fullmatch(str(nozzle)) else None,
                 'materials': materials,
+                'source_materials': source_materials,
                 'process_options': _settings(plan.process_settings),
                 'unmapped_keys': sorted(key for key in plan.unmapped
                                         if isinstance(key, str) and re.fullmatch(r'[a-z][a-z0-9_]{1,50}', key)

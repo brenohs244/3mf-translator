@@ -40,3 +40,24 @@ class SettingsTests(unittest.TestCase):
             path.write_text("broken", encoding="utf-8")
             settings = load_settings(path)
         self.assertEqual(settings["nozzle"], "0.4")
+
+    def test_includes_professor_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "prefs.json"
+            settings = load_settings(path)
+            self.assertEqual(settings.get("mode"), "offline")
+            self.assertEqual(settings.get("purpose"), "decorativa")
+            self.assertEqual(settings.get("priority"), "equilibrio")
+            self.assertEqual(settings.get("ai_model"), "gemini-3.8-flash")
+
+            save_settings({
+                "mode": "ai",
+                "purpose": "esforco",
+                "priority": "economia",
+                "ai_model": "gemini-3.5-flash-lite",
+            }, path)
+            updated = load_settings(path)
+            self.assertEqual(updated.get("mode"), "ai")
+            self.assertEqual(updated.get("purpose"), "esforco")
+            self.assertEqual(updated.get("priority"), "economia")
+            self.assertEqual(updated.get("ai_model"), "gemini-3.5-flash-lite")

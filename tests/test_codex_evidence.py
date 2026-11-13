@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from types import SimpleNamespace
 from maker_elegoo.codex_evidence import build_codex_evidence, validate_codex_recommendations
 
@@ -67,6 +67,20 @@ class EvidenceTests(unittest.TestCase):
             report=verify_process_recommendation(SimpleNamespace(path=Path('source.3mf')),
                                                  plan,baseline,suggestion,object())
         self.assertFalse(report['verified'])
+
+    def test_evidence_uses_target_filament_materials_when_present(self):
+        project = SimpleNamespace(path='source.3mf', objects=(), source_settings={},
+                                  filaments=(SimpleNamespace(material='PLA', profile=''),))
+        plan = SimpleNamespace(
+            machine_settings={'printer_model': 'Elegoo Centauri Carbon 2', 'nozzle_diameter': ['0.4']},
+            process_settings={'wall_loops': '2'},
+            filament_settings=({'filament_type': ['ABS']},),
+            unmapped={},
+        )
+        result = SimpleNamespace(success=True, validation=None, geometry=None)
+        payload = build_codex_evidence(project, plan, result)
+        self.assertEqual(payload['materials'], ['ABS'])
+        self.assertEqual(payload['source_materials'], ['PLA'])
 
 
 

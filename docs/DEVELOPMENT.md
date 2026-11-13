@@ -35,6 +35,16 @@ O pacote também não contém perfis personalizados: cada computador mostra os p
 
 ## Limites técnicos
 
+## Regressão local e variantes
+
+Para repetir a conversão e o fatiamento de exemplos locais após atualizar o ELEGOO Slicer:
+
+```powershell
+python scripts/regression_local.py --output "$env:TEMP\maker-elegoo-regression" caminho\exemplo.3mf
+```
+
+O script escolhe o primeiro perfil de máquina e processo compatível com o bico e um perfil de cada material. Confira os perfis selecionados antes de usar os resultados como comparação definitiva. A pasta de saída contém cópias convertidas e `regression.json`; escolha uma pasta fora do repositório. A interface oferece uma prévia de compatibilidade e variantes locais para qualidade, velocidade, economia e resistência. Os objetivos só alteram parâmetros presentes no perfil e cada variante precisa passar pelo fatiamento. Estimativas não comprovam acabamento nem resistência real.
+
 - A opção Codex usa o CLI instalado e autenticado no próprio computador. O app mostra um resumo de campos permitidos e medições locais antes do consentimento, chama `codex exec` em diretório temporário vazio com sessão efêmera, sandbox de leitura e esquema JSON, e valida a resposta localmente. O 3MF, a malha, as vistas, o G-code e caminhos do projeto não entram no resumo. Recomendações de suporte são refatiadas antes de serem aplicáveis; orientação só aceita candidatas locais já fatiadas. A qualidade visual final ainda exige revisão no ELEGOO Slicer.
 
 - O assistente opcional de orientação lê a malha localmente, mostra quatro vistas para escolher a frente e compara a posição atual com eixos principais e pequenas inclinações. A triagem mede apoio na mesa e risco frontal aproximado; recomenda mudança apenas após validação pelo ELEGOO Slicer e ganho frontal claro. A primeira versão aceita uma placa e uma instância de malha. A aplicação pede confirmação, salva uma nova cópia e fatia novamente. O 3MF, as vistas e o G-code não são enviados à IA. Confira visualmente o rosto e os suportes no fatiador; as medidas geométricas não provam qualidade estética.

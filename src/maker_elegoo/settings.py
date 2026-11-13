@@ -8,7 +8,16 @@ import os
 from pathlib import Path
 
 
-DEFAULTS = {"nozzle": "0.4", "machine": "", "last_dir": "", "slicer_exe": ""}
+DEFAULTS = {
+    "nozzle": "0.4",
+    "machine": "",
+    "last_dir": "",
+    "slicer_exe": "",
+    "mode": "offline",
+    "purpose": "decorativa",
+    "priority": "equilibrio",
+    "ai_model": "gemini-3.8-flash",
+}
 
 
 def _valid_nozzle(value: str) -> bool:

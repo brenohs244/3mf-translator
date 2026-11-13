@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from zipfile import ZipFile
+from zipfile import ZipFile, is_zipfile
 
 from .mapping import ConversionPlan
 from .project import ProjectInfo
@@ -61,19 +61,51 @@ def _details(result: subprocess.CompletedProcess, folder: Path) -> str:
     return f"ELEGOO Slicer terminou com código {result.returncode}"
 
 
-def _patched_source(project: ProjectInfo, repairs: dict, destination: Path) -> Path:
-    if not repairs:
-        return project.path.resolve()
-    with ZipFile(project.path) as source, ZipFile(destination, "w") as target:
+def _rewrite_project_settings(source_zip: Path, dest_zip: Path, settings: dict) -> None:
+    """Reescreve Metadata/project_settings.config mantendo os demais itens do 3MF."""
+    with ZipFile(source_zip) as source, ZipFile(dest_zip, "w") as target:
         for info in source.infolist():
             if info.filename == "Metadata/project_settings.config":
-                settings = dict(project.source_settings)
-                settings.update(repairs)
                 target.writestr(info, json.dumps(settings, ensure_ascii=False).encode("utf-8"))
             else:
                 with source.open(info) as stream_in, target.open(info, "w") as stream_out:
                     shutil.copyfileobj(stream_in, stream_out, length=1024 * 1024)
+
+
+def _patched_source(project: ProjectInfo, repairs: dict, destination: Path) -> Path:
+    if not repairs:
+        return project.path.resolve()
+    settings = dict(project.source_settings)
+    for key, value in repairs.items():
+        if value is None:
+            settings.pop(key, None)
+        else:
+            settings[key] = value
+    _rewrite_project_settings(project.path, destination, settings)
     return destination
+
+
+def _sync_exported_prime_tower(destination: Path, wanted: object) -> None:
+    """Restaura enable_prime_tower quando --export-3mf o descarta em projetos multicoloridos."""
+    if wanted != "1" or not is_zipfile(destination):
+        return
+    with ZipFile(destination) as archive:
+        if "Metadata/project_settings.config" not in archive.namelist():
+            return
+        try:
+            settings = json.loads(archive.read("Metadata/project_settings.config"))
+        except (ValueError, UnicodeDecodeError):
+            return
+    if not isinstance(settings, dict) or settings.get("enable_prime_tower") == "1":
+        return
+    settings["enable_prime_tower"] = "1"
+    temporary = destination.with_name(f"{destination.name}.tmp")
+    try:
+        _rewrite_project_settings(destination, temporary, settings)
+        temporary.replace(destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 class SlicerCLI:
@@ -113,6 +145,7 @@ class SlicerCLI:
                 return ExportResult(False, destination, f"Falha ao iniciar ELEGOO Slicer: {exc}")
             if result.returncode != 0 or not destination.is_file() or destination.stat().st_size == 0:
                 return ExportResult(False, destination, _details(result, folder))
+            _sync_exported_prime_tower(destination, plan.process_settings.get("enable_prime_tower"))
             return ExportResult(True, destination, "Projeto ELEGOO exportado")
 
     def validate(self, project: Path, plate_count: int) -> ValidationResult:
@@ -128,10 +161,12 @@ class SlicerCLI:
                 return ValidationResult(False, 0, f"Falha ao iniciar ELEGOO Slicer: {exc}")
             if result.returncode != 0:
                 return ValidationResult(False, 0, _details(result, folder))
-            gcodes = [path for path in folder.glob("plate_*.gcode") if path.stat().st_size > 0]
-            if len(gcodes) < plate_count:
-                return ValidationResult(False, len(gcodes),
-                                        f"G-code gerado para {len(gcodes)} de {plate_count} placas")
+            gcodes = [folder / f"plate_{number}.gcode" for number in range(1, plate_count + 1)]
+            present = [path for path in gcodes if path.is_file() and path.stat().st_size > 0]
+            if len(present) != plate_count:
+                missing = [str(number) for number, path in enumerate(gcodes, 1) if path not in present]
+                return ValidationResult(False, len(present),
+                                        f"G-code ausente ou vazio nas placas: {', '.join(missing)}")
             warnings = tuple(line for line in (result.stderr or "").splitlines()
                              if "warning" in line.lower() or "aviso" in line.lower())
             metrics = [_gcode_metrics(path) for path in gcodes]

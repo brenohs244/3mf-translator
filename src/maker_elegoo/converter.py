@@ -10,7 +10,7 @@ from xml.etree import ElementTree
 from zipfile import ZipFile
 
 from .mapping import ConversionPlan
-from .project import ProjectInfo, inspect_project
+from .project import PlateInfo, ProjectInfo, inspect_project
 from .slicer import ExportResult, SlicerCLI, ValidationResult
 
 
@@ -30,6 +30,7 @@ class ConversionResult:
     geometry: GeometryComparison | None
     output_project: ProjectInfo | None
     unmapped: dict
+    source_plates: tuple[PlateInfo, ...] = ()
 
 
 def _geometry_hashes(path: Path) -> dict[str, str]:
@@ -63,8 +64,8 @@ def _geometry_hashes(path: Path) -> dict[str, str]:
 
 
 def _mesh_shapes(path: Path) -> list[tuple[list[tuple[float, float, float]], str]]:
-    """Read mesh coordinates for the slicer's tiny floating point rewrites."""
-    shapes = []
+    """Read per-mesh coordinates for the slicer's tiny floating point rewrites."""
+    shapes: list[tuple[list[tuple[float, float, float]], str]] = []
     with ZipFile(path) as archive:
         for name in archive.namelist():
             if not (name.startswith("3D/") and name.endswith(".model")):
@@ -72,9 +73,17 @@ def _mesh_shapes(path: Path) -> list[tuple[list[tuple[float, float, float]], str
             vertices: list[tuple[float, float, float]] = []
             triangles = hashlib.sha256()
             triangle_count = 0
+            in_mesh = False
             with archive.open(name) as stream:
-                for _, element in ElementTree.iterparse(stream, events=("end",)):
+                for event, element in ElementTree.iterparse(stream, events=("start", "end")):
                     tag = element.tag.rsplit("}", 1)[-1]
+                    if event == "start":
+                        if tag == "mesh":
+                            vertices = []
+                            triangles = hashlib.sha256()
+                            triangle_count = 0
+                            in_mesh = True
+                        continue
                     if tag == "vertex":
                         vertices.append(tuple(float(element.get(axis, "nan"))
                                               for axis in ("x", "y", "z")))
@@ -83,8 +92,14 @@ def _mesh_shapes(path: Path) -> list[tuple[list[tuple[float, float, float]], str
                                         for key in ("v1", "v2", "v3"))
                         triangles.update(f"{indices[0]},{indices[1]},{indices[2]};".encode())
                         triangle_count += 1
+                    elif tag == "mesh":
+                        if vertices or triangle_count:
+                            shapes.append((vertices, triangles.hexdigest()))
+                        vertices = []
+                        triangle_count = 0
+                        in_mesh = False
                     element.clear()
-            if vertices or triangle_count:
+            if not in_mesh and (vertices or triangle_count):
                 shapes.append((vertices, triangles.hexdigest()))
     return shapes
 
@@ -98,16 +113,20 @@ def _same_meshes_within_tolerance(source: Path, target: Path,
         return False
     if len(before) != len(after) or not before:
         return False
-    remaining = list(after)
+    buckets: dict[tuple[str, int], list[list[tuple[float, float, float]]]] = {}
+    for candidate, digest in after:
+        buckets.setdefault((digest, len(candidate)), []).append(candidate)
     for vertices, triangles in before:
-        match = next((index for index, (candidate, digest) in enumerate(remaining)
-                      if digest == triangles and len(candidate) == len(vertices)
-                      and all(abs(a - b) <= tolerance
-                              for left, right in zip(vertices, candidate)
-                              for a, b in zip(left, right))), None)
+        candidates = buckets.get((triangles, len(vertices)))
+        if not candidates:
+            return False
+        match = next((index for index, candidate in enumerate(candidates)
+                      if all(abs(a - b) <= tolerance
+                             for left, right in zip(vertices, candidate)
+                             for a, b in zip(left, right))), None)
         if match is None:
             return False
-        remaining.pop(match)
+        candidates.pop(match)
     return True
 
 
@@ -128,7 +147,7 @@ def convert_project(project: ProjectInfo, plan: ConversionPlan, destination: Pat
         return ConversionResult(False, exported.destination, exported.message, exported,
                                 None, None, None, plan.unmapped)
     try:
-        output = inspect_project(exported.destination)
+        output = inspect_project(exported.destination, include_geometry=False)
     except Exception as exc:
         return ConversionResult(False, exported.destination, f"Saída 3MF inválida: {exc}", exported,
                                 None, None, None, plan.unmapped)
@@ -137,6 +156,21 @@ def convert_project(project: ProjectInfo, plan: ConversionPlan, destination: Pat
                                 exported, None, None, output, plan.unmapped)
     if len(output.plates) != len(project.plates):
         return ConversionResult(False, exported.destination, "Quantidade de placas mudou na exportação",
+                                exported, None, None, output, plan.unmapped)
+    for source_plate, target_plate in zip(project.plates, output.plates):
+        if source_plate.instance_count != target_plate.instance_count:
+            return ConversionResult(False, exported.destination,
+                                    f"Instâncias da placa {source_plate.number} mudaram na exportação",
+                                    exported, None, None, output, plan.unmapped)
+        if (source_plate.filament_slots and target_plate.filament_slots
+                and all(source_plate.filament_slots) and all(target_plate.filament_slots)
+                and source_plate.filament_slots != target_plate.filament_slots):
+            return ConversionResult(False, exported.destination,
+                                    f"Associação de filamentos da placa {source_plate.number} mudou",
+                                    exported, None, None, output, plan.unmapped)
+    if len(output.filaments) != len(project.filaments):
+        return ConversionResult(False, exported.destination,
+                                "Quantidade de filamentos mudou na exportação",
                                 exported, None, None, output, plan.unmapped)
     geometry = compare_geometry(project.path, exported.destination)
     validation = slicer.validate(exported.destination, len(output.plates))
@@ -147,4 +181,4 @@ def convert_project(project: ProjectInfo, plan: ConversionPlan, destination: Pat
         f"{validation.message}; a geometria mudou durante a exportação"
     )
     return ConversionResult(success, exported.destination, message,
-                            exported, validation, geometry, output, unmapped)
+                            exported, validation, geometry, output, unmapped, project.plates)

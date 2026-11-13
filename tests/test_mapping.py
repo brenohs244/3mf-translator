@@ -72,3 +72,46 @@ class MappingTests(unittest.TestCase):
         project = ProjectInfo(root, {}, (FilamentInfo(1, "PLA", "#fff", ""),), (), (), (), ())
         with self.assertRaisesRegex(ValueError, "filamento"):
             build_conversion(project, SlicerInstall(root, root), None, None, [])
+
+    def test_suggest_process_by_source_layer_height(self):
+        from maker_elegoo.mapping import suggest_process
+        from maker_elegoo.profiles import Profile
+        p_fine = Profile("0.12mm Fine @Elegoo CC2 0.4 nozzle", "process", Path("fine.json"), {"layer_height": "0.12"})
+        p_std = Profile("0.20mm Standard @Elegoo CC2 0.4 nozzle", "process", Path("std.json"), {"layer_height": "0.20"})
+        p_draft = Profile("0.24mm Draft @Elegoo CC2 0.4 nozzle", "process", Path("draft.json"), {"layer_height": "0.24"})
+
+        candidates = [p_std, p_fine, p_draft]
+
+        # Origem 0.12 deve sugerir 0.12 Fine
+        sug_12 = suggest_process({"layer_height": "0.12"}, candidates)
+        self.assertIsNotNone(sug_12)
+        self.assertEqual(sug_12.name, "0.12mm Fine @Elegoo CC2 0.4 nozzle")
+
+        # Origem 0.19 deve sugerir 0.20 Standard
+        sug_19 = suggest_process({"layer_height": "0.19"}, candidates)
+        self.assertEqual(sug_19.name, "0.20mm Standard @Elegoo CC2 0.4 nozzle")
+
+    def test_transfers_brim_type_even_when_elegoo_process_omits_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for kind, name, data in [
+                ("machine", "Machine", {"printer_model": "Elegoo Centauri Carbon 2", "nozzle_diameter": ["0.4"]}),
+                ("process", "Standard", {"wall_loops": "2", "layer_height": "0.2"}),
+                ("filament", "PLA", {"filament_type": ["PLA"]}),
+            ]:
+                path = root / "system" / "Elegoo" / kind / (name + ".json")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"type": kind, "name": name, **data}), encoding="utf-8")
+            machine, process, filament = [
+                Profile(name, kind, root / "system" / "Elegoo" / kind / (name + ".json"), {})
+                for kind, name in [("machine", "Machine"), ("process", "Standard"), ("filament", "PLA")]
+            ]
+            project = ProjectInfo(
+                root / "source.3mf",
+                {"brim_type": "no_brim"},
+                (FilamentInfo(1, "PLA", "#FFFFFF", ""),),
+                (PlateInfo(1, 1),), ("Cube",), (), (),
+            )
+            plan = build_conversion(project, SlicerInstall(root / "exe", root), machine, process, [filament])
+        self.assertEqual(plan.process_settings.get("brim_type"), "no_brim")
+        self.assertEqual(plan.transferred.get("brim_type"), "no_brim")
