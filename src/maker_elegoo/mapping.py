@@ -54,6 +54,7 @@ class ConversionPlan:
     replaced: dict
     source_repairs: dict
     material_findings: tuple[Finding, ...]
+    forced_process_keys: tuple[str, ...] = ()
 
 
 def _valid_transfer(key: str, value: object) -> bool:

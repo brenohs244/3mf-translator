@@ -293,6 +293,155 @@ class ProfessorV2AndKeychainsTests(unittest.TestCase):
         self.assertEqual(len(advices), 1)
         self.assertEqual(advices[0].proposed, "arachne")
 
+    def test_pla_to_abs_reinforces_structure_speeds_and_filters_unused_filament_slots(self):
+        proj = ProjectInfo(
+            Path(" multi_slot.3mf"),
+            {"layer_height": "0.2", "wall_loops": "2", "sparse_infill_density": "15%"},
+            (
+                FilamentInfo(1, "PLA", "#111111", "PLA"),
+                FilamentInfo(2, "PLA", "#222222", "PLA"),
+                FilamentInfo(3, "PLA", "#333333", "PLA"),
+            ),
+            (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+            ("Bracket",),
+            (),
+            (),
+            used_filament_slots=("1",),
+        )
+        abs_cfg = {
+            "filament_type": ["ABS"],
+            "fan_max_speed": ["40"],
+            "overhang_fan_speed": ["80"],
+            "additional_cooling_fan_speed": ["0"],
+            "during_print_exhaust_fan_speed": ["70"],
+        }
+        plan = ConversionPlan(
+            machine=self.machine,
+            process=self.process,
+            filaments=(self.fil_pla, self.fil_pla, self.fil_pla),
+            machine_settings=self.machine_settings,
+            process_settings=dict(self.base_process),
+            filament_settings=(dict(abs_cfg), dict(abs_cfg), dict(abs_cfg)),
+            transferred={}, unmapped={}, replaced={}, source_repairs={}, material_findings=(),
+        )
+        # Mesmo em "externa" ou "funcional_leve" com prioridade "equilibrio", PLA -> ABS deve reforçar estrutura e moderar velocidades
+        advices = advise_offline(proj, plan, PrintGoal("externa", "equilibrio"))
+        fil_slots = {a.slot for a in advices if a.scope == "filament"}
+        self.assertEqual(fil_slots, {1})  # Slots 2 e 3 ociosos não devem poluir o diálogo!
+        proc_map = {a.key: a.proposed for a in advices if a.scope == "process"}
+        self.assertEqual(proc_map.get("wall_loops"), "3")
+        self.assertEqual(proc_map.get("top_shell_layers"), "4")
+        self.assertEqual(proc_map.get("sparse_infill_density"), "20%")
+        self.assertEqual(proc_map.get("sparse_infill_pattern"), "gyroid")
+        self.assertEqual(proc_map.get("outer_wall_speed"), "100")
+        self.assertEqual(proc_map.get("inner_wall_speed"), "150")
+
+    def test_apply_advice_and_slicer_export_sync_object_overrides_in_model_settings(self):
+        from zipfile import ZipFile
+        import subprocess
+        from xml.etree import ElementTree
+        from maker_elegoo.slicer import SlicerCLI
+
+        proj = ProjectInfo(
+            Path("override_obj.3mf"),
+            {"layer_height": "0.2", "wall_loops": "3", "sparse_infill_density": "15%"},
+            (FilamentInfo(1, "PLA", "#FFFFFF", "PLA"),),
+            (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+            ("Peca Com Override",),
+            (),
+            (),
+            used_filament_slots=("1",),
+            object_overrides=(
+                ObjectOverride("1", "Peca Com Override", {"sparse_infill_density": "5%", "wall_loops": "2", "enable_support": "1"}),
+            ),
+        )
+        # Global já tem wall_loops=3, mas o objeto tem wall_loops=2 e infill=5%; esforco exige >=4 paredes e >=30% infill
+        plan = self._plan(wall_loops="3", sparse_infill_density="15%")
+        advices = advise_offline(proj, plan, PrintGoal("esforco", "equilibrio"))
+        approved = [a for a in advices if a.default_on]
+        updated_plan = apply_advice(plan, approved)
+        self.assertIn("wall_loops", updated_plan.forced_process_keys)
+        self.assertIn("sparse_infill_density", updated_plan.forced_process_keys)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src_3mf = root / "in.3mf"
+            dst_3mf = root / "out.3mf"
+            model_settings_xml = (
+                '<?xml version="1.0" encoding="UTF-8"?>\n'
+                '<config>\n'
+                '  <object id="1">\n'
+                '    <metadata key="name" value="Peca Com Override"/>\n'
+                '    <metadata key="wall_loops" value="2"/>\n'
+                '    <metadata key="sparse_infill_density" value="5%"/>\n'
+                '    <metadata key="enable_support" value="1"/>\n'
+                '  </object>\n'
+                '</config>'
+            )
+            with ZipFile(src_3mf, "w") as zf:
+                zf.writestr("3D/3dmodel.model", "<model/>")
+                zf.writestr("Metadata/project_settings.config", "{}")
+                zf.writestr("Metadata/model_settings.config", model_settings_xml)
+            proj_on_disk = ProjectInfo(
+                src_3mf, proj.source_settings, proj.filaments, proj.plates, proj.objects,
+                ("3D/3dmodel.model", "Metadata/project_settings.config", "Metadata/model_settings.config"),
+                (), (), proj.used_filament_slots, proj.object_overrides,
+            )
+
+            def fake_runner(args, **kwargs):
+                export_idx = args.index("--export-3mf")
+                out_path = Path(args[export_idx + 1])
+                in_path = Path(args[export_idx + 2])
+                import shutil
+                shutil.copyfile(in_path, out_path)
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            cli = SlicerCLI(root / "elegoo-slicer.exe", runner=fake_runner)
+            res = cli.export(proj_on_disk, updated_plan, dst_3mf)
+            self.assertTrue(res.success)
+            with ZipFile(dst_3mf) as zf:
+                xml_out = ElementTree.fromstring(zf.read("Metadata/model_settings.config"))
+            metas = {m.get("key"): m.get("value") for m in xml_out.find("object").findall("metadata")}
+            self.assertEqual(metas["wall_loops"], "4")
+            self.assertEqual(metas["sparse_infill_density"], "30%")
+            self.assertEqual(metas["enable_support"], "1")
+
+    def test_gemini_merges_offline_diagnostic_alerts_and_sends_extended_context(self):
+        from maker_elegoo.professor import merge_with_offline_alerts
+
+        proj = ProjectInfo(
+            Path("study.3mf"),
+            {"layer_height": "0.2", "elefant_foot_compensation": "0"},
+            tuple(FilamentInfo(i, "PLA", "#111111", "") for i in range(1, 6)),
+            (PlateInfo(1, 1, ("1",), ("1",), ("1", "2", "3", "4", "5"), has_paint_color=True),),
+            ("Statuette",),
+            ("Metadata/layer_heights_profile.txt",),
+            (),
+            advanced_features=("Suporte manual no arquivo sem pintagem/enforcers explícitos",),
+            used_filament_slots=("1", "2", "3", "4", "5"),
+            object_overrides=(ObjectOverride("1", "Statuette", {"sparse_infill_density": "5%"}),),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.prompt = ""
+            def generate_json(self, prompt: str):
+                self.prompt = prompt
+                return {"advices": [{"scope": "process", "key": "wall_loops", "proposed": "3", "title": "3 Paredes", "why": "Reforço", "default_on": True}]}
+
+        client = FakeClient()
+        plan = self._plan()
+        ai_adv = advise_gemini(client, proj, plan, PrintGoal("decorativa", "qualidade"))
+        self.assertIn("max_colors_on_single_plate", client.prompt)
+        self.assertIn("advanced_features", client.prompt)
+        offline_adv = advise_offline(proj, plan, PrintGoal("decorativa", "qualidade"))
+        merged = merge_with_offline_alerts(ai_adv, offline_adv)
+        titles = {a.title for a in merged if a.scope == "alert"}
+        self.assertTrue(any("4 cores" in t.lower() for t in titles))
+        self.assertTrue(any("suporte manual" in t.lower() for t in titles))
+        self.assertTrue(any("preenchimento muito baixo" in t.lower() for t in titles))
+
+
 
 if __name__ == "__main__":
     unittest.main()

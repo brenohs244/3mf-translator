@@ -203,6 +203,22 @@ def _effective_object_support(project: ProjectInfo, proc: dict) -> tuple[bool, b
     return (global_enabled or obj_enabled), obj_enabled and not global_enabled, support_type
 
 
+def _min_effective_int(project: ProjectInfo, proc: dict, key: str, default: int) -> int:
+    val = _as_int(proc.get(key, default), default)
+    for o in getattr(project, "object_overrides", ()) or ():
+        if key in o.settings:
+            val = min(val, _as_int(o.settings[key], val))
+    return val
+
+
+def _min_effective_float(project: ProjectInfo, proc: dict, key: str, default: float) -> float:
+    val = _as_float(proc.get(key, default), default)
+    for o in getattr(project, "object_overrides", ()) or ():
+        if key in o.settings:
+            val = min(val, _as_float(o.settings[key], val))
+    return val
+
+
 def _propose_speed_cap(proc: dict, key: str, limit: float, title: str, why: str, advices: list[Advice]) -> None:
     if key not in proc:
         return
@@ -225,11 +241,20 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
         _as_str(cfg.get("filament_type", "")).upper() in {"ABS", "ASA"}
         for cfg in plan.filament_settings
     )
-    is_original_pla = any(f.material.upper() == "PLA" for f in project.filaments)
+    is_original_pla = any(
+        any(m in f.material.upper() for m in ("PLA", "PETG"))
+        for f in project.filaments
+    )
 
     # 1. Ajustes por Material (Segurança & Fusão de Camadas)
+    used_slots_set = {
+        str(s) for s in (getattr(project, "used_filament_slots", ()) or ())
+        if s and str(s) != "0"
+    }
     if is_abs_asa:
         for idx, cfg in enumerate(plan.filament_settings, 1):
+            if used_slots_set and str(idx) not in used_slots_set:
+                continue
             mat = _as_str(cfg.get("filament_type", "")).upper()
             if mat in {"ABS", "ASA"}:
                 # Ventoinha máxima
@@ -297,6 +322,59 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 default_on=True
             ))
 
+        # Moderação de velocidades para solda intercamadas em ABS/ASA
+        _propose_speed_cap(
+            proc, "outer_wall_speed", 100.0,
+            "Moderar Velocidade Externa para ABS/ASA (100 mm/s)",
+            "Velocidades de PLA (160–200 mm/s) com baixa ventilação comprometem a fusão térmica e o acabamento em ABS/ASA.",
+            advices,
+        )
+        _propose_speed_cap(
+            proc, "inner_wall_speed", 150.0,
+            "Moderar Velocidade Interna para ABS/ASA (150 mm/s)",
+            "Mantém vazão volumétrica estável e melhora a adesão entre camadas no ABS/ASA.",
+            advices,
+        )
+
+        # Reforço estrutural para compensar menor adesão Z do ABS quando peça não é meramente decorativa
+        if goal.purpose != "decorativa":
+            cur_walls = _as_int(proc.get("wall_loops", "2"), 2)
+            if "wall_loops" in proc and cur_walls < 3:
+                advices.append(Advice(
+                    scope="process", slot=None, key="wall_loops",
+                    current=str(cur_walls), proposed="3",
+                    title="Reforço de Paredes para ABS/ASA (≥ 3)",
+                    why="Projetos originalmente feitos para PLA costumam usar 2 paredes; no ABS/ASA, 3 paredes compensam a menor resistência entre camadas e retêm melhor o calor.",
+                    default_on=True,
+                ))
+            cur_top = _as_int(proc.get("top_shell_layers", "3"), 3)
+            if "top_shell_layers" in proc and cur_top < 4:
+                advices.append(Advice(
+                    scope="process", slot=None, key="top_shell_layers",
+                    current=str(cur_top), proposed="4",
+                    title="Reforço de Camadas de Topo para ABS/ASA",
+                    why="Evita fechamento falho sobre o preenchimento com ventilação reduzida no ABS/ASA.",
+                    default_on=True,
+                ))
+            cur_infill = proc.get("sparse_infill_density", "15%")
+            if "sparse_infill_density" in proc and _as_float(cur_infill, 15.0) < 20.0:
+                advices.append(Advice(
+                    scope="process", slot=None, key="sparse_infill_density",
+                    current=str(cur_infill), proposed="20%",
+                    title="Reforço de Preenchimento para ABS/ASA (20%)",
+                    why="Aumenta a ancoragem interna e compensa tensões térmicas na troca de PLA para ABS/ASA.",
+                    default_on=True,
+                ))
+            cur_pattern = proc.get("sparse_infill_pattern", "rectilinear")
+            if "sparse_infill_pattern" in proc and cur_pattern != "gyroid":
+                advices.append(Advice(
+                    scope="process", slot=None, key="sparse_infill_pattern",
+                    current=str(cur_pattern), proposed="gyroid",
+                    title="Padrão Gyroid para ABS/ASA",
+                    why="Evita cruzamento de linhas na mesma camada (comum no grid) e distribui tensões térmicas sem empenar.",
+                    default_on=True,
+                ))
+
         # Alertas de uso de ABS
         advices.append(Advice(
             scope="alert", slot=None, key="",
@@ -318,7 +396,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
     # 2. Ajustes por Uso da Peça (Propósito Mecânico)
     if goal.purpose == "esforco":
         # Paredes
-        cur_walls = _as_int(proc.get("wall_loops", "2"), 2)
+        cur_walls = _min_effective_int(project, proc, "wall_loops", 2)
         if "wall_loops" in proc and cur_walls < 4:
             advices.append(Advice(
                 scope="process", slot=None, key="wall_loops",
@@ -328,7 +406,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 default_on=True
             ))
         # Topo / Base
-        cur_top = _as_int(proc.get("top_shell_layers", "5"), 5)
+        cur_top = _min_effective_int(project, proc, "top_shell_layers", 5)
         if "top_shell_layers" in proc and cur_top < 5:
             advices.append(Advice(
                 scope="process", slot=None, key="top_shell_layers",
@@ -339,11 +417,11 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
             ))
         # Preenchimento
         cur_infill = proc.get("sparse_infill_density", "15%")
-        infill_num = _as_float(cur_infill, 15.0)
+        infill_num = _min_effective_float(project, proc, "sparse_infill_density", 15.0)
         if "sparse_infill_density" in proc and infill_num < 30.0:
             advices.append(Advice(
                 scope="process", slot=None, key="sparse_infill_density",
-                current=str(cur_infill), proposed="30%",
+                current=f"{infill_num:g}%", proposed="30%",
                 title="Aumentar Densidade de Preenchimento",
                 why="Núcleo mais denso para suportar cargas distribuídas sem esmagamento interno.",
                 default_on=True
@@ -631,6 +709,24 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
         ))
 
     elif goal.purpose == "externa":
+        cur_walls = _as_int(proc.get("wall_loops", "2"), 2)
+        if "wall_loops" in proc and cur_walls < 3:
+            advices.append(Advice(
+                scope="process", slot=None, key="wall_loops",
+                current=str(cur_walls), proposed="3",
+                title="Reforço de Paredes para Uso Externo (≥ 3)",
+                why="Aumenta a estanqueidade e a resistência contra dilatação térmica sob sol e chuva.",
+                default_on=True,
+            ))
+        cur_top = _as_int(proc.get("top_shell_layers", "3"), 3)
+        if "top_shell_layers" in proc and cur_top < 4:
+            advices.append(Advice(
+                scope="process", slot=None, key="top_shell_layers",
+                current=str(cur_top), proposed="4",
+                title="Reforço de Topo para Uso Externo",
+                why="Protege o núcleo da peça contra infiltração de água e exposição solar.",
+                default_on=True,
+            ))
         # Checar se filamento é PLA
         for cfg in plan.filament_settings:
             if _as_str(cfg.get("filament_type")).upper() == "PLA":
@@ -823,14 +919,30 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
     return _consolidate_advices(advices)
 
 
+def merge_with_offline_alerts(ai_advices: list[Advice], offline_advices: list[Advice]) -> list[Advice]:
+    """Combina sugestões da IA com alertas diagnósticos determinísticos locais sem duplicar títulos."""
+    merged = list(ai_advices)
+    seen_titles = {adv.title.strip().lower() for adv in merged if adv.scope == "alert"}
+    for adv in offline_advices:
+        if adv.scope == "alert":
+            norm = adv.title.strip().lower()
+            if norm not in seen_titles:
+                seen_titles.add(norm)
+                merged.append(adv)
+    return merged
+
+
 def apply_advice(plan: ConversionPlan, approved: list[Advice]) -> ConversionPlan:
     new_process = dict(plan.process_settings)
     new_filaments = [dict(f) for f in plan.filament_settings]
+    forced_keys = list(getattr(plan, "forced_process_keys", ()) or ())
 
     for adv in approved:
         if adv.scope == "process":
             if validate_change("process", adv.key, adv.proposed, plan):
                 new_process[adv.key] = adv.proposed
+                if adv.key not in forced_keys:
+                    forced_keys.append(adv.key)
         elif adv.scope == "filament" and adv.slot is not None:
             if validate_change("filament", adv.key, adv.proposed, plan, adv.slot):
                 cfg = new_filaments[adv.slot - 1]
@@ -840,4 +952,5 @@ def apply_advice(plan: ConversionPlan, approved: list[Advice]) -> ConversionPlan
         plan,
         process_settings=new_process,
         filament_settings=tuple(new_filaments),
+        forced_process_keys=tuple(forced_keys),
     )

@@ -121,6 +121,13 @@ def advise_gemini(
 
     min_h = plan.machine_settings.get("min_layer_height", ["0.08"])
     max_h = plan.machine_settings.get("max_layer_height", ["0.28"])
+    max_plate_colors = max(
+        (
+            len({s for s in (getattr(p, "used_filament_slots", ()) or getattr(p, "filament_slots", ())) if s and s != "0"})
+            for p in getattr(project, "plates", ())
+        ),
+        default=1,
+    )
     context_payload = {
         "printer": plan.machine_settings.get("printer_model", "ELEGOO"),
         "nozzle_mm": str(plan.machine_settings.get("nozzle_diameter", ["0.4"])[0]),
@@ -128,6 +135,10 @@ def advise_gemini(
         "max_layer_height_mm": str(max_h[0] if isinstance(max_h, list) else max_h),
         "source_materials": source_materials,
         "target_materials": target_materials,
+        "used_filament_slots": list(getattr(project, "used_filament_slots", ()) or ()),
+        "max_colors_on_single_plate": int(max_plate_colors),
+        "advanced_features": list(getattr(project, "advanced_features", ()) or ()),
+        "has_object_overrides": bool(getattr(project, "object_overrides", ())),
         "current_process": safe_process,
         "current_filaments": safe_filaments,
         "goal_purpose": goal.purpose,

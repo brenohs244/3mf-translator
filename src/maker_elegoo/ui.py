@@ -37,7 +37,7 @@ from .orientation import FRONTS, load_scene, render_front_views
 from .orientation_service import (OrientationAnalysis, apply_orientation,
                                   evaluate_orientations)
 from .optimization import compare_objectives
-from .professor import Advice, PrintGoal, advise_offline, apply_advice
+from .professor import Advice, PrintGoal, advise_offline, apply_advice, merge_with_offline_alerts
 from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles, resolve_profile
 from .project import ProjectInfo, inspect_project
 from .scale import RescaleResult, ScaleError, analyze_scale_risk, rescale_3mf
@@ -481,7 +481,7 @@ class MakerElegooApp(tk.Tk):
                     validation = item.result.validation
                     lines.extend(["", item.objective.upper(), item.result.message,
                                   f"Ajustes: {item.changed or 'perfil original'}",
-                                  f"Tempo: {validation.estimated_seconds if validation else None} s",
+                                  f"Tempo: {format_duration(validation.estimated_seconds if validation else None)}",
                                   f"Material: {validation.filament_grams if validation else None} g",
                                   f"Arquivo: {item.result.destination}"])
                 self._set_report("\n".join(lines))
@@ -1031,7 +1031,8 @@ class MakerElegooApp(tk.Tk):
             try:
                 client = GeminiClient(api_key=key, model=model_name)
                 ai_advices = advise_gemini(client, project, plan, goal)
-                self.professor_queue.put((project, plan, goal, destination, model_name, ai_advices, None))
+                merged_ai = merge_with_offline_alerts(ai_advices, advise_offline(project, plan, goal))
+                self.professor_queue.put((project, plan, goal, destination, model_name, merged_ai, None))
             except Exception as exc:
                 self.professor_queue.put((project, plan, goal, destination, model_name, None, exc))
 
@@ -1244,12 +1245,12 @@ class MakerElegooApp(tk.Tk):
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text="Escolha o objetivo, copie o resumo para sua IA e cole a resposta JSON.",
                   wraplength=780).pack(anchor="w")
-        priority = tk.StringVar(value="Equilibrada")
-        purpose = tk.StringVar(value="Decorativa ou visual")
+        priority = tk.StringVar(value=priority_label("equilibrio"))
+        purpose = tk.StringVar(value=purpose_label("decorativa"))
         for label, variable, options in (
-            ("Prioridade", priority, ("Equilibrada", "Qualidade visual", "Resistência", "Velocidade", "Menos material")),
-            ("Uso da peça", purpose, ("Decorativa ou visual", "Funcional, uso leve", "Funcional, com esforço mecânico",
-                                      "Protótipo rápido", "Miniatura com muitos detalhes", "Acabamento para venda"))):
+            ("Prioridade", priority, tuple(PRIORITY_LABELS.values())),
+            ("Uso da peça", purpose, tuple(PURPOSE_LABELS.values())),
+        ):
             row = ttk.Frame(frame)
             row.pack(fill="x", pady=(8, 0))
             ttk.Label(row, text=label, width=17).pack(side="left")
@@ -1306,7 +1307,7 @@ class MakerElegooApp(tk.Tk):
         if self.ai_provider_var.get() == "Codex":
             self._analyze_codex()
             return
-        key = simpledialog.askstring("Gemini", "Chave de API Gemini (não será salva):", show="*", parent=self)
+        key = get_gemini_key() or simpledialog.askstring("Gemini", "Chave de API Gemini (não será salva):", show="*", parent=self)
         if not key:
             return
         consent = messagebox.askyesno(

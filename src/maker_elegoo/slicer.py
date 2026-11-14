@@ -10,6 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from xml.etree import ElementTree
 from zipfile import ZipFile, is_zipfile
 
 from .mapping import ConversionPlan
@@ -61,12 +62,12 @@ def _details(result: subprocess.CompletedProcess, folder: Path) -> str:
     return f"ELEGOO Slicer terminou com código {result.returncode}"
 
 
-def _rewrite_project_settings(source_zip: Path, dest_zip: Path, settings: dict) -> None:
-    """Reescreve Metadata/project_settings.config mantendo os demais itens do 3MF."""
+def _rewrite_3mf_entries(source_zip: Path, dest_zip: Path, replacements: dict[str, bytes]) -> None:
+    """Reescreve entradas específicas mantendo os demais itens do 3MF."""
     with ZipFile(source_zip) as source, ZipFile(dest_zip, "w") as target:
         for info in source.infolist():
-            if info.filename == "Metadata/project_settings.config":
-                target.writestr(info, json.dumps(settings, ensure_ascii=False).encode("utf-8"))
+            if info.filename in replacements:
+                target.writestr(info, replacements[info.filename])
             else:
                 with source.open(info) as stream_in, target.open(info, "w") as stream_out:
                     shutil.copyfileobj(stream_in, stream_out, length=1024 * 1024)
@@ -81,27 +82,54 @@ def _patched_source(project: ProjectInfo, repairs: dict, destination: Path) -> P
             settings.pop(key, None)
         else:
             settings[key] = value
-    _rewrite_project_settings(project.path, destination, settings)
+    _rewrite_3mf_entries(
+        project.path,
+        destination,
+        {"Metadata/project_settings.config": json.dumps(settings, ensure_ascii=False).encode("utf-8")},
+    )
     return destination
 
 
-def _sync_exported_prime_tower(destination: Path, wanted: object) -> None:
-    """Restaura enable_prime_tower quando --export-3mf o descarta em projetos multicoloridos."""
-    if wanted != "1" or not is_zipfile(destination):
+def _sync_exported_prime_tower(destination: Path, wanted: object, forced_process: dict[str, str] | None = None) -> None:
+    """Restaura enable_prime_tower e sincroniza overrides por objeto aprovados pelo Professor."""
+    if not is_zipfile(destination):
         return
+    replacements: dict[str, bytes] = {}
     with ZipFile(destination) as archive:
-        if "Metadata/project_settings.config" not in archive.namelist():
-            return
-        try:
-            settings = json.loads(archive.read("Metadata/project_settings.config"))
-        except (ValueError, UnicodeDecodeError):
-            return
-    if not isinstance(settings, dict) or settings.get("enable_prime_tower") == "1":
+        names = set(archive.namelist())
+        if wanted == "1" and "Metadata/project_settings.config" in names:
+            try:
+                settings = json.loads(archive.read("Metadata/project_settings.config"))
+            except (ValueError, UnicodeDecodeError):
+                settings = None
+            if isinstance(settings, dict) and settings.get("enable_prime_tower") != "1":
+                settings["enable_prime_tower"] = "1"
+                replacements["Metadata/project_settings.config"] = json.dumps(
+                    settings, ensure_ascii=False
+                ).encode("utf-8")
+        if forced_process and "Metadata/model_settings.config" in names:
+            raw_xml = archive.read("Metadata/model_settings.config")
+            if b"<!DOCTYPE" not in raw_xml.upper() and b"<!ENTITY" not in raw_xml.upper():
+                try:
+                    root = ElementTree.fromstring(raw_xml)
+                except ElementTree.ParseError:
+                    root = None
+                if root is not None:
+                    changed_xml = False
+                    for meta in root.iter("metadata"):
+                        mkey = meta.get("key", "")
+                        if mkey in forced_process and meta.get("value") != forced_process[mkey]:
+                            meta.set("value", forced_process[mkey])
+                            changed_xml = True
+                    if changed_xml:
+                        replacements["Metadata/model_settings.config"] = ElementTree.tostring(
+                            root, encoding="utf-8", xml_declaration=True
+                        )
+    if not replacements:
         return
-    settings["enable_prime_tower"] = "1"
     temporary = destination.with_name(f"{destination.name}.tmp")
     try:
-        _rewrite_project_settings(destination, temporary, settings)
+        _rewrite_3mf_entries(destination, temporary, replacements)
         temporary.replace(destination)
     finally:
         if temporary.exists():
@@ -145,7 +173,16 @@ class SlicerCLI:
                 return ExportResult(False, destination, f"Falha ao iniciar ELEGOO Slicer: {exc}")
             if result.returncode != 0 or not destination.is_file() or destination.stat().st_size == 0:
                 return ExportResult(False, destination, _details(result, folder))
-            _sync_exported_prime_tower(destination, plan.process_settings.get("enable_prime_tower"))
+            forced_process = {
+                k: str(plan.process_settings[k])
+                for k in (getattr(plan, "forced_process_keys", ()) or ())
+                if k in plan.process_settings
+            }
+            _sync_exported_prime_tower(
+                destination,
+                plan.process_settings.get("enable_prime_tower"),
+                forced_process=forced_process,
+            )
             return ExportResult(True, destination, "Projeto ELEGOO exportado")
 
     def validate(self, project: Path, plate_count: int) -> ValidationResult:
