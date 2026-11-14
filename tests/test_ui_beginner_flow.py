@@ -1,0 +1,336 @@
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from maker_elegoo.converter import ConversionResult
+from maker_elegoo.professor import Advice, PrintGoal
+from maker_elegoo.profiles import Profile
+from maker_elegoo.project import FilamentInfo, PlateInfo, ProjectInfo
+from maker_elegoo.slicer import ExportResult, PlateValidationMetric, ValidationResult
+from maker_elegoo.ui import MakerElegooApp
+
+
+def _setup_fake_slicer_env(root: Path) -> dict[str, str]:
+    data_dir = root / "AppData" / "ElegooSlicer"
+    exe_dir = root / "ProgramFiles" / "ElegooSlicer"
+    exe_dir.mkdir(parents=True)
+    (exe_dir / "elegoo-slicer.exe").touch()
+    base = "Elegoo Centauri Carbon 2 0.4 nozzle"
+    entries = [
+        (
+            "system/Elegoo/machine/ECC2/base.json",
+            {
+                "type": "machine",
+                "name": base,
+                "printer_model": "Elegoo Centauri Carbon 2",
+                "nozzle_diameter": ["0.4"],
+                "min_layer_height": ["0.08"],
+                "max_layer_height": ["0.28"],
+                "support_chamber_temp_control": "0",
+            },
+        ),
+        (
+            "system/Elegoo/process/ECC2/std.json",
+            {
+                "type": "process",
+                "name": "0.20mm Standard @Elegoo CC2 0.4 nozzle",
+                "layer_height": "0.20",
+                "wall_loops": "2",
+                "top_shell_layers": "3",
+                "bottom_shell_layers": "3",
+                "sparse_infill_density": "15%",
+                "sparse_infill_pattern": "grid",
+                "compatible_printers": [base],
+            },
+        ),
+        (
+            "system/Elegoo/filament/Generic/pla.json",
+            {
+                "type": "filament",
+                "name": "Elegoo PLA @ECC2",
+                "filament_type": ["PLA"],
+                "fan_min_speed": ["60"],
+                "fan_max_speed": ["100"],
+                "compatible_printers": [base],
+            },
+        ),
+        (
+            "system/Elegoo/filament/Generic/abs.json",
+            {
+                "type": "filament",
+                "name": "Elegoo ABS @ECC2",
+                "filament_type": ["ABS"],
+                "fan_min_speed": ["10"],
+                "fan_max_speed": ["40"],
+                "overhang_fan_speed": ["80"],
+                "nozzle_temperature": ["270"],
+                "textured_plate_temp": ["90"],
+                "compatible_printers": [base],
+            },
+        ),
+    ]
+    for rel, payload in entries:
+        path = data_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    return {
+        "APPDATA": str(root / "AppData"),
+        "ProgramFiles": str(root / "ProgramFiles"),
+        "MAKER_ELEGOO_CONFIG_DIR": str(root / "prefs"),
+    }
+
+
+def _collect_all_label_texts(widget) -> str:
+    texts: list[str] = []
+    for child in widget.winfo_children():
+        try:
+            text = child.cget("text")
+            if text:
+                texts.append(str(text))
+        except Exception:
+            pass
+        texts.append(_collect_all_label_texts(child))
+    return "\n".join(texts)
+
+
+class UIBeginnerFlowTests(unittest.TestCase):
+    def test_beginner_main_flow_hides_advanced_details_never_presumes_filament_and_measures_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = _setup_fake_slicer_env(root)
+
+            # 1) Jornada 1: Peça 1-filamento simples, iniciante quer fluxo rápido sem abrir detalhes avançados
+            proj_single = ProjectInfo(
+                root / "chaveiro.3mf",
+                {"printer_model": "Bambu Lab A1", "layer_height": "0.20"},
+                (FilamentInfo(1, "PLA", "#FFFFFF", "Bambu PLA"),),
+                (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+                ("Chaveiro",),
+                (),
+                (),
+                used_filament_slots=("1",),
+            )
+            # 2) Jornada 2: Multi-filamento declarado (5 slots declarados, 1 usado em múltiplas placas)
+            proj_multi = ProjectInfo(
+                root / "multi.3mf",
+                {"printer_model": "Bambu Lab P1S", "layer_height": "0.20"},
+                tuple(FilamentInfo(i, "PETG" if i == 1 else "PLA", "#FFFFFF", f"Slot {i}") for i in range(1, 6)),
+                (
+                    PlateInfo(1, 1, ("1",), ("1",), ("1",)),
+                    PlateInfo(2, 2, ("2", "3"), ("1", "2"), ("1", "2")),
+                ),
+                ("Parte A", "Parte B", "Parte C"),
+                (),
+                (),
+                used_filament_slots=("1", "2"),
+            )
+
+            with patch.dict(os.environ, env):
+                app = MakerElegooApp()
+                try:
+                    # Botão principal orientado ao iniciante e detalhes avançados recolhidos por padrão
+                    self.assertEqual(app.convert_button.cget("text"), "Traduzir para minha ELEGOO")
+                    self.assertFalse(app.advanced_visible.get())
+                    self.assertEqual(app.advanced_frame.winfo_manager(), "")
+
+                    # Abrir detalhes avançados e recolher novamente funciona
+                    app._toggle_advanced()
+                    self.assertTrue(app.advanced_visible.get())
+                    self.assertNotEqual(app.advanced_frame.winfo_manager(), "")
+                    app._toggle_advanced()
+                    self.assertFalse(app.advanced_visible.get())
+
+                    for jornada, proj, mat_choice in (
+                        ("1-filamento", proj_single, "PLA"),
+                        ("multi-placa", proj_multi, "ABS"),
+                    ):
+                        t0 = time.monotonic()
+                        decisions = 0
+
+                        with patch("maker_elegoo.ui.inspect_project", return_value=proj):
+                            app.file_var.set(str(proj.path))
+                            app._inspect_file()  # Decisão 1: escolher 3MF
+
+                        # Regra de ouro: NUNCA presumir filamento físico == 3MF
+                        self.assertFalse(app.physical_filament_confirmed_var.get())
+                        card_unconfirmed = app.preconversion_var.get()
+                        self.assertIn("PENDENTE", card_unconfirmed)
+
+                        # Decisão 2: confirmar filamento físico explicitamente
+                        app.physical_material_var.set(mat_choice)
+                        app.physical_filament_confirmed_var.set(True)
+                        app._on_physical_filament_changed()
+                        decisions += 2  # (1) 3MF + (2) confirmação de filamento físico
+
+                        card_ready = app.preconversion_var.get()
+                        self.assertIn("CARTÃO PRÉ-CONVERSÃO", card_ready)
+                        self.assertIn("Confirmado", card_ready)
+                        self.assertIn(f"{len(proj.plates)} placa", card_ready)
+
+                        if mat_choice == "ABS":
+                            # Verifica se a troca de filamento físico atualizou o slot usado para Elegoo ABS @ECC2 sem abrir avançados
+                            self.assertIn("ABS", app.filament_vars[0].get())
+
+                        # Quando usuário indica uso mecânico sem preencher detalhes ('Não sei'), confiança cai para baixa
+                        from maker_elegoo.labels import purpose_label
+
+                        app.purpose_var.set(purpose_label("esforco"))
+                        self.assertIn("baixa", app.confidence_var.get().lower())
+                        app.purpose_var.set(purpose_label("decorativa"))
+
+                        # Sem ambiguidade/risco quando advices=() e confirmado -> não interrompe usuário
+                        out_path = root / f"out_{jornada}.3mf"
+                        fake_res = ConversionResult(
+                            True,
+                            out_path,
+                            "Todas as placas foram fatiadas",
+                            ExportResult(True, out_path, "Projeto ELEGOO exportado"),
+                            ValidationResult(
+                                True,
+                                len(proj.plates),
+                                "Todas as placas foram fatiadas",
+                                (),
+                                1800,
+                                14.5,
+                                tuple(PlateValidationMetric(p.number, 900, 7.25) for p in proj.plates),
+                            ),
+                            None,
+                            proj,
+                            {},
+                            proj.plates,
+                        )
+                        with patch("maker_elegoo.ui.filedialog.asksaveasfilename", return_value=str(out_path)), \
+                             patch("maker_elegoo.ui.advise_offline", return_value=[]), \
+                             patch("maker_elegoo.ui.convert_project", return_value=fake_res), \
+                             patch.object(app, "_show_professor_dialog") as modal_spy:
+                            app._convert()  # Decisão 3: Traduzir para minha ELEGOO
+                            decisions += 1
+                            deadline = time.monotonic() + 3.0
+                            while app.result is not fake_res and time.monotonic() < deadline:
+                                app.update()
+                                time.sleep(0.01)
+                            modal_spy.assert_not_called()
+
+                        elapsed = time.monotonic() - t0
+                        self.assertLessEqual(decisions, 3)
+                        self.assertLess(elapsed, 3.0)
+                        self.assertEqual(app.result, fake_res)
+                finally:
+                    app.destroy()
+
+    def test_contextual_questions_confidence_professor_dialog_details_and_local_feedback_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = _setup_fake_slicer_env(root)
+            proj = ProjectInfo(
+                root / "suporte.3mf",
+                {"printer_model": "Bambu Lab A1", "layer_height": "0.20"},
+                (FilamentInfo(1, "PLA", "#FFFFFF", "Bambu PLA"),),
+                (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+                ("Suporte",),
+                (),
+                (),
+                used_filament_slots=("1",),
+            )
+            with patch.dict(os.environ, env):
+                app = MakerElegooApp()
+                try:
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj):
+                        app.file_var.set(str(proj.path))
+                        app._inspect_file()
+
+                    # Preenche todas as perguntas contextuais -> confiança Alta
+                    from maker_elegoo.labels import (
+                        criticality_label,
+                        fit_label,
+                        heat_exposure_label,
+                        load_type_label,
+                        priority_label,
+                        purpose_label,
+                    )
+
+                    app.purpose_var.set(purpose_label("esforco"))
+                    app.priority_var.set(priority_label("equilibrio"))
+                    app.load_type_var.set(load_type_label("tracao_eixo_z"))
+                    app.criticality_var.set(criticality_label("alta"))
+                    app.fit_clearance_var.set(fit_label("encaixe_justo"))
+                    app.heat_exposure_var.set(heat_exposure_label("calor_sol"))
+                    app.physical_material_var.set("ABS")
+                    app.physical_filament_confirmed_var.set(True)
+                    app._on_physical_filament_changed()
+
+                    self.assertIn("alta", app.confidence_var.get().lower())
+
+                    goal = app._current_goal()
+                    self.assertEqual(goal.load_type, "tracao_eixo_z")
+                    self.assertEqual(goal.criticality, "alta")
+                    self.assertEqual(goal.fit_clearance, "encaixe_justo")
+                    self.assertEqual(goal.heat_exposure, "calor_sol")
+                    self.assertEqual(goal.physical_material, "ABS")
+
+                    plan = app._selected_profiles()
+                    conv_plan = app._build_current_plan(*plan)
+                    advices = [
+                        Advice(
+                            scope="process",
+                            slot=None,
+                            key="wall_loops",
+                            current="2",
+                            proposed="4",
+                            title="Aumentar Paredes (4)",
+                            why="Maior casca perimetral.",
+                            default_on=True,
+                            expected_effect="Eleva espessura e massa.",
+                            what_to_check="Faça ensaio físico com carga real.",
+                            evidence_class="estimado_regra_ia",
+                            requires_physical_test=False,
+                            confidence="alta",
+                        ),
+                        Advice(
+                            scope="alert",
+                            slot=None,
+                            key="",
+                            current="",
+                            proposed="",
+                            title="Carga no Eixo Z",
+                            why="Esforço perpendicular às camadas.",
+                            default_on=False,
+                            expected_effect="Evitar falso senso de segurança.",
+                            what_to_check="Rotacione no Slicer e teste fisicamente.",
+                            evidence_class="depende_teste_fisico",
+                            requires_physical_test=True,
+                            confidence="alta",
+                        ),
+                    ]
+                    dialog = app._show_professor_dialog(conv_plan, str(root / "out.3mf"), advices)
+                    try:
+                        all_text = _collect_all_label_texts(dialog).lower()
+                        self.assertIn("efeito esperado:", all_text)
+                        self.assertIn("o que conferir:", all_text)
+                        self.assertIn("depende de teste físico", all_text)
+                    finally:
+                        dialog.destroy()
+
+                    # Testar registro de feedback local opt-in sem rede/3MF
+                    from maker_elegoo.history import load_feedback_history
+
+                    app.save_history_var.set(True)
+                    rec = app._record_feedback(
+                        target_material="ABS",
+                        purpose="esforco",
+                        visual_result="empenou_soltou",
+                        notes="Canto levantou sem brim.",
+                    )
+                    self.assertIsNotNone(rec)
+                    saved_records = load_feedback_history()
+                    self.assertEqual(len(saved_records), 1)
+                    self.assertEqual(saved_records[0].visual_result, "empenou_soltou")
+                finally:
+                    app.destroy()

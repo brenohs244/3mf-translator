@@ -46,6 +46,7 @@ PURPOSE_LABELS: dict[str, str] = {
     "externa": "Uso externo / sol / calor",
     "chaveiro_rigido": "Chaveiro / peça plana com relevo (acabamento)",
     "chaveiro_articulado": "Chaveiro articulado / print-in-place",
+    "nao_sei": "Não sei informar (confiança reduzida)",
 }
 
 PRIORITY_LABELS: dict[str, str] = {
@@ -55,8 +56,55 @@ PRIORITY_LABELS: dict[str, str] = {
     "economia": "Economia de material",
 }
 
+LOAD_TYPE_LABELS: dict[str, str] = {
+    "nao_sei": "Não sei informar",
+    "decorativa": "Sem carga mecânica (apenas visual)",
+    "flexao_lateral": "Flexão / esforço paralelo às camadas (XY)",
+    "tracao_eixo_z": "Tração / puxão entre camadas (eixo Z)",
+    "compressao": "Compressão / esmagamento",
+    "impacto": "Impacto / encaixe repetido / vibração",
+}
+
+CRITICALITY_LABELS: dict[str, str] = {
+    "nao_sei": "Não sei informar",
+    "baixa": "Baixa (falha não gera risco/prejuízo)",
+    "media": "Média (uso funcional cotidiano)",
+    "alta": "Alta (carga crítica, segurança ou peça essencial)",
+}
+
+FIT_LABELS: dict[str, str] = {
+    "nao_sei": "Não sei informar",
+    "sem_encaixe": "Sem encaixe ou partes móveis",
+    "encaixe_justo": "Roscas, travas ou encaixes justos",
+    "partes_moveis": "Partes móveis / articuladas no local",
+}
+
+HEAT_EXPOSURE_LABELS: dict[str, str] = {
+    "nao_sei": "Não sei informar",
+    "interno": "Ambiente interno (até ~40 °C)",
+    "calor_sol": "Calor, sol direto ou interior de carro",
+    "agua_externo": "Área externa (sol + chuva/umidade)",
+}
+
+EVIDENCE_LABELS: dict[str, str] = {
+    "verificado_3mf": "Verificado no 3MF",
+    "verificado_fatiamento": "Verificado pelo fatiamento",
+    "estimado_regra_ia": "Estimado por regra/IA",
+    "depende_teste_fisico": "Depende de teste físico",
+}
+
+CONFIDENCE_LABELS: dict[str, str] = {
+    "alta": "Alta (cenário informado; resultado final exige peça de teste)",
+    "media": "Média",
+    "baixa": "Baixa (há itens em 'Não sei' ou sem confirmação física)",
+}
+
 _PURPOSE_BY_LABEL = {label: code for code, label in PURPOSE_LABELS.items()}
 _PRIORITY_BY_LABEL = {label: code for code, label in PRIORITY_LABELS.items()}
+_LOAD_BY_LABEL = {label: code for code, label in LOAD_TYPE_LABELS.items()}
+_CRITICALITY_BY_LABEL = {label: code for code, label in CRITICALITY_LABELS.items()}
+_FIT_BY_LABEL = {label: code for code, label in FIT_LABELS.items()}
+_HEAT_BY_LABEL = {label: code for code, label in HEAT_EXPOSURE_LABELS.items()}
 
 
 def purpose_label(code: str) -> str:
@@ -73,6 +121,46 @@ def priority_label(code: str) -> str:
 
 def priority_code(label_or_code: str) -> str:
     return _PRIORITY_BY_LABEL.get(label_or_code, label_or_code if label_or_code in PRIORITY_LABELS else "equilibrio")
+
+
+def load_type_label(code: str) -> str:
+    return LOAD_TYPE_LABELS.get(code, code)
+
+
+def load_type_code(label_or_code: str) -> str:
+    return _LOAD_BY_LABEL.get(label_or_code, label_or_code if label_or_code in LOAD_TYPE_LABELS else "nao_sei")
+
+
+def criticality_label(code: str) -> str:
+    return CRITICALITY_LABELS.get(code, code)
+
+
+def criticality_code(label_or_code: str) -> str:
+    return _CRITICALITY_BY_LABEL.get(label_or_code, label_or_code if label_or_code in CRITICALITY_LABELS else "nao_sei")
+
+
+def fit_label(code: str) -> str:
+    return FIT_LABELS.get(code, code)
+
+
+def fit_code(label_or_code: str) -> str:
+    return _FIT_BY_LABEL.get(label_or_code, label_or_code if label_or_code in FIT_LABELS else "nao_sei")
+
+
+def heat_exposure_label(code: str) -> str:
+    return HEAT_EXPOSURE_LABELS.get(code, code)
+
+
+def heat_exposure_code(label_or_code: str) -> str:
+    return _HEAT_BY_LABEL.get(label_or_code, label_or_code if label_or_code in HEAT_EXPOSURE_LABELS else "nao_sei")
+
+
+def evidence_label(code: str) -> str:
+    return EVIDENCE_LABELS.get(code, code)
+
+
+def confidence_label(code: str) -> str:
+    return CONFIDENCE_LABELS.get(code, code)
 
 
 def describe_change(key: str, before: str, after: str) -> str:

@@ -16,6 +16,11 @@ DEFAULTS = {
     "mode": "offline",
     "purpose": "decorativa",
     "priority": "equilibrio",
+    "load_type": "nao_sei",
+    "criticality": "nao_sei",
+    "fit_clearance": "nao_sei",
+    "heat_exposure": "nao_sei",
+    "save_print_history": "0",
     "ai_model": "gemini-3.8-flash",
 }
 

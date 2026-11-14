@@ -116,3 +116,39 @@ class SlicerTests(unittest.TestCase):
             self.assertEqual(resolved_overwrite, base)
             self.assertFalse(base.exists())
 
+    def test_validation_extracts_plate_metrics_per_plate(self):
+        from maker_elegoo.slicer import PlateValidationMetric
+
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "multi.3mf"
+            project.touch()
+
+            def runner(args, **kwargs):
+                output = Path(args[args.index("--outputdir") + 1])
+                (output / "plate_1.gcode").write_text(
+                    "; total filament used [g] = 12.5\n"
+                    "; estimated printing time (normal mode) = 45m 10s\nG1 X1\n",
+                    encoding="utf-8",
+                )
+                (output / "plate_2.gcode").write_text(
+                    "; total filament used [g] = 8.25\n"
+                    "; estimated printing time (normal mode) = 1h 5m\nG1 X2\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            result = SlicerCLI(Path("elegoo-slicer.exe"), runner=runner).validate(project, 2)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.plate_count, 2)
+        self.assertEqual(result.estimated_seconds, 2710 + 3900)
+        self.assertAlmostEqual(result.filament_grams or 0.0, 20.75, places=2)
+        self.assertEqual(
+            result.plate_metrics,
+            (
+                PlateValidationMetric(1, 2710, 12.5),
+                PlateValidationMetric(2, 3900, 8.25),
+            ),
+        )
+
+

@@ -143,6 +143,11 @@ def advise_gemini(
         "current_filaments": safe_filaments,
         "goal_purpose": goal.purpose,
         "goal_priority": goal.priority,
+        "goal_load_type": getattr(goal, "load_type", "nao_sei"),
+        "goal_criticality": getattr(goal, "criticality", "nao_sei"),
+        "goal_fit_clearance": getattr(goal, "fit_clearance", "nao_sei"),
+        "goal_heat_exposure": getattr(goal, "heat_exposure", "nao_sei"),
+        "goal_physical_material": getattr(goal, "physical_material", "nao_sei"),
     }
     geom = getattr(project, "geometry_summary", None)
     if geom is not None and getattr(geom, "triangle_count", 0) > 0:
@@ -159,18 +164,19 @@ def advise_gemini(
         "Você é um Professor e Engenheiro Especialista em Manufatura Aditiva e Impressão 3D FDM. "
         "Um usuário baixou um projeto 3MF (originalmente configurado para impressora Bambu) e está convertendo "
         "para uma impressora ELEGOO Centauri Carbon 2.\n\n"
-        "Analise o contexto a seguir e sugira ajustes didáticos necessários nas configurações para que a impressão tenha sucesso, "
-        "boa fusão mecânica e atenda ao objetivo do usuário (Uso e Prioridade).\n"
+        "Analise o contexto a seguir e sugira ajustes didáticos necessários como hipóteses de partida para que o usuário "
+        "possa testar e validar no fatiamento e na peça real.\n"
         "Regras estritas:\n"
         "1. Para 'process', use APENAS chaves existentes em 'current_process' e respeite min_layer_height_mm e max_layer_height_mm (para brim_type use auto_brim, outer_only ou no_brim).\n"
-        "2. Para 'filament', informe o 'slot' (1-based) e use chaves existentes em current_filaments (como fan_max_speed, overhang_fan_speed, during_print_exhaust_fan_speed).\n"
-        "3. Em 'why', explique de forma clara e didática em português o motivo mecânico ou prático da mudança.\n"
-        "4. Em 'default_on', use true para recomendações fortes e false para alertas de odor/exaustão ou câmara.\n\n"
+        "2. Para 'filament', informe o 'slot' (1-based) e use chaves existentes em current_filaments (como fan_max_speed, fan_min_speed, overhang_fan_speed, during_print_exhaust_fan_speed) respeitando fan_min_speed <= fan_max_speed.\n"
+        "3. Nunca prometa nem afirme resistência mecânica garantida, estabilidade dimensional ou solda perfeita sem ensaio físico; informe 'expected_effect' e 'what_to_check' em linguagem simples.\n"
+        "4. Diferencie origem PLA vs PETG vs mista; nunca rotule PETG como PLA.\n"
+        "5. Em 'default_on', use true para recomendações padrão compatíveis e false para alertas de odor/exaustão, câmara ou itens que dependam de teste físico.\n\n"
         f"Contexto do Projeto:\n{json.dumps(context_payload, ensure_ascii=False, indent=2)}\n\n"
         "Responda SOMENTE um JSON no formato:\n"
         "{\n"
         '  "advices": [\n'
-        '    {"scope": "process|filament|alert", "slot": 1, "key": "string", "proposed": "string", "title": "string", "why": "string", "default_on": true}\n'
+        '    {"scope": "process|filament|alert", "slot": 1, "key": "string", "proposed": "string", "title": "string", "why": "string", "expected_effect": "string", "what_to_check": "string", "requires_physical_test": false, "default_on": true}\n'
         "  ]\n"
         "}"
     )
@@ -190,10 +196,20 @@ def advise_gemini(
         proposed = str(item.get("proposed", ""))
         title = str(item.get("title", ""))[:80]
         why = str(item.get("why", ""))[:400]
+        expected_effect = str(item.get("expected_effect", ""))[:200]
+        what_to_check = str(item.get("what_to_check", ""))[:200]
+        requires_physical_test = bool(item.get("requires_physical_test", False))
         default_on = bool(item.get("default_on", False))
 
         if scope == "alert":
-            verified.append(Advice("alert", None, "", "", "", title, why, default_on))
+            verified.append(Advice(
+                "alert", None, "", "", "", title, why, default_on,
+                expected_effect=expected_effect,
+                what_to_check=what_to_check,
+                evidence_class="depende_teste_fisico" if requires_physical_test else "estimado_regra_ia",
+                requires_physical_test=requires_physical_test,
+                confidence="media",
+            ))
             continue
 
         if scope in {"process", "filament"}:
@@ -204,7 +220,14 @@ def advise_gemini(
                     else str(plan.filament_settings[slot - 1].get(key, [""])[0])
                 )
                 verified.append(
-                    Advice(scope, slot, key, current_val, proposed, title, why, default_on)
+                    Advice(
+                        scope, slot, key, current_val, proposed, title, why, default_on,
+                        expected_effect=expected_effect,
+                        what_to_check=what_to_check,
+                        evidence_class="estimado_regra_ia",
+                        requires_physical_test=requires_physical_test,
+                        confidence="media",
+                    )
                 )
 
     return verified

@@ -93,3 +93,51 @@ class UIReportTests(unittest.TestCase):
         report_close = format_conversion_report(result, plan_close)
         self.assertNotIn("Velocidade da parede externa: 150 → 160 mm/s", report_close)
 
+    def test_conversion_report_shows_all_4_evidence_classes_and_plate_metrics(self):
+        from maker_elegoo.slicer import PlateValidationMetric
+
+        plan = ConversionPlan(
+            machine=Profile("ECC2 0.4", "machine", Path("m.json"), {}),
+            process=Profile("0.20mm Standard", "process", Path("p.json"), {}),
+            filaments=(Profile("Elegoo ABS @ECC2", "filament", Path("f.json"), {}),),
+            machine_settings={}, process_settings={}, filament_settings=({},),
+            transferred={}, unmapped={}, replaced={}, source_repairs={}, material_findings=(),
+        )
+        result = ConversionResult(
+            True, Path("out.3mf"), "Todas as placas foram fatiadas",
+            ExportResult(True, Path("out.3mf"), "ok"),
+            ValidationResult(
+                True, 2, "ok", (), 3600, 22.5,
+                (PlateValidationMetric(1, 2400, 15.0), PlateValidationMetric(2, 1200, 7.5)),
+            ),
+            None, None, {},
+        )
+        advices = [
+            Advice(
+                "process", None, "wall_loops", "2", "4", "Mais paredes", "Reforça casca", True,
+                expected_effect="Maior consumo e casca mais espessa",
+                what_to_check="Validar resistência em peça real",
+            ),
+            Advice(
+                "alert", None, "", "", "", "Câmara passiva", "Feche a porta", False,
+                what_to_check="Observar 1ª camada",
+                evidence_class="depende_teste_fisico",
+                requires_physical_test=True,
+            ),
+        ]
+        report = format_conversion_report(result, plan, professor_advices=advices)
+        lower = report.lower()
+        for heading in (
+            "verificado no 3mf",
+            "verificado pelo fatiamento",
+            "estimado por regra/ia",
+            "depende de teste físico",
+            "fatiar não prova acabamento, estabilidade dimensional nem resistência mecânica.",
+            "placa 1:",
+            "placa 2:",
+            "efeito esperado:",
+            "o que conferir:",
+        ):
+            self.assertIn(heading, lower)
+
+

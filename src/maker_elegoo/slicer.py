@@ -25,6 +25,13 @@ class ExportResult:
 
 
 @dataclass(frozen=True)
+class PlateValidationMetric:
+    plate: int
+    estimated_seconds: int | None = None
+    filament_grams: float | None = None
+
+
+@dataclass(frozen=True)
 class ValidationResult:
     success: bool
     plate_count: int
@@ -32,6 +39,7 @@ class ValidationResult:
     warnings: tuple[str, ...] = ()
     estimated_seconds: int | None = None
     filament_grams: float | None = None
+    plate_metrics: tuple[PlateValidationMetric, ...] = ()
 
 
 def _gcode_metrics(path: Path) -> tuple[int | None, float | None]:
@@ -220,7 +228,11 @@ class SlicerCLI:
             warnings = tuple(line for line in (result.stderr or "").splitlines()
                              if "warning" in line.lower() or "aviso" in line.lower())
             metrics = [_gcode_metrics(path) for path in gcodes]
+            plate_metrics = tuple(
+                PlateValidationMetric(index, item[0], item[1])
+                for index, item in enumerate(metrics, 1)
+            )
             seconds = sum(item[0] for item in metrics) if all(item[0] is not None for item in metrics) else None
             grams = sum(item[1] for item in metrics) if all(item[1] is not None for item in metrics) else None
             return ValidationResult(True, len(gcodes), "Todas as placas foram fatiadas",
-                                    warnings, seconds, grams)
+                                    warnings, seconds, grams, plate_metrics)

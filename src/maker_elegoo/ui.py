@@ -22,11 +22,33 @@ from .codex_cli import run_codex
 from .codex_evidence import (build_codex_evidence,
                              validate_codex_recommendations, verify_process_recommendation)
 from .credentials import clear_gemini_key, get_gemini_key, save_gemini_key
+from .history import (
+    VISUAL_RESULTS,
+    FeedbackRecord,
+    append_feedback_record,
+    adjust_advices_from_history,
+    clear_feedback_history,
+    load_feedback_history,
+)
 from .labels import (
+    CRITICALITY_LABELS,
+    FIT_LABELS,
+    HEAT_EXPOSURE_LABELS,
+    LOAD_TYPE_LABELS,
     PRIORITY_LABELS,
     PURPOSE_LABELS,
+    confidence_label,
+    criticality_code,
+    criticality_label,
     describe_change,
+    evidence_label,
+    fit_code,
+    fit_label,
     format_duration,
+    heat_exposure_code,
+    heat_exposure_label,
+    load_type_code,
+    load_type_label,
     priority_code,
     priority_label,
     purpose_code,
@@ -36,14 +58,17 @@ from .mapping import ConversionPlan, build_conversion, suggest_process
 from .orientation import FRONTS, load_scene, render_front_views
 from .orientation_service import (OrientationAnalysis, apply_orientation,
                                   evaluate_orientations)
-from .optimization import compare_objectives
+from .optimization import compare_objectives, format_objective_comparison
 from .professor import (
     Advice,
     PrintGoal,
     advise_offline,
     apply_advice,
+    build_preconversion_card,
     build_print_summary,
+    goal_confidence,
     merge_with_offline_alerts,
+    needs_user_intervention,
 )
 from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles, resolve_profile
 from .project import ProjectInfo, inspect_project
@@ -139,10 +164,17 @@ def format_conversion_report(result: ConversionResult, plan: ConversionPlan,
             lines.append(f"  • {describe_change(item.key, item.current, item.proposed)}")
             if item.why:
                 lines.append(f"    Por quê: {item.why}")
+            if getattr(item, "expected_effect", ""):
+                lines.append(f"    Efeito esperado: {item.expected_effect}")
+            if getattr(item, "what_to_check", ""):
+                lines.append(f"    O que conferir: {item.what_to_check}")
     if alerts:
         lines.extend(["", "Atenção (avisos do Professor):"])
         for item in alerts:
-            lines.append(f"  • {item.title}: {item.why}")
+            phys_tag = " [Depende de teste físico]" if getattr(item, "requires_physical_test", False) else ""
+            lines.append(f"  • {item.title}{phys_tag}: {item.why}")
+            if getattr(item, "what_to_check", ""):
+                lines.append(f"    O que conferir: {item.what_to_check}")
     lines.extend(["", f"Parâmetros de processo transferidos: {len(plan.transferred)}",
                   f"Campos sem equivalência confirmada: {len(result.unmapped)}"])
     if result.geometry:
@@ -165,6 +197,9 @@ def format_conversion_report(result: ConversionResult, plan: ConversionPlan,
             lines.append(f"Tempo total estimado: {format_duration(result.validation.estimated_seconds)}")
         if result.validation.filament_grams is not None:
             lines.append(f"Material estimado: {result.validation.filament_grams:.2f} g")
+        for pm in (getattr(result.validation, "plate_metrics", ()) or ()):
+            grams_txt = f"{pm.filament_grams:.2f} g" if pm.filament_grams is not None else "n/d"
+            lines.append(f"  Placa {pm.plate}: {format_duration(pm.estimated_seconds)} · {grams_txt}")
         lines.extend(f"Aviso do fatiador: {warning}" for warning in result.validation.warnings)
     if plan.material_findings:
         lines.extend(["", "Mudanças de material/perfil:"])
@@ -191,6 +226,27 @@ def format_conversion_report(result: ConversionResult, plan: ConversionPlan,
     if result.unmapped:
         lines.extend(["", "Detalhes técnicos (campos não mapeados - primeiros 30):"])
         lines.extend(f"  • {key}" for key in list(sorted(result.unmapped))[:30])
+
+    # 4 classes obrigatórias de evidência em toda conclusão
+    slice_evidence = (
+        f"{result.validation.plate_count} placa(s) fatiada(s) no ELEGOO Slicer "
+        f"({format_duration(result.validation.estimated_seconds)})"
+        if result.validation and result.validation.success
+        else "fatiamento não validado / falhou"
+    )
+    geom_evidence = (
+        "malhas preservadas (tolerância 0,0001 mm)"
+        if result.geometry and result.geometry.unchanged
+        else "estrutura de placas e parâmetros extraídos do arquivo"
+    )
+    lines.extend([
+        "",
+        "Classes de evidência:",
+        f"  • {evidence_label('verificado_3mf')}: {geom_evidence}; {len(plan.transferred)} campos transferidos.",
+        f"  • {evidence_label('verificado_fatiamento')}: {slice_evidence}.",
+        f"  • {evidence_label('estimado_regra_ia')}: {len(applied)} ajuste(s) sugerido(s) aplicados; {len(plan.material_findings)} troca(s) de material.",
+        f"  • {evidence_label('depende_teste_fisico')}: {len(alerts)} aviso(s)/checagem(ns). Fatiar não prova acabamento, estabilidade dimensional nem resistência mecânica.",
+    ])
     lines.extend(["", "Confira a posição das peças, cores, suportes e prévia no ELEGOO Slicer antes de imprimir."])
     return "\n".join(lines)
 
@@ -286,11 +342,23 @@ class MakerElegooApp(tk.Tk):
         self.nozzle_var = tk.StringVar(value=self.preferences["nozzle"])
         self.machine_var = tk.StringVar(value=self.preferences["machine"])
         self.process_var = tk.StringVar()
+        self.physical_material_var = tk.StringVar(value="Não sei informar")
+        self.physical_filament_confirmed_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Selecione um projeto 3MF para começar")
         self.ai_provider_var = tk.StringVar(value="Codex")
         self.mode_var = tk.StringVar(value=self.preferences.get("mode", "offline"))
         self.purpose_var = tk.StringVar(value=purpose_label(self.preferences.get("purpose", "decorativa")))
         self.priority_var = tk.StringVar(value=priority_label(self.preferences.get("priority", "equilibrio")))
+        self.load_type_var = tk.StringVar(value=load_type_label(self.preferences.get("load_type", "nao_sei")))
+        self.criticality_var = tk.StringVar(value=criticality_label(self.preferences.get("criticality", "nao_sei")))
+        self.fit_clearance_var = tk.StringVar(value=fit_label(self.preferences.get("fit_clearance", "nao_sei")))
+        self.heat_exposure_var = tk.StringVar(value=heat_exposure_label(self.preferences.get("heat_exposure", "nao_sei")))
+        self.save_history_var = tk.BooleanVar(value=self.preferences.get("save_print_history", "0") == "1")
+        self.advanced_visible = tk.BooleanVar(value=False)
+        self.confidence_var = tk.StringVar(value="Confiança: Baixa")
+        self.preconversion_var = tk.StringVar(
+            value="Escolha um projeto 3MF e confirme o filamento físico carregado na ELEGOO."
+        )
         self.ai_model_var = tk.StringVar(value=self.preferences.get("ai_model", "gemini-3.8-flash"))
         self.scale_mode_var = tk.StringVar(value="Original (100%)")
         self.scale_value_var = tk.StringVar(value="")
@@ -298,12 +366,21 @@ class MakerElegooApp(tk.Tk):
         self._build_layout()
         self.nozzle_var.trace_add("write", lambda *_: self._refresh_profiles())
         self.process_var.trace_add("write", lambda *_: self._profiles_changed())
-        self.mode_var.trace_add("write", lambda *_: self._save_preferences())
-        self.purpose_var.trace_add("write", lambda *_: self._save_preferences())
-        self.priority_var.trace_add("write", lambda *_: self._save_preferences())
-        self.ai_model_var.trace_add("write", lambda *_: self._save_preferences())
+        for var in (
+            self.mode_var,
+            self.purpose_var,
+            self.priority_var,
+            self.load_type_var,
+            self.criticality_var,
+            self.fit_clearance_var,
+            self.heat_exposure_var,
+            self.save_history_var,
+            self.ai_model_var,
+        ):
+            var.trace_add("write", lambda *_: self._on_goal_or_pref_changed())
         self.scale_mode_var.trace_add("write", lambda *_: self._on_scale_mode_changed())
         self._refresh_profiles()
+        self._update_context_preview()
         self._worker_after = self.after(150, self._poll_worker)
         self._ai_after = self.after(150, self._poll_ai)
         self._professor_after = self.after(150, self._poll_professor)
@@ -328,95 +405,165 @@ class MakerElegooApp(tk.Tk):
         tools_menu.add_command(label="Salvar relatório", command=self._save_report)
         tools_menu.add_command(label="Comparar objetivos de impressão", command=self._compare_objectives)
         tools_menu.add_command(label="Comparar placas antes/depois", command=self._show_plate_comparison)
+        tools_menu.add_command(label="Registrar resultado da impressão (histórico local)", command=self._open_feedback_dialog)
         menu.add_cascade(label="Ferramentas", menu=tools_menu)
         self.configure(menu=menu)
-        outer = ttk.Frame(self, padding=18)
+        outer = ttk.Frame(self, padding=14)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="Maker → ELEGOO", font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(outer, text="Converta projetos MakerWorld usando os perfis reais da Centauri Carbon 2.").pack(anchor="w", pady=(2, 16))
+        self._outer_frame = outer
+        ttk.Label(outer, text="Maker → ELEGOO", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="Traduza projetos MakerWorld para sua Centauri Carbon 2 com validação real e orientações honestas.",
+        ).pack(anchor="w", pady=(2, 10))
 
-        source = ttk.LabelFrame(outer, text="1  Projeto de origem", padding=12)
-        source.pack(fill="x", pady=(0, 12))
+        source = ttk.LabelFrame(outer, text="1  Projeto 3MF de origem", padding=10)
+        source.pack(fill="x", pady=(0, 8))
         source.columnconfigure(0, weight=1)
         ttk.Entry(source, textvariable=self.file_var).grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(source, text="Escolher 3MF", command=self._choose_file).grid(row=0, column=1)
         ttk.Button(source, text="Analisar", command=self._inspect_file).grid(row=0, column=2, padx=(8, 0))
 
-        target = ttk.LabelFrame(outer, text="2  Perfis de destino", padding=12)
-        target.pack(fill="x", pady=(0, 12))
-        target.columnconfigure(1, weight=1)
-        ttk.Label(target, text="Bico").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self.nozzle_combo = ttk.Combobox(target, textvariable=self.nozzle_var,
-                                         state="readonly", width=8)
-        self.nozzle_combo.grid(row=0, column=1, sticky="w")
-        ttk.Label(target, text="Impressora").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
-        self.machine_combo = ttk.Combobox(target, textvariable=self.machine_var, state="readonly")
-        self.machine_combo.grid(row=1, column=1, sticky="ew", pady=(10, 0))
-        self.machine_combo.bind("<<ComboboxSelected>>", lambda *_: self._refresh_dependents())
-        ttk.Label(target, text="Processo").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
-        self.process_combo = ttk.Combobox(target, textvariable=self.process_var, state="readonly")
-        self.process_combo.grid(row=2, column=1, sticky="ew", pady=(10, 0))
-        ttk.Button(target, text="Localizar ELEGOO Slicer", command=self._choose_slicer).grid(row=0, column=2, rowspan=3, padx=(12, 0))
-        self.filament_frame = ttk.Frame(target)
-        self.filament_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(12, 0))
-        self.filament_frame.columnconfigure(1, weight=1)
+        printer_simple = ttk.LabelFrame(outer, text="2  Sua ELEGOO e Filamento Físico", padding=10)
+        printer_simple.pack(fill="x", pady=(0, 8))
+        printer_simple.columnconfigure(3, weight=1)
+        ttk.Label(printer_simple, text="Bico instalado:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.nozzle_combo = ttk.Combobox(printer_simple, textvariable=self.nozzle_var, state="readonly", width=7)
+        self.nozzle_combo.grid(row=0, column=1, sticky="w", padx=(0, 14))
+        ttk.Label(printer_simple, text="Filamento na impressora:").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.physical_material_combo = ttk.Combobox(
+            printer_simple,
+            textvariable=self.physical_material_var,
+            state="readonly",
+            values=("Não sei informar", "PLA", "PETG", "ABS", "ASA", "ABS-CF", "ASA-CF", "TPU"),
+            width=18,
+        )
+        self.physical_material_combo.grid(row=0, column=3, sticky="w")
+        self.physical_material_combo.bind("<<ComboboxSelected>>", lambda *_: self._on_physical_filament_changed())
+        self.physical_confirm_chk = ttk.Checkbutton(
+            printer_simple,
+            text="Confirmo que este filamento físico está carregado (nunca presumir pelo 3MF)",
+            variable=self.physical_filament_confirmed_var,
+            command=self._on_physical_filament_changed,
+        )
+        self.physical_confirm_chk.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
-        consultant = ttk.LabelFrame(outer, text="3  Professor de Impressão (Uso e Ajustes)", padding=12)
-        consultant.pack(fill="x", pady=(0, 12))
+        consultant = ttk.LabelFrame(outer, text="3  Professor de Impressão e Cartão Pré-Conversão", padding=10)
+        consultant.pack(fill="x", pady=(0, 8))
         consultant.columnconfigure(1, weight=1)
         consultant.columnconfigure(3, weight=1)
 
-        ttk.Label(consultant, text="Modo:").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        mode_box = ttk.Frame(consultant)
-        mode_box.grid(row=0, column=1, columnspan=3, sticky="w")
-        ttk.Radiobutton(mode_box, text="100% Offline (Regras Locais)", variable=self.mode_var, value="offline").pack(side="left", padx=(0, 12))
-        ttk.Radiobutton(mode_box, text="Professor IA (Google Gemini)", variable=self.mode_var, value="ai").pack(side="left", padx=(0, 12))
-        ttk.Button(mode_box, text="Chave Gemini...", command=self._configure_gemini_key).pack(side="left")
-
-        ttk.Label(consultant, text="Uso da Peça:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
+        ttk.Label(consultant, text="Uso da Peça:").grid(row=0, column=0, sticky="w", padx=(0, 6))
         self.purpose_combo = ttk.Combobox(consultant, textvariable=self.purpose_var, state="readonly",
                                           values=tuple(PURPOSE_LABELS.values()))
-        self.purpose_combo.grid(row=1, column=1, sticky="ew", pady=(10, 0), padx=(0, 12))
-
-        ttk.Label(consultant, text="Prioridade:").grid(row=1, column=2, sticky="w", padx=(0, 8), pady=(10, 0))
+        self.purpose_combo.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        ttk.Label(consultant, text="Prioridade:").grid(row=0, column=2, sticky="w", padx=(0, 6))
         self.priority_combo = ttk.Combobox(consultant, textvariable=self.priority_var, state="readonly",
                                            values=tuple(PRIORITY_LABELS.values()))
-        self.priority_combo.grid(row=1, column=3, sticky="ew", pady=(10, 0))
+        self.priority_combo.grid(row=0, column=3, sticky="ew")
 
-        ttk.Label(consultant, text="Tamanho:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
-        self.scale_mode_combo = ttk.Combobox(
+        ttk.Label(consultant, text="Carga principal:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        self.load_type_combo = ttk.Combobox(consultant, textvariable=self.load_type_var, state="readonly",
+                                            values=tuple(LOAD_TYPE_LABELS.values()))
+        self.load_type_combo.grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(0, 10))
+        ttk.Label(consultant, text="Criticidade:").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
+        self.criticality_combo = ttk.Combobox(consultant, textvariable=self.criticality_var, state="readonly",
+                                              values=tuple(CRITICALITY_LABELS.values()))
+        self.criticality_combo.grid(row=1, column=3, sticky="ew", pady=(6, 0))
+
+        ttk.Label(consultant, text="Encaixes / Folgas:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        self.fit_clearance_combo = ttk.Combobox(consultant, textvariable=self.fit_clearance_var, state="readonly",
+                                                values=tuple(FIT_LABELS.values()))
+        self.fit_clearance_combo.grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(0, 10))
+        ttk.Label(consultant, text="Calor / Sol / Água:").grid(row=2, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
+        self.heat_exposure_combo = ttk.Combobox(consultant, textvariable=self.heat_exposure_var, state="readonly",
+                                                values=tuple(HEAT_EXPOSURE_LABELS.values()))
+        self.heat_exposure_combo.grid(row=2, column=3, sticky="ew", pady=(6, 0))
+
+        self.confidence_label = ttk.Label(consultant, textvariable=self.confidence_var, foreground="#333333")
+        self.confidence_label.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        self.preconversion_label = ttk.Label(
             consultant,
+            textvariable=self.preconversion_var,
+            wraplength=900,
+            justify="left",
+            foreground="#1F3A52",
+        )
+        self.preconversion_label.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(2, 0))
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x", pady=(0, 8))
+        self.convert_button = ttk.Button(actions, text="Traduzir para minha ELEGOO", command=self._convert)
+        self.convert_button.pack(side="left")
+        self.open_button = ttk.Button(actions, text="Abrir no ELEGOO Slicer", command=self._open_result, state="disabled")
+        self.open_button.pack(side="left", padx=(8, 0))
+        self.feedback_button = ttk.Button(actions, text="Registrar resultado da impressão", command=self._open_feedback_dialog)
+        self.feedback_button.pack(side="left", padx=(8, 0))
+        self.advanced_toggle_btn = ttk.Button(actions, text="Mostrar detalhes avançados ▾", command=self._toggle_advanced)
+        self.advanced_toggle_btn.pack(side="left", padx=(8, 0))
+        ttk.Label(actions, textvariable=self.status_var).pack(side="right")
+
+        # Painel retrátil de Detalhes Avançados (recolhido por padrão, mas todos controles instanciados)
+        self.advanced_frame = ttk.LabelFrame(outer, text="Detalhes avançados (perfis, filamentos por slot, escala e IA)", padding=10)
+        target = ttk.Frame(self.advanced_frame)
+        target.pack(fill="x", pady=(0, 6))
+        target.columnconfigure(1, weight=1)
+        ttk.Label(target, text="Impressora").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.machine_combo = ttk.Combobox(target, textvariable=self.machine_var, state="readonly")
+        self.machine_combo.grid(row=0, column=1, sticky="ew")
+        self.machine_combo.bind("<<ComboboxSelected>>", lambda *_: self._refresh_dependents())
+        ttk.Label(target, text="Processo").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        self.process_combo = ttk.Combobox(target, textvariable=self.process_var, state="readonly")
+        self.process_combo.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        ttk.Button(target, text="Localizar ELEGOO Slicer", command=self._choose_slicer).grid(row=0, column=2, rowspan=2, padx=(12, 0))
+        self.filament_frame = ttk.Frame(target)
+        self.filament_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.filament_frame.columnconfigure(1, weight=1)
+
+        adv_opts = ttk.Frame(self.advanced_frame)
+        adv_opts.pack(fill="x", pady=(4, 0))
+        adv_opts.columnconfigure(1, weight=1)
+        adv_opts.columnconfigure(3, weight=1)
+        ttk.Label(adv_opts, text="Modo Professor:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        mode_box = ttk.Frame(adv_opts)
+        mode_box.grid(row=0, column=1, columnspan=3, sticky="w")
+        ttk.Radiobutton(mode_box, text="100% Offline (Regras Locais)", variable=self.mode_var, value="offline").pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(mode_box, text="Professor IA (Google Gemini)", variable=self.mode_var, value="ai").pack(side="left", padx=(0, 10))
+        ttk.Button(mode_box, text="Chave Gemini...", command=self._configure_gemini_key).pack(side="left")
+        ttk.Checkbutton(
+            mode_box,
+            text="Salvar histórico local de impressões neste PC",
+            variable=self.save_history_var,
+        ).pack(side="left", padx=(10, 0))
+
+        ttk.Label(adv_opts, text="Tamanho:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        self.scale_mode_combo = ttk.Combobox(
+            adv_opts,
             textvariable=self.scale_mode_var,
             state="readonly",
             values=("Original (100%)", "Escala (%)", "Altura Z (mm)"),
         )
-        self.scale_mode_combo.grid(row=2, column=1, sticky="ew", pady=(10, 0), padx=(0, 12))
-
-        ttk.Label(consultant, text="Valor:").grid(row=2, column=2, sticky="w", padx=(0, 8), pady=(10, 0))
-        scale_val_box = ttk.Frame(consultant)
-        scale_val_box.grid(row=2, column=3, sticky="ew", pady=(10, 0))
+        self.scale_mode_combo.grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(0, 10))
+        ttk.Label(adv_opts, text="Valor:").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
+        scale_val_box = ttk.Frame(adv_opts)
+        scale_val_box.grid(row=1, column=3, sticky="ew", pady=(6, 0))
         self.scale_value_entry = ttk.Entry(scale_val_box, textvariable=self.scale_value_var, width=10, state="disabled")
         self.scale_value_entry.pack(side="left")
         ttk.Label(scale_val_box, text="ex.: 80 (mm) ou 50 (%)", foreground="#555555").pack(side="left", padx=(8, 0))
 
-        actions = ttk.Frame(outer)
-        actions.pack(fill="x", pady=(0, 12))
-        self.convert_button = ttk.Button(actions, text="Converter e fatiar para validar", command=self._convert)
-        self.convert_button.pack(side="left")
-        self.orientation_button = ttk.Button(actions, text="Orientação de figura", command=self._orientation_open,
-                                             state="disabled")
-        self.orientation_button.pack(side="left", padx=(10, 0))
-        self.open_button = ttk.Button(actions, text="Abrir no ELEGOO Slicer", command=self._open_result, state="disabled")
-        self.open_button.pack(side="left", padx=(10, 0))
-        self.ai_button = ttk.Button(actions, text="Analisar orientação/suportes (Codex / IA)", command=self._analyze_ai, state="disabled")
-        self.ai_button.pack(side="left", padx=(10, 0))
-        ttk.Combobox(actions, textvariable=self.ai_provider_var, values=("Codex", "Gemini"),
+        adv_actions = ttk.Frame(self.advanced_frame)
+        adv_actions.pack(fill="x", pady=(8, 0))
+        ttk.Button(adv_actions, text="Comparar 5 alternativas", command=self._compare_objectives).pack(side="left")
+        self.orientation_button = ttk.Button(adv_actions, text="Orientação de figura", command=self._orientation_open, state="disabled")
+        self.orientation_button.pack(side="left", padx=(8, 0))
+        self.ai_button = ttk.Button(adv_actions, text="Analisar orientação/suportes (Codex / IA)", command=self._analyze_ai, state="disabled")
+        self.ai_button.pack(side="left", padx=(8, 0))
+        ttk.Combobox(adv_actions, textvariable=self.ai_provider_var, values=("Codex", "Gemini"),
                      state="readonly", width=8).pack(side="left", padx=(5, 0))
-        ttk.Label(actions, textvariable=self.status_var).pack(side="right")
 
-        report_frame = ttk.LabelFrame(outer, text="4  Análise e relatório", padding=8)
-        report_frame.pack(fill="both", expand=True)
-        self.report = scrolledtext.ScrolledText(report_frame, wrap="word", font=("Consolas", 10), state="disabled")
+        self.report_frame = ttk.LabelFrame(outer, text="4  Análise e relatório", padding=8)
+        self.report_frame.pack(fill="both", expand=True)
+        self.report = scrolledtext.ScrolledText(self.report_frame, wrap="word", font=("Consolas", 10), state="disabled")
         self.report.pack(fill="both", expand=True)
         self._set_report("O arquivo original permanece intacto. O G-code de validação é temporário e nunca é enviado à impressora.")
 
@@ -528,27 +675,116 @@ class MakerElegooApp(tk.Tk):
                 self.status_var.set("Falha na comparação")
                 self._set_report(str(error))
             else:
-                lines = ["COMPARAÇÃO DE OBJETIVOS", "Valores estimados pelo ELEGOO Slicer; confira cada variante antes de imprimir."]
-                for item in variants:
-                    validation = item.result.validation
-                    lines.extend(["", item.objective.upper(), item.result.message,
-                                  f"Ajustes: {item.changed or 'perfil original'}",
-                                  f"Tempo: {format_duration(validation.estimated_seconds if validation else None)}",
-                                  f"Material: {validation.filament_grams if validation else None} g",
-                                  f"Arquivo: {item.result.destination}"])
-                self._set_report("\n".join(lines))
+                history_records = load_feedback_history() if self.save_history_var.get() else ()
+                report_text = format_objective_comparison(
+                    variants,
+                    goal=self._current_goal(),
+                    history_records=history_records,
+                )
+                self._set_report(report_text)
                 self.status_var.set("Comparação concluída")
         self._comparison_after = self.after(150, self._poll_comparison)
 
+    def _current_goal(self) -> PrintGoal:
+        raw_phys = self.physical_material_var.get().strip()
+        phys = "nao_sei" if raw_phys in {"", "Não sei informar"} else raw_phys
+        return PrintGoal(
+            purpose=purpose_code(self.purpose_var.get()),
+            priority=priority_code(self.priority_var.get()),
+            load_type=load_type_code(self.load_type_var.get()),
+            criticality=criticality_code(self.criticality_var.get()),
+            fit_clearance=fit_code(self.fit_clearance_var.get()),
+            heat_exposure=heat_exposure_code(self.heat_exposure_var.get()),
+            physical_material=phys,
+        )
+
+    def _build_current_plan(self, machine: Profile, process: Profile, filaments: list[Profile]) -> ConversionPlan:
+        return build_conversion(self.project, self.install, machine, process, filaments)
+
+    def _toggle_advanced(self):
+        show = not self.advanced_visible.get()
+        self.advanced_visible.set(show)
+        if show:
+            self.advanced_frame.pack(fill="x", pady=(0, 8), before=self.report_frame)
+            self.advanced_toggle_btn.configure(text="Ocultar detalhes avançados ▴")
+        else:
+            self.advanced_frame.pack_forget()
+            self.advanced_toggle_btn.configure(text="Mostrar detalhes avançados ▾")
+
+    def _on_goal_or_pref_changed(self):
+        self._save_preferences()
+        self._update_context_preview()
+
+    def _on_physical_filament_changed(self):
+        raw_mat = self.physical_material_var.get().strip()
+        if (
+            raw_mat not in {"", "Não sei informar"}
+            and self.project is not None
+            and self.filament_profiles
+            and self.filament_vars
+        ):
+            options = [p.name for p in self.filament_profiles]
+            target_upper = raw_mat.upper()
+            matched = (
+                next((name for name in options if name.upper() == f"ELEGOO {target_upper} @ECC2"), None)
+                or next((name for name in options if target_upper in name.upper() and "@ECC2" in name.upper()), None)
+                or next((name for name in options if target_upper in name.upper()), None)
+            )
+            if matched:
+                used = {
+                    str(s) for s in (getattr(self.project, "used_filament_slots", ()) or ())
+                    if s and str(s) != "0"
+                }
+                for idx, var in enumerate(self.filament_vars, 1):
+                    if not used or str(idx) in used:
+                        if var.get() != matched:
+                            var.set(matched)
+        self._update_context_preview()
+
+    def _update_context_preview(self):
+        goal = self._current_goal()
+        conf, reasons = goal_confidence(goal)
+        conf_txt = confidence_label(conf)
+        if conf == "baixa" and reasons:
+            self.confidence_var.set(f"Confiança da recomendação: {conf_txt} — faltam respostas ({len(reasons)} item(ns))")
+        else:
+            self.confidence_var.set(f"Confiança da recomendação: {conf_txt}")
+
+        if not self.project or not self.install:
+            return
+        try:
+            machine, process, filaments = self._selected_profiles()
+            plan = self._build_current_plan(machine, process, filaments)
+            advices = advise_offline(self.project, plan, goal)
+            if self.save_history_var.get():
+                advices = adjust_advices_from_history(advices, self.project, plan, goal, load_feedback_history())
+            card = build_preconversion_card(
+                self.project,
+                plan,
+                goal,
+                physical_confirmed=self.physical_filament_confirmed_var.get(),
+                advices=advices,
+            )
+            self.preconversion_var.set(card)
+        except (ValueError, IndexError, StopIteration, ProfileError):
+            pass
+
     def _save_preferences(self):
-        save_settings({"nozzle": self.nozzle_var.get(),
-                       "machine": self.machine_var.get(),
-                       "last_dir": str(Path(self.file_var.get()).parent) if self.file_var.get() else self.preferences["last_dir"],
-                       "slicer_exe": str(self.install.executable) if self.install else self.preferences["slicer_exe"],
-                       "mode": self.mode_var.get(),
-                       "purpose": purpose_code(self.purpose_var.get()),
-                       "priority": priority_code(self.priority_var.get()),
-                       "ai_model": self.ai_model_var.get()})
+        save_settings({
+            "nozzle": self.nozzle_var.get(),
+            "machine": self.machine_var.get(),
+            "last_dir": str(Path(self.file_var.get()).parent) if self.file_var.get() else self.preferences["last_dir"],
+            "slicer_exe": str(self.install.executable) if self.install else self.preferences["slicer_exe"],
+            "mode": self.mode_var.get(),
+            "purpose": purpose_code(self.purpose_var.get()),
+            "priority": priority_code(self.priority_var.get()),
+            "load_type": load_type_code(self.load_type_var.get()),
+            "criticality": criticality_code(self.criticality_var.get()),
+            "fit_clearance": fit_code(self.fit_clearance_var.get()),
+            "heat_exposure": heat_exposure_code(self.heat_exposure_var.get()),
+            "save_print_history": "1" if self.save_history_var.get() else "0",
+            "ai_model": self.ai_model_var.get(),
+        })
 
     def _choose_slicer(self):
         filename = filedialog.askopenfilename(title="Localize elegoo-slicer.exe", filetypes=[("Executável", "*.exe")])
@@ -643,13 +879,17 @@ class MakerElegooApp(tk.Tk):
             self.last_plan = None
             self.orientation_analysis = None
             self.orientation_plan = None
+            # Nunca presumir filamento físico == 3MF ao analisar novo projeto
+            self.physical_filament_confirmed_var.set(False)
+            self.physical_material_var.set("Não sei informar")
             self._clear_ai_approval()
             self.ai_button.configure(state="disabled")
             self.orientation_button.configure(state="normal")
             self.open_button.configure(state="disabled")
             self._set_report(format_project_summary(self.project))
             self._refresh_dependents(prefer_suggested=True)
-            self.status_var.set("Projeto analisado")
+            self._update_context_preview()
+            self.status_var.set("Projeto analisado — confirme o filamento físico")
             self._save_preferences()
         except Exception as exc:
             self.project = None
@@ -989,6 +1229,19 @@ class MakerElegooApp(tk.Tk):
         if not self.project or not self.install:
             messagebox.showinfo("Dados incompletos", "Analise um 3MF e localize o ELEGOO Slicer primeiro.")
             return
+        if not self.physical_filament_confirmed_var.get():
+            mat_label = self.physical_material_var.get()
+            if not messagebox.askyesno(
+                "Confirmar filamento físico",
+                f"Filamento selecionado: {mat_label}.\n\n"
+                "Nunca presumimos que o filamento na sua impressora é igual ao do arquivo 3MF.\n"
+                "Você confirma que o filamento físico carregado corresponde à seleção?",
+                parent=self,
+            ):
+                self.status_var.set("Confirme o filamento físico antes de traduzir")
+                return
+            self.physical_filament_confirmed_var.set(True)
+            self._on_physical_filament_changed()
         try:
             scale_percent, target_height_mm = self._parse_scale_request()
         except ScaleError as exc:
@@ -1010,11 +1263,8 @@ class MakerElegooApp(tk.Tk):
             messagebox.showerror("Perfil ausente", "Escolha um processo e um perfil para cada filamento.")
             return
 
-        plan = build_conversion(self.project, self.install, machine, process, filaments)
-        goal = PrintGoal(
-            purpose=purpose_code(self.purpose_var.get()),
-            priority=priority_code(self.priority_var.get()),
-        )
+        plan = self._build_current_plan(machine, process, filaments)
+        goal = self._current_goal()
 
         scale_advices: list[Advice] = []
         if scale_percent is not None or target_height_mm is not None:
@@ -1029,7 +1279,12 @@ class MakerElegooApp(tk.Tk):
                     messagebox.showerror("Escala inválida", str(exc))
                     return
                 for warn in risk.warnings:
-                    scale_advices.append(Advice("alert", None, "", "", "", "Alerta de Redimensionamento", warn, False))
+                    scale_advices.append(Advice(
+                        "alert", None, "", "", "", "Alerta de Redimensionamento", warn, False,
+                        what_to_check="Confira espessura mínima e folgas após fatiar.",
+                        evidence_class="estimado_regra_ia",
+                        requires_physical_test=True,
+                    ))
                 if risk.recommend_finer_layer:
                     cur_h = str(plan.process_settings.get("layer_height", "0.2"))
                     try:
@@ -1039,6 +1294,9 @@ class MakerElegooApp(tk.Tk):
                                 "Camada Mais Fina Para Peça Reduzida",
                                 "Compensa a redução de tamanho preservando contornos e detalhes com bico 0.4 mm.",
                                 True,
+                                expected_effect="Maior resolução vertical para compensar redução em Z (mais tempo).",
+                                what_to_check="Compare detalhes na prévia de camadas.",
+                                evidence_class="estimado_regra_ia",
                             ))
                     except ValueError:
                         pass
@@ -1054,7 +1312,7 @@ class MakerElegooApp(tk.Tk):
                     return
                 self.mode_var.set("offline")
                 advices = advise_offline(self.project, plan, goal)
-                self._finish_professor_lookup(plan, destination, advices)
+                self._finish_professor_lookup(plan, destination, advices, goal=goal)
                 return
 
             consent = messagebox.askyesno(
@@ -1073,7 +1331,7 @@ class MakerElegooApp(tk.Tk):
             return
 
         advices = advise_offline(self.project, plan, goal)
-        self._finish_professor_lookup(plan, destination, advices)
+        self._finish_professor_lookup(plan, destination, advices, goal=goal)
 
     def _start_gemini_professor(self, project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal,
                                 destination: str, key: str, model_name: str):
@@ -1091,13 +1349,30 @@ class MakerElegooApp(tk.Tk):
 
         threading.Thread(target=work_ai, daemon=True).start()
 
-    def _finish_professor_lookup(self, plan: ConversionPlan, destination: str, advices: list[Advice]):
+    def _finish_professor_lookup(
+        self,
+        plan: ConversionPlan,
+        destination: str,
+        advices: list[Advice],
+        *,
+        goal: PrintGoal | None = None,
+    ):
         merged = list(advices) + list(getattr(self, "_pending_scale_advices", ()))
         self._pending_scale_advices = []
-        if merged:
+        active_goal = goal or self._current_goal()
+        if self.save_history_var.get() and self.project is not None:
+            merged = adjust_advices_from_history(merged, self.project, plan, active_goal, load_feedback_history())
+        needs_decision, _ = needs_user_intervention(
+            self.project,
+            plan,
+            active_goal,
+            merged,
+            physical_confirmed=self.physical_filament_confirmed_var.get(),
+        )
+        if merged and (needs_decision or any(a.scope != "alert" for a in merged)):
             self._show_professor_dialog(plan, destination, merged)
         else:
-            self._execute_conversion(plan, destination)
+            self._execute_conversion(plan, destination, professor_advices=merged)
 
     def _poll_professor(self):
         try:
@@ -1179,10 +1454,7 @@ class MakerElegooApp(tk.Tk):
         alerts = [adv for adv in advices if adv.scope == "alert"]
 
         if self.project is not None:
-            goal = PrintGoal(
-                purpose=purpose_code(self.purpose_var.get()),
-                priority=priority_code(self.priority_var.get()),
-            )
+            goal = self._current_goal()
             summary_box = ttk.LabelFrame(scrollable_frame, text="Resumo para impressão", padding=8)
             summary_box.pack(fill="x", expand=True, pady=(0, 8), padx=4)
             ttk.Label(
@@ -1201,13 +1473,27 @@ class MakerElegooApp(tk.Tk):
                 var = tk.BooleanVar(value=adv.default_on)
                 chk = ttk.Checkbutton(
                     adv_box,
-                    text=f"Aplicar: {adv.current} → {adv.proposed}",
+                    text=f"Aplicar: {adv.current} → {adv.proposed} ({evidence_label(adv.evidence_class)})",
                     variable=var,
                 )
                 chk.pack(anchor="w")
-                ttk.Label(adv_box, text=f"Por quê: {adv.why}", wraplength=680, foreground="#333333").pack(
+                ttk.Label(adv_box, text=f"Motivo: {adv.why}", wraplength=680, foreground="#333333").pack(
                     anchor="w", pady=(4, 0)
                 )
+                if getattr(adv, "expected_effect", ""):
+                    ttk.Label(
+                        adv_box,
+                        text=f"Efeito esperado: {adv.expected_effect}",
+                        wraplength=680,
+                        foreground="#1F3A52",
+                    ).pack(anchor="w", pady=(2, 0))
+                if getattr(adv, "what_to_check", ""):
+                    ttk.Label(
+                        adv_box,
+                        text=f"O que conferir: {adv.what_to_check}",
+                        wraplength=680,
+                        foreground="#444444",
+                    ).pack(anchor="w", pady=(2, 0))
                 check_vars.append((adv, var))
 
         if alerts:
@@ -1216,12 +1502,24 @@ class MakerElegooApp(tk.Tk):
             for adv in alerts:
                 adv_box = ttk.LabelFrame(alert_section, text=adv.title, padding=8)
                 adv_box.pack(fill="x", expand=True, pady=4, padx=4)
+                phys_prefix = (
+                    "[Depende de teste físico — fatiar não comprova]\n"
+                    if getattr(adv, "requires_physical_test", False) or adv.evidence_class == "depende_teste_fisico"
+                    else f"[{evidence_label(adv.evidence_class)}]\n"
+                )
                 ttk.Label(
                     adv_box,
-                    text=f"Aviso importante:\n{adv.why}",
+                    text=f"{phys_prefix}{adv.why}",
                     foreground="#B34700",
                     wraplength=680,
                 ).pack(anchor="w")
+                if getattr(adv, "what_to_check", ""):
+                    ttk.Label(
+                        adv_box,
+                        text=f"O que conferir: {adv.what_to_check}",
+                        wraplength=680,
+                        foreground="#444444",
+                    ).pack(anchor="w", pady=(2, 0))
 
         btn_box = ttk.Frame(frame)
         btn_box.pack(fill="x", pady=(12, 0))
@@ -1239,6 +1537,127 @@ class MakerElegooApp(tk.Tk):
         ttk.Button(btn_box, text="Aplicar Selecionados e Converter", command=proceed).pack(side="left")
         ttk.Button(btn_box, text="Converter Sem Ajustes", command=skip).pack(side="left", padx=8)
         ttk.Button(btn_box, text="Cancelar", command=dialog.destroy).pack(side="right")
+        return dialog
+
+    def _record_feedback(
+        self,
+        *,
+        target_material: str,
+        purpose: str,
+        visual_result: str,
+        notes: str = "",
+        source_material: str = "",
+        load_type: str = "",
+    ):
+        if not self.save_history_var.get():
+            return None
+        proj_label = self.project.path.stem if self.project else "projeto_local"
+        src_mat = source_material or (
+            "/".join(f.material for f in self.project.filaments) if self.project else target_material
+        )
+        goal = self._current_goal()
+        params = {}
+        if self.last_plan is not None:
+            for k in ("layer_height", "wall_loops", "sparse_infill_density", "brim_type"):
+                if k in self.last_plan.process_settings:
+                    params[k] = str(self.last_plan.process_settings[k])
+        record = FeedbackRecord(
+            timestamp="",
+            project_label=proj_label,
+            source_material=src_mat,
+            target_material=target_material,
+            nozzle_mm=self.nozzle_var.get() or "0.4",
+            purpose=purpose,
+            priority=goal.priority,
+            load_type=load_type or goal.load_type,
+            visual_result=visual_result,
+            applied_params=params,
+            notes=notes,
+        )
+        append_feedback_record(record)
+        self._update_context_preview()
+        return record
+
+    def _open_feedback_dialog(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Registrar resultado da impressão (histórico local)")
+        dialog.geometry("540x400")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=14)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text="Registro 100% local (opcional). Nenhum .3mf, malha ou G-code sai deste computador.",
+            wraplength=500,
+        ).pack(anchor="w", pady=(0, 8))
+
+        ttk.Checkbutton(
+            frame,
+            text="Ativar histórico local de impressões para ajustar futuras recomendações",
+            variable=self.save_history_var,
+        ).pack(anchor="w", pady=(0, 8))
+
+        mat_default = self.physical_material_var.get()
+        if mat_default in {"", "Não sei informar"}:
+            mat_default = "PLA"
+        mat_var = tk.StringVar(value=mat_default)
+        purp_var = tk.StringVar(value=purpose_code(self.purpose_var.get()))
+        result_by_label = {label: code for code, label in VISUAL_RESULTS.items()}
+        vis_label_var = tk.StringVar(value=VISUAL_RESULTS["aprovado"])
+        notes_var = tk.StringVar()
+
+        form = ttk.Frame(frame)
+        form.pack(fill="x", pady=4)
+        form.columnconfigure(1, weight=1)
+        ttk.Label(form, text="Filamento impresso:").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Combobox(
+            form,
+            textvariable=mat_var,
+            values=("PLA", "PETG", "ABS", "ASA", "ABS-CF", "ASA-CF", "TPU"),
+            state="readonly",
+        ).grid(row=0, column=1, sticky="ew")
+        ttk.Label(form, text="Uso principal (código):").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Combobox(form, textvariable=purp_var, values=tuple(PURPOSE_LABELS.keys()), state="readonly").grid(
+            row=1, column=1, sticky="ew", pady=(6, 0)
+        )
+        ttk.Label(form, text="Resultado observado:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Combobox(form, textvariable=vis_label_var, values=tuple(VISUAL_RESULTS.values()), state="readonly").grid(
+            row=2, column=1, sticky="ew", pady=(6, 0)
+        )
+
+        ttk.Label(frame, text="Observações locais (opcional):").pack(anchor="w", pady=(10, 0))
+        ttk.Entry(frame, textvariable=notes_var).pack(fill="x", pady=(2, 10))
+
+        def save():
+            if not self.save_history_var.get():
+                if not messagebox.askyesno(
+                    "Ativar histórico local?",
+                    "O armazenamento local de histórico está desativado. Deseja ativá-lo neste computador e salvar este registro?",
+                    parent=dialog,
+                ):
+                    return
+                self.save_history_var.set(True)
+            vis_code = result_by_label.get(vis_label_var.get(), "aprovado")
+            self._record_feedback(
+                target_material=mat_var.get(),
+                purpose=purp_var.get(),
+                visual_result=vis_code,
+                notes=notes_var.get(),
+            )
+            self.status_var.set("Resultado da impressão salvo localmente")
+            dialog.destroy()
+
+        def clear_hist():
+            clear_feedback_history()
+            self.status_var.set("Histórico local limpo")
+            self._update_context_preview()
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x", pady=(8, 0))
+        ttk.Button(btns, text="Salvar registro local", command=save).pack(side="left")
+        ttk.Button(btns, text="Limpar histórico", command=clear_hist).pack(side="left", padx=8)
+        ttk.Button(btns, text="Fechar", command=dialog.destroy).pack(side="right")
         return dialog
 
     def _execute_conversion(self, plan: ConversionPlan, destination: str,

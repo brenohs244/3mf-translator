@@ -91,3 +91,38 @@ Benchmarks executados localmente no `ElegooSlicer 1.5.3.5`:
 - Suíte unitária completa (`python -m unittest discover -s tests`) verde com 100% de passagem.
 - Fatiamento real no `elegoo-slicer.exe` com **100% de aprovação (8/8 em `PROJETOS ESTUDO` + Chibi)** — zero falhas, malha preservada nos casos sem escala, dimensões exatas nos casos redimensionados, chaves aplicadas confirmadas no `Metadata/project_settings.config` e G-code.
 - Atualização do grafo de conhecimento (`graphify update .`) após cada bloco de alteração de código.
+
+---
+
+## Próxima fase: tradutor simples com Professor confiável (revisão de 2026-11-14)
+
+**Estado (atualizado em 2026-11-14):** implementação e verificação concluídas conforme [spec](docs/superpowers/specs/2026-11-14-tradutor-simples-professor-confiavel-design.md) e [plano](docs/superpowers/plans/2026-11-14-tradutor-simples-professor-confiavel.md). Suíte unitária (`117/117 OK`), fatiamento real via `elegoo-slicer.exe` (Centauri Carbon 2 `0.4 mm`) aprovado em decorativo (`Chaveiro+Nossa+Senhora.3mf`), funcional/esforço (`Dock Box V3 Rear Mounted.3mf`), articulado PLA e PLA→ABS (`flexi+rex+keychain.3mf`), PETG→ABS (`CANIVETE.3mf`), multiplaca (`Caballero partes.3mf`) e comparativo real 5 alternativas por placa (`original`, `qualidade`, `velocidade`, `equilibrio`, `economia`), além de conferência do fluxo iniciante na UI. Fatiar não substitui conferência visual no ELEGOO Slicer nem teste físico de encaixe/resistência/câmara passiva. Manter os 3MF do usuário locais, fora do Git e fora de serviços de IA; enviar somente resumo textual após autorização explícita.
+
+### 1. Fluxo principal para iniciantes
+
+- Criar a ação principal **“Traduzir para minha ELEGOO”**: escolher 3MF, confirmar filamento físico e bico instalado, receber perfis ELEGOO sugeridos e converter. Deixar máquina, processo e opções por filamento em “Detalhes avançados”. Nunca presumir que o filamento físico corresponde ao declarado no 3MF.
+- Mostrar antes da conversão um cartão curto: material de origem e destino, placas/cores, perfis sugeridos, mudanças relevantes e riscos que exigem decisão. Pedir intervenção apenas para ambiguidade, incompatibilidade ou risco identificado.
+- Testar o fluxo com usuário iniciante e com casos de um e vários filamentos/placas. Medir tempo até o primeiro resultado e quantas decisões são exigidas.
+
+### 2. Professor orientado ao uso real da peça
+
+- Além de “decorativa”, “recebe força” e “partes móveis”, perguntar **direção e tipo da carga**, criticidade da falha, encaixes/folgas, exposição a calor/sol e filamento físico. Permitir “não sei” e reduzir a confiança da recomendação nesse caso.
+- Explicar cada ajuste em termos simples: parâmetro atual, proposta, motivo, efeito esperado e o que conferir. Separar recomendações de configuração de alertas que dependem de ensaio físico.
+- Corrigir `is_original_pla` em `professor.py`: hoje inclui PETG e pode rotular PETG → ABS como PLA → ABS. Acrescentar testes para origens PLA, PETG e mistas.
+
+### 3. Diagnóstico específico para troca PLA → ABS/ASA
+
+- Criar checklist de contração e folgas, empenamento, adesão à mesa, temperatura do material/perfil, ambiente/câmara e ventilação da **peça**, distinguindo-a de exaustão do ambiente. Usar o perfil ELEGOO e as recomendações do fabricante do filamento como ponto de partida.
+- Remover garantias como “ventilação reduzida ... para garantir boa solda térmica” em `build_print_summary`. O software não mede temperatura da câmara, união entre camadas ou resistência final. Informar o que é hipótese, estimativa do fatiador e o que precisa de peça de teste/ensaio.
+- Revisar percentuais e limites fixos de ventoinha, velocidades, brim, paredes e preenchimento no Professor. Aplicar apenas valores compatíveis com perfil e geometria; explicar conflitos como ventilação para saliências versus adesão entre camadas e brim versus articulações.
+
+### 4. Evidência e comparação antes de recomendar
+
+- Exibir quatro classes em cada conclusão: **verificado no 3MF**, **verificado pelo fatiamento**, **estimado por regra/IA** e **depende de teste físico**. Fatiar não prova acabamento, estabilidade dimensional nem resistência mecânica.
+- Comparar original e alternativas de qualidade, velocidade, equilíbrio e economia antes de destacar uma: mostrar tempo, material e parâmetros alterados por placa. Não recomendar “mais forte” apenas por paredes/preenchimento; considerar orientação e direção da carga e deixar resistência como não comprovada.
+- Registrar resultado visual e feedback de impressão em histórico local opcional para ajustar futuras recomendações, sem enviar 3MF, malha ou G-code a serviços externos.
+
+### Verificação desta fase
+
+- Testes TDD para o fluxo simplificado, classificação de evidência, PETG → ABS e recomendações condicionais; revisão de linguagem para eliminar promessas de desempenho não medidas.
+- Fatiamento real de projetos decorativos, funcionais, articulados e PLA → ABS na Centauri Carbon 2, com comparação de perfis e conferência visual no ELEGOO Slicer. Registrar perdas e limites caso a caso antes de afirmar compatibilidade.

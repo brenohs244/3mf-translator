@@ -76,7 +76,15 @@ class UIProfessorTests(unittest.TestCase):
         abs_advices = advise_offline(self.project, self.plan_abs, PrintGoal("esforco", "equilibrio"))
         summary_abs = build_print_summary(self.project, self.plan_abs, PrintGoal("esforco", "equilibrio"), abs_advices)
         self.assertIn("PLA → ABS", summary_abs)
-        self.assertIn("solda", summary_abs.lower())
+        self.assertNotIn("garant", summary_abs.lower())
+        for heading in (
+            "verificado no 3mf",
+            "verificado pelo fatiamento",
+            "estimado por regra/ia",
+            "depende de teste físico",
+            "fatiar não prova acabamento",
+        ):
+            self.assertIn(heading, summary_abs.lower())
         self.assertIn("4 paredes", summary_abs.lower())
         self.assertIn("30%", summary_abs)
         self.assertIn("conferir no elegoo slicer", summary_abs.lower())
