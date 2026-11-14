@@ -60,6 +60,8 @@ SAFE_PROCESS_KEYS = {
     "support_style",
     "support_top_z_distance",
     "elefant_foot_compensation",
+    "xy_contour_compensation",
+    "xy_hole_compensation",
 }
 
 SAFE_FILAMENT_KEYS = {
@@ -68,7 +70,39 @@ SAFE_FILAMENT_KEYS = {
     "overhang_fan_speed",
     "additional_cooling_fan_speed",
     "during_print_exhaust_fan_speed",
+    "filament_shrink",
 }
+
+SAFE_MACHINE_KEYS = {
+    "passive_preheat_seconds",
+}
+
+_PREHEAT_MARKER_START = "; --- Maker-ELEGOO: pre-aquecimento passivo"
+_PREHEAT_BLOCK_RE = re.compile(
+    r"\n?; --- Maker-ELEGOO: pre-aquecimento passivo[^\n]*\nG4 S\d+[^\n]*\n?",
+    re.MULTILINE,
+)
+
+
+def inject_passive_preheat_gcode(machine_start_gcode: str, seconds: int) -> str:
+    """Insere espera térmica (G4) após M190 de forma idempotente no start G-code."""
+    cleaned = _PREHEAT_BLOCK_RE.sub("\n", machine_start_gcode or "").strip("\r\n")
+    minutes = seconds / 60.0
+    block = (
+        f"{_PREHEAT_MARKER_START} opcional da camara ---\n"
+        f"G4 S{seconds} ; Aguarda {minutes:.1f} min apos aquecer mesa (camara passiva, porta fechada)"
+    )
+    lines = cleaned.splitlines()
+    insert_at = None
+    for idx, line in enumerate(lines):
+        if line.strip().upper().startswith("M190"):
+            insert_at = idx + 1
+            break
+    if insert_at is None:
+        lines.insert(0, block)
+    else:
+        lines.insert(insert_at, block)
+    return "\n".join(lines)
 
 
 @dataclass(frozen=True)
@@ -259,13 +293,29 @@ def validate_change(scope: str, key: str, value: str, plan: ConversionPlan, slot
                 return math.isfinite(comp) and 0.0 <= comp <= 0.4
             except ValueError:
                 return False
+        if key in {"xy_contour_compensation", "xy_hole_compensation"}:
+            try:
+                comp = float(value)
+                return math.isfinite(comp) and -0.25 <= comp <= 0.35
+            except ValueError:
+                return False
         return True
 
     if scope == "filament":
         if slot is None or slot < 1 or slot > len(plan.filament_settings):
             return False
         cfg = plan.filament_settings[slot - 1]
-        if key not in SAFE_FILAMENT_KEYS or key not in cfg:
+        if key not in SAFE_FILAMENT_KEYS:
+            return False
+        if key == "filament_shrink":
+            if not value.endswith("%"):
+                return False
+            try:
+                pct = float(value[:-1])
+                return math.isfinite(pct) and 96.0 <= pct <= 102.0
+            except ValueError:
+                return False
+        if key not in cfg:
             return False
         try:
             val_int = int(value)
@@ -277,6 +327,15 @@ def validate_change(scope: str, key: str, value: str, plan: ConversionPlan, slot
             return 0 <= val_int <= orig_int
         except ValueError:
             return False
+
+    if scope == "machine":
+        if key not in SAFE_MACHINE_KEYS:
+            return False
+        if key == "passive_preheat_seconds":
+            if "machine_start_gcode" not in plan.machine_settings:
+                return False
+            return value.isdigit() and 180 <= int(value) <= 900
+        return False
 
     return False
 
@@ -735,6 +794,30 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
             confidence=conf,
             default_on=False,
         ))
+        chamber_ctrl = _as_str(plan.machine_settings.get("support_chamber_temp_control", "0"))
+        if chamber_ctrl == "0" and "machine_start_gcode" in plan.machine_settings:
+            large_footprint = geom is not None and max(getattr(geom, "size_x", 0.0), getattr(geom, "size_y", 0.0)) >= 120.0
+            soak_seconds = "480" if large_footprint else "300"
+            soak_mins = "8" if large_footprint else "5"
+            _add_if_valid(
+                advices,
+                Advice(
+                    scope="machine", slot=None, key="passive_preheat_seconds",
+                    current="0", proposed=soak_seconds,
+                    title=f"Pré-aquecimento passivo opcional ({soak_mins} min após aquecer a mesa)",
+                    why=(
+                        "Como a CC2 não tem aquecedor ativo de câmara (controle = 0), pausar com a mesa quente "
+                        "e porta/tampa fechadas antes de iniciar ajuda a aquecer o ar interno antes da 1ª camada."
+                    ),
+                    expected_effect=f"Adiciona G4 S{soak_seconds} no start G-code para estabilização térmica inicial (não garante temperatura fixa).",
+                    what_to_check="Deixe porta e tampa fechadas desde o início e confirme o G4 na auditoria de G-code.",
+                    evidence_class="estimado_regra_ia",
+                    requires_physical_test=True,
+                    confidence=conf,
+                    default_on=False,
+                ),
+                plan,
+            )
 
         has_shrink_context = (
             goal.purpose in {"moveis", "chaveiro_articulado"}
@@ -1745,6 +1828,25 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 default_on=False,
             ))
 
+        if getattr(geom, "has_thin_neck", False) and getattr(geom, "neck_findings", ()):
+            neck = geom.neck_findings[0]
+            pct = neck.ratio_to_peak * 100.0
+            advices.append(Advice(
+                scope="alert", slot=None, key="", current="", proposed="",
+                title="Pescoço / Seção Estreita Detectada na Malha",
+                why=(
+                    f"Em Z≈{neck.z_mm:.1f} mm a área transversal cai para {neck.cross_area_mm2:.1f} mm² "
+                    f"(~{pct:.0f}% da seção adjacente; vão ~{neck.width_mm:.1f}×{neck.depth_mm:.1f} mm). "
+                    "Camadas horizontais tendem a concentrar tensão nessa região caso a peça receba carga lateral ou tração em Z."
+                ),
+                expected_effect="Alertar para reforço de paredes (wall_loops) ou avaliação de impressão deitada antes do teste físico.",
+                what_to_check="Avalie 'Analisar orientação de figura' considerando a carga real e teste fisicamente o gargalo.",
+                evidence_class="verificado_3mf",
+                requires_physical_test=True,
+                confidence=conf,
+                default_on=False,
+            ))
+
     return _consolidate_advices(advices)
 
 
@@ -1762,12 +1864,20 @@ def merge_with_offline_alerts(ai_advices: list[Advice], offline_advices: list[Ad
 
 
 def apply_advice(plan: ConversionPlan, approved: list[Advice]) -> ConversionPlan:
+    new_machine = dict(plan.machine_settings)
     new_process = dict(plan.process_settings)
     new_filaments = [dict(f) for f in plan.filament_settings]
     forced_keys = list(getattr(plan, "forced_process_keys", ()) or ())
 
     for adv in approved:
-        if adv.scope == "process":
+        if adv.scope == "machine":
+            if validate_change("machine", adv.key, adv.proposed, plan):
+                if adv.key == "passive_preheat_seconds":
+                    new_machine["machine_start_gcode"] = inject_passive_preheat_gcode(
+                        str(new_machine.get("machine_start_gcode", "")),
+                        int(adv.proposed),
+                    )
+        elif adv.scope == "process":
             if validate_change("process", adv.key, adv.proposed, plan):
                 new_process[adv.key] = adv.proposed
                 if adv.key not in forced_keys:
@@ -1779,6 +1889,7 @@ def apply_advice(plan: ConversionPlan, approved: list[Advice]) -> ConversionPlan
 
     return replace(
         plan,
+        machine_settings=new_machine,
         process_settings=new_process,
         filament_settings=tuple(new_filaments),
         forced_process_keys=tuple(forced_keys),

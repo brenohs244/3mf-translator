@@ -17,19 +17,23 @@ from zipfile import ZipFile
 from .ai import (AIError, Suggestion, apply_suggestions, build_manual_prompt,
                  parse_manual_response, suggest_equivalences)
 from .ai_client import GeminiClient, GeminiClientError, advise_gemini
+from .calibration import compute_shrinkage_stats, export_calibration_3mf
 from .converter import ConversionResult, convert_project
 from .codex_cli import run_codex
 from .codex_evidence import (build_codex_evidence,
                              validate_codex_recommendations, verify_process_recommendation)
 from .credentials import clear_gemini_key, get_gemini_key, save_gemini_key
+from .gcode_audit import summarize_gcode_audit
 from .history import (
     VISUAL_RESULTS,
     FeedbackRecord,
     append_feedback_record,
     adjust_advices_from_history,
     clear_feedback_history,
+    find_validated_recipes,
     load_feedback_history,
 )
+from .layer_preview import render_layer1_and_overhang_preview
 from .labels import (
     CRITICALITY_LABELS,
     FIT_LABELS,
@@ -200,6 +204,46 @@ def format_conversion_report(result: ConversionResult, plan: ConversionPlan,
         for pm in (getattr(result.validation, "plate_metrics", ()) or ()):
             grams_txt = f"{pm.filament_grams:.2f} g" if pm.filament_grams is not None else "n/d"
             lines.append(f"  Placa {pm.plate}: {format_duration(pm.estimated_seconds)} · {grams_txt}")
+        gcode_audit = getattr(result.validation, "gcode_audit", None)
+        if gcode_audit and getattr(gcode_audit, "plates", ()):
+            lines.extend(["", "Auditoria real do G-code:"])
+            for pa in gcode_audit.plates:
+                noz = "/".join(f"{t:g}°C" for t in pa.nozzle_temps) or "n/d"
+                bed = "/".join(f"{t:g}°C" for t in pa.bed_temps) or "n/d"
+                fans = []
+                if pa.part_fan_max_pct is not None:
+                    fans.append(f"peça≤{pa.part_fan_max_pct}%")
+                if pa.aux_fan_max_pct is not None:
+                    fans.append(f"aux≤{pa.aux_fan_max_pct}%")
+                if pa.exhaust_fan_max_pct is not None:
+                    fans.append(f"exaustor≤{pa.exhaust_fan_max_pct}%")
+                fan_txt = ", ".join(fans) if fans else "n/d"
+                min_lt = f"{pa.min_layer_time_s:.1f} s" if pa.min_layer_time_s is not None else "n/d"
+                dwell_txt = f" · pré-aquec. G4 S{pa.preheat_dwell_seconds}" if pa.has_preheat_dwell else ""
+                lines.append(
+                    f"  Placa {pa.plate}: {pa.layer_count} camadas · bico {noz} · mesa {bed} · "
+                    f"ventoinhas [{fan_txt}] · vazão máx. ~{pa.max_volumetric_flow_mm3_s:.1f} mm³/s · "
+                    f"menor camada {min_lt} · ilhas 1ª camada {pa.layer1_island_count}{dwell_txt}"
+                )
+            vol_limits = []
+            target_polymers: set[str] = set()
+            for cfg in plan.filament_settings:
+                ft = cfg.get("filament_type", [""])
+                mat = str(ft[0] if isinstance(ft, (list, tuple)) and ft else ft)
+                if mat:
+                    target_polymers.add(mat)
+                vm = cfg.get("filament_max_volumetric_speed")
+                try:
+                    vol_limits.append(float(str(vm[0] if isinstance(vm, (list, tuple)) and vm else vm)))
+                except (TypeError, ValueError, IndexError):
+                    pass
+            max_vol_limit = min(vol_limits) if vol_limits else None
+            audit_findings = summarize_gcode_audit(
+                gcode_audit.plates,
+                max_volumetric_limit=max_vol_limit,
+                target_polymers=target_polymers,
+            )
+            lines.extend(f"  • {item}" for item in audit_findings)
         lines.extend(f"Aviso do fatiador: {warning}" for warning in result.validation.warnings)
     if plan.material_findings:
         lines.extend(["", "Mudanças de material/perfil:"])
@@ -284,6 +328,8 @@ def format_orientation_analysis(analysis: OrientationAnalysis) -> str:
         validation = result.validation
         lines = [f"{candidate.label}: {'fatiamento validado' if result.success else 'falha no fatiamento'}",
                  f"  Apoio estimado: {candidate.contact_mm2:.0f} mm²; risco frontal estimado: {candidate.front_overhang_mm2:.0f} mm²"]
+        if getattr(candidate, "load_note", ""):
+            lines.append(f"  Carga × camadas: {candidate.load_note}")
         if validation and validation.estimated_seconds is not None:
             minutes = round(validation.estimated_seconds / 60)
             lines.append(f"  Tempo estimado: {minutes // 60}h {minutes % 60:02d}min")
@@ -405,6 +451,8 @@ class MakerElegooApp(tk.Tk):
         tools_menu.add_command(label="Salvar relatório", command=self._save_report)
         tools_menu.add_command(label="Comparar objetivos de impressão", command=self._compare_objectives)
         tools_menu.add_command(label="Comparar placas antes/depois", command=self._show_plate_comparison)
+        tools_menu.add_command(label="Prévia visual: 1ª camada e overhangs", command=self._preview_layer1_dialog)
+        tools_menu.add_command(label="Gerar 3MF de calibração (50 mm + folgas)", command=self._generate_calibration_dialog)
         tools_menu.add_command(label="Registrar resultado da impressão (histórico local)", command=self._open_feedback_dialog)
         menu.add_cascade(label="Ferramentas", menu=tools_menu)
         self.configure(menu=menu)
@@ -554,6 +602,8 @@ class MakerElegooApp(tk.Tk):
         adv_actions = ttk.Frame(self.advanced_frame)
         adv_actions.pack(fill="x", pady=(8, 0))
         ttk.Button(adv_actions, text="Comparar 5 alternativas", command=self._compare_objectives).pack(side="left")
+        ttk.Button(adv_actions, text="Prévia 1ª camada", command=self._preview_layer1_dialog).pack(side="left", padx=(8, 0))
+        ttk.Button(adv_actions, text="Gerar calibração 50 mm", command=self._generate_calibration_dialog).pack(side="left", padx=(8, 0))
         self.orientation_button = ttk.Button(adv_actions, text="Orientação de figura", command=self._orientation_open, state="disabled")
         self.orientation_button.pack(side="left", padx=(8, 0))
         self.ai_button = ttk.Button(adv_actions, text="Analisar orientação/suportes (Codex / IA)", command=self._analyze_ai, state="disabled")
@@ -1014,6 +1064,7 @@ class MakerElegooApp(tk.Tk):
             try:
                 analysis = evaluate_orientations(
                     project, plan, front, SlicerCLI(install.executable),
+                    load_type=load_type_code(self.load_type_var.get()),
                     progress=lambda label, index, total: self.orientation_queue.put(
                         (generation, "progress", f"Fatiando {label} ({index}/{total})...")),
                     cancelled=cancel.is_set)
@@ -1548,6 +1599,10 @@ class MakerElegooApp(tk.Tk):
         notes: str = "",
         source_material: str = "",
         load_type: str = "",
+        filament_brand: str = "",
+        profile_name: str = "",
+        measured_bar_mm: float | None = None,
+        fitted_clearance_mm: float | None = None,
     ):
         if not self.save_history_var.get():
             return None
@@ -1557,7 +1612,9 @@ class MakerElegooApp(tk.Tk):
         )
         goal = self._current_goal()
         params = {}
+        prof_name = profile_name
         if self.last_plan is not None:
+            prof_name = prof_name or self.last_plan.process.name
             for k in ("layer_height", "wall_loops", "sparse_infill_density", "brim_type"):
                 if k in self.last_plan.process_settings:
                     params[k] = str(self.last_plan.process_settings[k])
@@ -1573,6 +1630,10 @@ class MakerElegooApp(tk.Tk):
             visual_result=visual_result,
             applied_params=params,
             notes=notes,
+            filament_brand=filament_brand.strip(),
+            profile_name=prof_name.strip(),
+            measured_bar_mm=measured_bar_mm,
+            fitted_clearance_mm=fitted_clearance_mm,
         )
         append_feedback_record(record)
         self._update_context_preview()
@@ -1581,7 +1642,7 @@ class MakerElegooApp(tk.Tk):
     def _open_feedback_dialog(self):
         dialog = tk.Toplevel(self)
         dialog.title("Registrar resultado da impressão (histórico local)")
-        dialog.geometry("540x400")
+        dialog.geometry("560x500")
         dialog.transient(self)
         frame = ttk.Frame(dialog, padding=14)
         frame.pack(fill="both", expand=True)
@@ -1589,7 +1650,7 @@ class MakerElegooApp(tk.Tk):
         ttk.Label(
             frame,
             text="Registro 100% local (opcional). Nenhum .3mf, malha ou G-code sai deste computador.",
-            wraplength=500,
+            wraplength=520,
         ).pack(anchor="w", pady=(0, 8))
 
         ttk.Checkbutton(
@@ -1605,6 +1666,10 @@ class MakerElegooApp(tk.Tk):
         purp_var = tk.StringVar(value=purpose_code(self.purpose_var.get()))
         result_by_label = {label: code for code, label in VISUAL_RESULTS.items()}
         vis_label_var = tk.StringVar(value=VISUAL_RESULTS["aprovado"])
+        brand_var = tk.StringVar()
+        measured_var = tk.StringVar()
+        clearance_var = tk.StringVar()
+        shrink_preview_var = tk.StringVar(value="Contração medida: opcional (use barra nominal de 50,00 mm).")
         notes_var = tk.StringVar()
 
         form = ttk.Frame(frame)
@@ -1617,19 +1682,61 @@ class MakerElegooApp(tk.Tk):
             values=("PLA", "PETG", "ABS", "ASA", "ABS-CF", "ASA-CF", "TPU"),
             state="readonly",
         ).grid(row=0, column=1, sticky="ew")
-        ttk.Label(form, text="Uso principal (código):").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Label(form, text="Marca / cor / lote:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(form, textvariable=brand_var).grid(row=1, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(form, text="Uso principal (código):").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         ttk.Combobox(form, textvariable=purp_var, values=tuple(PURPOSE_LABELS.keys()), state="readonly").grid(
-            row=1, column=1, sticky="ew", pady=(6, 0)
-        )
-        ttk.Label(form, text="Resultado observado:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Combobox(form, textvariable=vis_label_var, values=tuple(VISUAL_RESULTS.values()), state="readonly").grid(
             row=2, column=1, sticky="ew", pady=(6, 0)
         )
+        ttk.Label(form, text="Resultado observado:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Combobox(form, textvariable=vis_label_var, values=tuple(VISUAL_RESULTS.values()), state="readonly").grid(
+            row=3, column=1, sticky="ew", pady=(6, 0)
+        )
+        ttk.Label(form, text="Barra 50 mm medida (mm):").grid(row=4, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Entry(form, textvariable=measured_var).grid(row=4, column=1, sticky="ew", pady=(6, 0))
+        ttk.Label(form, text="Menor folga livre (mm):").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Combobox(
+            form,
+            textvariable=clearance_var,
+            values=("", "0.15", "0.20", "0.30"),
+            state="readonly",
+        ).grid(row=5, column=1, sticky="ew", pady=(6, 0))
 
-        ttk.Label(frame, text="Observações locais (opcional):").pack(anchor="w", pady=(10, 0))
+        def _refresh_shrink_hint(*_):
+            raw = measured_var.get().strip().replace(",", ".")
+            if not raw:
+                shrink_preview_var.set("Contração medida: opcional (use barra nominal de 50,00 mm).")
+                return
+            try:
+                st = compute_shrinkage_stats(float(raw))
+                scale_p = round(st.xy_scale_factor * 100.0, 2)
+                shrink_preview_var.set(
+                    f"Contração observada: {st.shrinkage_pct:.2f}% · Escala compensada sugerida: {scale_p:.2f}%"
+                )
+            except ValueError:
+                shrink_preview_var.set("Medida esperada entre 45,0 mm e 52,5 mm.")
+
+        measured_var.trace_add("write", _refresh_shrink_hint)
+        ttk.Label(frame, textvariable=shrink_preview_var, foreground="#1F3A52").pack(anchor="w", pady=(4, 0))
+        ttk.Label(frame, text="Observações locais (opcional):").pack(anchor="w", pady=(8, 0))
         ttk.Entry(frame, textvariable=notes_var).pack(fill="x", pady=(2, 10))
 
         def save():
+            raw_bar = measured_var.get().strip().replace(",", ".")
+            measured_val: float | None = None
+            if raw_bar:
+                try:
+                    measured_val = float(raw_bar)
+                    compute_shrinkage_stats(measured_val)
+                except ValueError as exc:
+                    messagebox.showerror("Medição inválida", str(exc), parent=dialog)
+                    return
+            clear_val: float | None = None
+            if clearance_var.get().strip():
+                try:
+                    clear_val = float(clearance_var.get().strip())
+                except ValueError:
+                    pass
             if not self.save_history_var.get():
                 if not messagebox.askyesno(
                     "Ativar histórico local?",
@@ -1644,6 +1751,10 @@ class MakerElegooApp(tk.Tk):
                 purpose=purp_var.get(),
                 visual_result=vis_code,
                 notes=notes_var.get(),
+                filament_brand=brand_var.get(),
+                profile_name=self.process_var.get(),
+                measured_bar_mm=measured_val,
+                fitted_clearance_mm=clear_val,
             )
             self.status_var.set("Resultado da impressão salvo localmente")
             dialog.destroy()
@@ -1659,6 +1770,95 @@ class MakerElegooApp(tk.Tk):
         ttk.Button(btns, text="Limpar histórico", command=clear_hist).pack(side="left", padx=8)
         ttk.Button(btns, text="Fechar", command=dialog.destroy).pack(side="right")
         return dialog
+
+    def _preview_layer1_dialog(self):
+        src_path: Path | None = None
+        audit_plate = None
+        neck_z = None
+        if self.result and self.result.output_project and self.result.output_project.path.is_file():
+            src_path = self.result.output_project.path
+            ga = getattr(getattr(self.result, "validation", None), "gcode_audit", None)
+            if ga and getattr(ga, "plates", ()):
+                audit_plate = ga.plates[0]
+        elif self.project and self.project.path.is_file():
+            src_path = self.project.path
+            geom = getattr(self.project, "geometry_summary", None)
+            if geom and getattr(geom, "neck_findings", ()):
+                neck_z = geom.neck_findings[0].z_mm
+        if src_path is None:
+            messagebox.showinfo("Prévia visual", "Analise um projeto 3MF primeiro.", parent=self)
+            return
+        preview = render_layer1_and_overhang_preview(src_path, gcode_audit=audit_plate, neck_z_mm=neck_z)
+        dialog = tk.Toplevel(self)
+        dialog.title("Prévia local: 1ª camada e saliências (>45°)")
+        dialog.geometry("420x460")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=12)
+        frame.pack(fill="both", expand=True)
+        img = tk.PhotoImage(data=preview.ppm_bytes)
+        lbl = ttk.Label(frame, image=img)
+        lbl.image = img
+        lbl.pack(pady=(0, 8))
+        ttk.Label(frame, text=preview.legend, wraplength=380, foreground="#1F3A52").pack(anchor="w")
+        stats_txt = (
+            f"Apoio estimado na mesa: {preview.contact_area_mm2:.0f} mm² · "
+            f"Saliências >45°: {preview.overhang_area_mm2:.0f} mm²"
+        )
+        if audit_plate is not None:
+            stats_txt += f" · Ilhas na 1ª camada: {audit_plate.layer1_island_count}"
+        if neck_z is not None:
+            stats_txt += f" · Pescoço detectado em Z≈{neck_z:.1f} mm"
+        ttk.Label(frame, text=stats_txt, wraplength=380).pack(anchor="w", pady=(4, 8))
+        ttk.Button(frame, text="Fechar", command=dialog.destroy).pack(anchor="e")
+        return dialog
+
+    def _generate_calibration_dialog(self):
+        if not self.install:
+            messagebox.showinfo("Calibração", "Localize o ELEGOO Slicer primeiro.", parent=self)
+            return
+        try:
+            machine, process, filaments = self._selected_profiles()
+        except (ValueError, IndexError, StopIteration, ProfileError):
+            messagebox.showinfo("Calibração", "Selecione bico, processo e filamento primeiro.", parent=self)
+            return
+        fil = filaments[0]
+        dest = filedialog.asksaveasfilename(
+            title="Salvar 3MF de calibração (barra 50 mm + folgas)",
+            initialfile="Calibracao_CC2_50mm_Folgas.3mf",
+            defaultextension=".3mf",
+            filetypes=[("Projeto 3MF", "*.3mf")],
+        )
+        if not dest:
+            return
+        dest_path = Path(dest)
+        if dest_path.exists():
+            dest_path.unlink()
+        self.status_var.set("Gerando e fatiando peça de calibração...")
+
+        def run_calib():
+            try:
+                res = export_calibration_3mf(self.install, machine, process, fil, dest_path)
+            except Exception as exc:
+                self.after(0, lambda: messagebox.showerror("Calibração", str(exc), parent=self))
+                return
+            def finish():
+                self.status_var.set("Calibração pronta" if res.success else "Falha ao fatiar calibração")
+                if res.success:
+                    time_txt = format_duration(res.validation.estimated_seconds) if res.validation else "n/d"
+                    grams_txt = f"{res.validation.filament_grams:.2f} g" if (res.validation and res.validation.filament_grams is not None) else "n/d"
+                    messagebox.showinfo(
+                        "Peça de calibração pronta",
+                        f"Salva e fatiada em:\n{dest_path}\n\n"
+                        f"Estimativa real: {time_txt} · {grams_txt}\n\n"
+                        "Após imprimir, meça a barra de 50,00 mm com paquímetro e teste o pino 6 mm nas fendas (+0,15 / +0,20 / +0,30 mm), "
+                        "depois registre em 'Registrar resultado da impressão'.",
+                        parent=self,
+                    )
+                else:
+                    messagebox.showerror("Calibração", res.message, parent=self)
+            self.after(0, finish)
+
+        threading.Thread(target=run_calib, daemon=True).start()
 
     def _execute_conversion(self, plan: ConversionPlan, destination: str,
                             *, professor_advices: list[Advice] | tuple[Advice, ...] = ()):

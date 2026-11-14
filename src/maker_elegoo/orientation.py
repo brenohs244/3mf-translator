@@ -52,6 +52,7 @@ class Candidate:
     valid: bool
     reason: str
     is_current: bool = False
+    load_note: str = ""
 
 
 def parse_transform(value: str | None) -> tuple[float, ...]:
@@ -245,7 +246,7 @@ def _printable_bounds(printable_area: list[str], printable_height: float) -> tup
 
 
 def rank_orientations(scene: Scene, front: str, printable_area: list[str],
-                      printable_height: float) -> list[Candidate]:
+                      printable_height: float, *, load_type: str = "nao_sei") -> list[Candidate]:
     if front not in FRONTS:
         raise OrientationError("Escolha a vista frontal da figura")
     bed_x0, bed_x1, bed_y0, bed_y1, max_height = _printable_bounds(printable_area, printable_height)
@@ -336,8 +337,25 @@ def rank_orientations(scene: Scene, front: str, printable_area: list[str],
                 and transformed_bounds[2] >= bed_y0 - 1e-4 and transformed_bounds[3] <= bed_y1 + 1e-4
                 and transformed_bounds[4] >= -1e-4 and transformed_bounds[5] <= max_height + 1e-4)
         score = 4 * front_overhang + 0.4 * overhang - 0.2 * min(contact, 1000)
+        load_note = ""
+        if load_type in {"tracao_eixo_z", "flexao_lateral", "impacto"}:
+            dx_b = transformed_bounds[1] - transformed_bounds[0]
+            dy_b = transformed_bounds[3] - transformed_bounds[2]
+            dz_b = transformed_bounds[5] - transformed_bounds[4]
+            max_xy = max(dx_b, dy_b)
+            if dz_b > 1.35 * max_xy:
+                score += min(250.0, (dz_b - max_xy) * 3.0)
+                load_note = "Camadas transversais ao eixo alto (ponto fraco potencial sob tração/flexão)."
+            elif max_xy >= 1.35 * dz_b:
+                score -= min(250.0, (max_xy - dz_b) * 3.0)
+                load_note = (
+                    "Camadas alinhadas ao maior vão (favorece continuidade em tração/flexão, "
+                    "porém pode exigir suportes; resistência exige teste físico)."
+                )
+            else:
+                load_note = "Proporção equilibrada; confira a direção da carga em relação às camadas no Slicer."
         candidates.append(Candidate(label, item_transform, transformed_bounds, contact, overhang,
-                                    front_overhang, score, fits, "" if fits else "Fora do volume útil", current))
+                                    front_overhang, score, fits, "" if fits else "Fora do volume útil", current, load_note))
 
     minimum_contact = max(10.0, 0.12 * max(item.contact_mm2 for item in candidates))
     checked = []
@@ -345,7 +363,7 @@ def rank_orientations(scene: Scene, front: str, printable_area: list[str],
         if item.contact_mm2 < minimum_contact:
             checked.append(Candidate(item.label, item.item_transform, item.bounds, item.contact_mm2,
                                      item.overhang_mm2, item.front_overhang_mm2, item.score, False,
-                                     "Contato insuficiente com a mesa", item.is_current))
+                                     "Contato insuficiente com a mesa", item.is_current, item.load_note))
         else:
             checked.append(item)
     return [checked[0], *sorted(checked[1:], key=lambda item: (not item.valid, item.score))]

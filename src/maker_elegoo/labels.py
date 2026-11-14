@@ -35,7 +35,11 @@ LABELS: dict[str, tuple[str, str]] = {
     "inner_wall_speed": ("Velocidade da parede interna", "mm/s"),
     "top_surface_speed": ("Velocidade da superfície superior", "mm/s"),
     "elefant_foot_compensation": ("Compensação pé de elefante", "mm"),
+    "xy_contour_compensation": ("Compensação XY externa (contorno)", "mm"),
+    "xy_hole_compensation": ("Compensação XY de furos", "mm"),
     "filament_type": ("Material", ""),
+    "filament_shrink": ("Compensação de contração do filamento", ""),
+    "passive_preheat_seconds": ("Pré-aquecimento passivo da câmara", "s"),
 }
 
 PURPOSE_LABELS: dict[str, str] = {

@@ -13,6 +13,7 @@ from typing import Callable
 from xml.etree import ElementTree
 from zipfile import ZipFile, is_zipfile
 
+from .gcode_audit import GcodeAuditSummary, PlateGcodeAudit, audit_gcode_file, summarize_gcode_audit
 from .mapping import ConversionPlan
 from .project import ProjectInfo
 
@@ -40,6 +41,7 @@ class ValidationResult:
     estimated_seconds: int | None = None
     filament_grams: float | None = None
     plate_metrics: tuple[PlateValidationMetric, ...] = ()
+    gcode_audit: GcodeAuditSummary | None = None
 
 
 def _gcode_metrics(path: Path) -> tuple[int | None, float | None]:
@@ -228,11 +230,13 @@ class SlicerCLI:
             warnings = tuple(line for line in (result.stderr or "").splitlines()
                              if "warning" in line.lower() or "aviso" in line.lower())
             metrics = [_gcode_metrics(path) for path in gcodes]
+            audits = tuple(audit_gcode_file(path, plate=index) for index, path in enumerate(gcodes, 1))
             plate_metrics = tuple(
                 PlateValidationMetric(index, item[0], item[1])
                 for index, item in enumerate(metrics, 1)
             )
             seconds = sum(item[0] for item in metrics) if all(item[0] is not None for item in metrics) else None
             grams = sum(item[1] for item in metrics) if all(item[1] is not None for item in metrics) else None
+            audit_summary = GcodeAuditSummary(plates=audits, findings=summarize_gcode_audit(audits))
             return ValidationResult(True, len(gcodes), "Todas as placas foram fatiadas",
-                                    warnings, seconds, grams, plate_metrics)
+                                    warnings, seconds, grams, plate_metrics, audit_summary)

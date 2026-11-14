@@ -33,6 +33,7 @@ class OrientationAnalysis:
 
 def evaluate_orientations(project: ProjectInfo, plan: ConversionPlan, front: str,
                           slicer: SlicerCLI, *,
+                          load_type: str = "nao_sei",
                           progress: Callable[[str, int, int], None] | None = None,
                           cancelled: Callable[[], bool] | None = None) -> OrientationAnalysis:
     if cancelled and cancelled():
@@ -40,7 +41,7 @@ def evaluate_orientations(project: ProjectInfo, plan: ConversionPlan, front: str
     scene = load_scene(project.path)
     area = plan.machine_settings.get("printable_area", [])
     height = float(plan.machine_settings.get("printable_height", "0"))
-    candidates = rank_orientations(scene, front, area, height)
+    candidates = rank_orientations(scene, front, area, height, load_type=load_type)
     selected = [candidates[0], *[item for item in candidates[1:] if item.valid][:2]]
     evaluations = []
     with tempfile.TemporaryDirectory(prefix="maker-elegoo-orientation-") as scratch:
@@ -65,11 +66,21 @@ def evaluate_orientations(project: ProjectInfo, plan: ConversionPlan, front: str
         reason = "A posição atual falhou no fatiamento; a alternativa foi validada."
     else:
         threshold = current.candidate.front_overhang_mm2 * 0.85
-        improved = [item for item in good
-                    if item.candidate.front_overhang_mm2 < threshold]
+        if load_type in {"tracao_eixo_z", "flexao_lateral", "impacto"}:
+            improved = [
+                item for item in good
+                if item.candidate.front_overhang_mm2 < threshold
+                or item.candidate.score < current.candidate.score - 20.0
+            ]
+        else:
+            improved = [item for item in good
+                        if item.candidate.front_overhang_mm2 < threshold]
         chosen = min(improved, key=lambda item: item.candidate.score) if improved else None
-        reason = ("Risco frontal estimado menor e fatiamento validado."
-                  if chosen else "Nenhuma alternativa validada melhorou claramente a frente; mantenha a posição atual.")
+        if chosen and chosen.candidate.load_note:
+            reason = f"Alternativa validada considerando direção da carga: {chosen.candidate.load_note}"
+        else:
+            reason = ("Risco frontal estimado menor e fatiamento validado."
+                      if chosen else "Nenhuma alternativa validada melhorou claramente a frente; mantenha a posição atual.")
     rejected = tuple(item for item in candidates[1:] if not item.valid)
     return OrientationAnalysis(front, current, tuple(alternatives),
                                chosen.candidate if chosen else current.candidate, reason, rejected)
