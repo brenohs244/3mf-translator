@@ -62,6 +62,19 @@ def _details(result: subprocess.CompletedProcess, folder: Path) -> str:
     return f"ELEGOO Slicer terminou com código {result.returncode}"
 
 
+def next_available_destination(path: Path) -> Path:
+    """Retorna o próprio caminho se livre, ou adiciona sufixo _2, _3... até encontrar nome disponível."""
+    path = Path(path)
+    if not path.exists():
+        return path
+    index = 2
+    while True:
+        candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 def _rewrite_3mf_entries(source_zip: Path, dest_zip: Path, replacements: dict[str, bytes]) -> None:
     """Reescreve entradas específicas mantendo os demais itens do 3MF."""
     with ZipFile(source_zip) as source, ZipFile(dest_zip, "w") as target:

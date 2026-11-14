@@ -37,12 +37,19 @@ from .orientation import FRONTS, load_scene, render_front_views
 from .orientation_service import (OrientationAnalysis, apply_orientation,
                                   evaluate_orientations)
 from .optimization import compare_objectives
-from .professor import Advice, PrintGoal, advise_offline, apply_advice, merge_with_offline_alerts
+from .professor import (
+    Advice,
+    PrintGoal,
+    advise_offline,
+    apply_advice,
+    build_print_summary,
+    merge_with_offline_alerts,
+)
 from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles, resolve_profile
 from .project import ProjectInfo, inspect_project
 from .scale import RescaleResult, ScaleError, analyze_scale_risk, rescale_3mf
 from .settings import load_settings, save_settings
-from .slicer import SlicerCLI
+from .slicer import SlicerCLI, next_available_destination
 
 
 def format_plate_color_guide(plates: tuple | list, filaments: tuple | list) -> list[str]:
@@ -163,11 +170,56 @@ def format_conversion_report(result: ConversionResult, plan: ConversionPlan,
         lines.extend(["", "Mudanças de material/perfil:"])
         lines.extend(f"  Filamento {item.slot}: {describe_change(item.key, item.source, item.target)}"
                      for item in plan.material_findings)
+    speed_warnings = []
+    for key in ("outer_wall_speed", "inner_wall_speed", "top_surface_speed"):
+        src_raw = plan.replaced.get(key)
+        dst_raw = plan.process_settings.get(key)
+        if src_raw is None or dst_raw is None:
+            continue
+        try:
+            src_val = float(str(src_raw[0] if isinstance(src_raw, (list, tuple)) else src_raw))
+            dst_val = float(str(dst_raw[0] if isinstance(dst_raw, (list, tuple)) else dst_raw))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if dst_val - src_val >= 30.0 and dst_val >= src_val * 1.25:
+            speed_warnings.append(
+                f"  • {describe_change(key, f'{src_val:g}', f'{dst_val:g}')} "
+                "(o perfil ELEGOO é mais rápido que o original; se notar perda de acabamento, use a prioridade 'Qualidade visual')"
+            )
+    if speed_warnings:
+        lines.extend(["", "Atenção (aumento de velocidade do perfil ELEGOO):", *speed_warnings])
     if result.unmapped:
         lines.extend(["", "Detalhes técnicos (campos não mapeados - primeiros 30):"])
         lines.extend(f"  • {key}" for key in list(sorted(result.unmapped))[:30])
     lines.extend(["", "Confira a posição das peças, cores, suportes e prévia no ELEGOO Slicer antes de imprimir."])
     return "\n".join(lines)
+
+
+def _resolve_existing_destination(
+    destination: Path,
+    *,
+    ask_action=messagebox.askyesnocancel,
+    parent=None,
+) -> Path | None:
+    """Trata destino já existente oferecendo sobrescrever, gerar sufixo ou cancelar."""
+    destination = Path(destination)
+    if not destination.exists():
+        return destination
+    suggested = next_available_destination(destination)
+    choice = ask_action(
+        "Destino existente",
+        f"O arquivo '{destination.name}' já existe.\n\n"
+        f"Sim = Sobrescrever arquivo existente\n"
+        f"Não = Salvar com novo nome ({suggested.name})\n"
+        "Cancelar = Abortar conversão",
+        parent=parent,
+    )
+    if choice is None:
+        return None
+    if choice is False:
+        return suggested
+    destination.unlink()
+    return destination
 
 
 def format_orientation_analysis(analysis: OrientationAnalysis) -> str:
@@ -270,7 +322,7 @@ class MakerElegooApp(tk.Tk):
         menu = tk.Menu(self)
         tools_menu = tk.Menu(menu, tearoff=False)
         tools_menu.add_command(label="Configurar Chave Google Gemini", command=self._configure_gemini_key)
-        tools_menu.add_command(label="Ajuste guiado por IA (sem API)", command=self._manual_ai)
+        tools_menu.add_command(label="Ajuste guiado sem API (copiar/colar JSON)", command=self._manual_ai)
         tools_menu.add_command(label="Analisar orientação de figura", command=self._orientation_open)
         tools_menu.add_command(label="Prévia de compatibilidade", command=self._preview_compatibility)
         tools_menu.add_command(label="Salvar relatório", command=self._save_report)
@@ -318,7 +370,7 @@ class MakerElegooApp(tk.Tk):
         mode_box = ttk.Frame(consultant)
         mode_box.grid(row=0, column=1, columnspan=3, sticky="w")
         ttk.Radiobutton(mode_box, text="100% Offline (Regras Locais)", variable=self.mode_var, value="offline").pack(side="left", padx=(0, 12))
-        ttk.Radiobutton(mode_box, text="IA (Google Gemini)", variable=self.mode_var, value="ai").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(mode_box, text="Professor IA (Google Gemini)", variable=self.mode_var, value="ai").pack(side="left", padx=(0, 12))
         ttk.Button(mode_box, text="Chave Gemini...", command=self._configure_gemini_key).pack(side="left")
 
         ttk.Label(consultant, text="Uso da Peça:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(10, 0))
@@ -356,7 +408,7 @@ class MakerElegooApp(tk.Tk):
         self.orientation_button.pack(side="left", padx=(10, 0))
         self.open_button = ttk.Button(actions, text="Abrir no ELEGOO Slicer", command=self._open_result, state="disabled")
         self.open_button.pack(side="left", padx=(10, 0))
-        self.ai_button = ttk.Button(actions, text="Analisar com IA (opcional)", command=self._analyze_ai, state="disabled")
+        self.ai_button = ttk.Button(actions, text="Analisar orientação/suportes (Codex / IA)", command=self._analyze_ai, state="disabled")
         self.ai_button.pack(side="left", padx=(10, 0))
         ttk.Combobox(actions, textvariable=self.ai_provider_var, values=("Codex", "Gemini"),
                      state="readonly", width=8).pack(side="left", padx=(5, 0))
@@ -948,9 +1000,10 @@ class MakerElegooApp(tk.Tk):
                                                     filetypes=[("Projeto 3MF", "*.3mf")])
         if not destination:
             return
-        if Path(destination).exists():
-            messagebox.showerror("Destino existente", "Escolha um nome novo para preservar arquivos existentes.")
+        resolved_dest = _resolve_existing_destination(Path(destination), parent=self)
+        if resolved_dest is None:
             return
+        destination = str(resolved_dest)
         try:
             machine, process, filaments = self._selected_profiles()
         except (IndexError, StopIteration):
@@ -1122,29 +1175,56 @@ class MakerElegooApp(tk.Tk):
         scrollbar.pack(side="right", fill="y")
 
         check_vars: list[tuple[Advice, tk.BooleanVar]] = []
+        adjustments = [adv for adv in advices if adv.scope != "alert"]
+        alerts = [adv for adv in advices if adv.scope == "alert"]
 
-        # Listar conselhos
-        for adv in advices:
-            adv_box = ttk.LabelFrame(scrollable_frame, text=adv.title, padding=8)
-            adv_box.pack(fill="x", expand=True, pady=4, padx=4)
+        if self.project is not None:
+            goal = PrintGoal(
+                purpose=purpose_code(self.purpose_var.get()),
+                priority=priority_code(self.priority_var.get()),
+            )
+            summary_box = ttk.LabelFrame(scrollable_frame, text="Resumo para impressão", padding=8)
+            summary_box.pack(fill="x", expand=True, pady=(0, 8), padx=4)
+            ttk.Label(
+                summary_box,
+                text=build_print_summary(self.project, plan, goal, advices),
+                wraplength=700,
+                justify="left",
+            ).pack(anchor="w")
 
-            if adv.scope == "alert":
-                ttk.Label(adv_box, text=f"Aviso importante:\n{adv.why}", foreground="#B34700", wraplength=700).pack(anchor="w")
-            else:
+        if adjustments:
+            adj_section = ttk.LabelFrame(scrollable_frame, text="Ajustes recomendados", padding=8)
+            adj_section.pack(fill="x", expand=True, pady=(0, 8), padx=4)
+            for adv in adjustments:
+                adv_box = ttk.LabelFrame(adj_section, text=adv.title, padding=8)
+                adv_box.pack(fill="x", expand=True, pady=4, padx=4)
                 var = tk.BooleanVar(value=adv.default_on)
                 chk = ttk.Checkbutton(
                     adv_box,
                     text=f"Aplicar: {adv.current} → {adv.proposed}",
-                    variable=var
+                    variable=var,
                 )
                 chk.pack(anchor="w")
-                ttk.Label(adv_box, text=f"Por quê: {adv.why}", wraplength=700, foreground="#333333").pack(anchor="w", pady=(4, 0))
+                ttk.Label(adv_box, text=f"Por quê: {adv.why}", wraplength=680, foreground="#333333").pack(
+                    anchor="w", pady=(4, 0)
+                )
                 check_vars.append((adv, var))
+
+        if alerts:
+            alert_section = ttk.LabelFrame(scrollable_frame, text="Avisos e dicas", padding=8)
+            alert_section.pack(fill="x", expand=True, pady=(0, 8), padx=4)
+            for adv in alerts:
+                adv_box = ttk.LabelFrame(alert_section, text=adv.title, padding=8)
+                adv_box.pack(fill="x", expand=True, pady=4, padx=4)
+                ttk.Label(
+                    adv_box,
+                    text=f"Aviso importante:\n{adv.why}",
+                    foreground="#B34700",
+                    wraplength=680,
+                ).pack(anchor="w")
 
         btn_box = ttk.Frame(frame)
         btn_box.pack(fill="x", pady=(12, 0))
-
-        alerts = [adv for adv in advices if adv.scope == "alert"]
 
         def proceed():
             approved = [adv for adv, var in check_vars if var.get()]
@@ -1159,6 +1239,7 @@ class MakerElegooApp(tk.Tk):
         ttk.Button(btn_box, text="Aplicar Selecionados e Converter", command=proceed).pack(side="left")
         ttk.Button(btn_box, text="Converter Sem Ajustes", command=skip).pack(side="left", padx=8)
         ttk.Button(btn_box, text="Cancelar", command=dialog.destroy).pack(side="right")
+        return dialog
 
     def _execute_conversion(self, plan: ConversionPlan, destination: str,
                             *, professor_advices: list[Advice] | tuple[Advice, ...] = ()):

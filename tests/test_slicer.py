@@ -85,3 +85,34 @@ class SlicerTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.estimated_seconds, 8288)
         self.assertEqual(result.filament_grams, 28.70)
+
+    def test_next_available_destination_and_existing_destination_handling(self):
+        from maker_elegoo.slicer import next_available_destination
+        from maker_elegoo.ui import _resolve_existing_destination
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "peca_ELEGOO.3mf"
+            self.assertEqual(next_available_destination(base), base)
+            base.write_bytes(b"existing")
+            cand2 = next_available_destination(base)
+            self.assertEqual(cand2, root / "peca_ELEGOO_2.3mf")
+            cand2.write_bytes(b"existing2")
+            cand3 = next_available_destination(base)
+            self.assertEqual(cand3, root / "peca_ELEGOO_3.3mf")
+
+            # Escolha False ("Não" -> usar sufixo sem apagar original)
+            resolved_suffix = _resolve_existing_destination(base, ask_action=lambda *_, **__: False)
+            self.assertEqual(resolved_suffix, root / "peca_ELEGOO_3.3mf")
+            self.assertTrue(base.exists())
+
+            # Escolha None ("Cancelar" -> aborta)
+            resolved_cancel = _resolve_existing_destination(base, ask_action=lambda *_, **__: None)
+            self.assertIsNone(resolved_cancel)
+            self.assertTrue(base.exists())
+
+            # Escolha True ("Sim" -> confirma sobrescrita removendo destino anterior)
+            resolved_overwrite = _resolve_existing_destination(base, ask_action=lambda *_, **__: True)
+            self.assertEqual(resolved_overwrite, base)
+            self.assertFalse(base.exists())
+

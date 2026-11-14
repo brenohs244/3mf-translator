@@ -183,3 +183,14 @@ class ProfessorTest(unittest.TestCase):
         )
         advices_var = advise_offline(proj_var, plan_pla, PrintGoal("decorativa", "equilibrio"))
         self.assertTrue(any(a.scope == "alert" and "detectada" in a.why.lower() for a in advices_var))
+
+    def test_abs_moveis_and_articulated_keychain_do_not_enable_brim_by_default(self):
+        for purpose in ("moveis", "chaveiro_articulado"):
+            with self.subTest(purpose=purpose):
+                advices = advise_offline(self.project_pla, self.plan_abs, PrintGoal(purpose, "equilibrio"))
+                brim_on = [a for a in advices if a.key in {"brim_type", "brim_width"} and a.default_on]
+                self.assertEqual(brim_on, [])
+                self.assertTrue(
+                    any(a.scope == "alert" and "brim" in a.title.lower() and "articula" in a.why.lower() for a in advices)
+                )
+

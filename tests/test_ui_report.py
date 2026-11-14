@@ -52,3 +52,44 @@ class UIReportTests(unittest.TestCase):
         self.assertIn("Resiste mais", report)
         self.assertIn("Câmara fechada", report)
         self.assertIn("1h 31min", report)
+
+    def test_conversion_report_warns_on_large_speed_increase_and_ignores_close_speeds(self):
+        plan_jump = ConversionPlan(
+            machine=Profile("ECC2 0.4", "machine", Path("m.json"), {}),
+            process=Profile("0.20mm Standard", "process", Path("p.json"), {}),
+            filaments=(Profile("Elegoo PLA @ECC2", "filament", Path("f.json"), {}),),
+            machine_settings={},
+            process_settings={"outer_wall_speed": "160", "inner_wall_speed": "200"},
+            filament_settings=({},),
+            transferred={},
+            unmapped={},
+            replaced={"outer_wall_speed": "60", "inner_wall_speed": "190"},
+            source_repairs={},
+            material_findings=(),
+        )
+        result = ConversionResult(
+            True, Path("out.3mf"), "ok",
+            ExportResult(True, Path("out.3mf"), "ok"),
+            ValidationResult(True, 1, "ok", (), 1200, 10.0),
+            None, None, {},
+        )
+        report_jump = format_conversion_report(result, plan_jump)
+        self.assertIn("Velocidade da parede externa: 60 → 160 mm/s", report_jump)
+        self.assertNotIn("Velocidade da parede interna: 190 → 200 mm/s", report_jump)
+
+        plan_close = ConversionPlan(
+            machine=plan_jump.machine,
+            process=plan_jump.process,
+            filaments=plan_jump.filaments,
+            machine_settings={},
+            process_settings={"outer_wall_speed": "160"},
+            filament_settings=({},),
+            transferred={},
+            unmapped={},
+            replaced={"outer_wall_speed": "150"},
+            source_repairs={},
+            material_findings=(),
+        )
+        report_close = format_conversion_report(result, plan_close)
+        self.assertNotIn("Velocidade da parede externa: 150 → 160 mm/s", report_close)
+

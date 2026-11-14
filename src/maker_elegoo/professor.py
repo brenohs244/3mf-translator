@@ -303,24 +303,34 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                         default_on=False
                     ))
 
-        # Brim para ABS
+        # Brim para ABS (exceto peças móveis/articuladas onde o brim funde as folgas)
+        is_articulated = goal.purpose in {"moveis", "chaveiro_articulado"}
         raw_brim = proc.get("brim_type")
-        if raw_brim != "outer_only":
+        if is_articulated:
             advices.append(Advice(
-                scope="process", slot=None, key="brim_type",
-                current=str(raw_brim or "auto_brim (padrão)"), proposed="outer_only",
-                title="Ativar Brim Externo (Borda)",
-                why="O ABS sofre forte contração térmica nos cantos. Uma borda externa garante ancoragem à mesa texturizada.",
-                default_on=True
+                scope="alert", slot=None, key="",
+                current="", proposed="",
+                title="Conflito: Brim no ABS vs. Articulações",
+                why="O ABS pede Brim contra empenamento, mas a borda (brim) funde folgas e articulações print-in-place na 1ª camada. O Brim externo não foi ativado por padrão: mantenha a câmara aquecida e a mesa limpa, ou use abas apenas em cantos externos no Slicer.",
+                default_on=False,
             ))
-        if "brim_width" in proc and _as_float(proc.get("brim_width", "5"), 5.0) < 5.0:
-            advices.append(Advice(
-                scope="process", slot=None, key="brim_width",
-                current=str(proc.get("brim_width")), proposed="5",
-                title="Aumentar Largura do Brim para 5 mm",
-                why="Borda de pelo menos 5 mm ajuda a segurar cantos de peças em ABS/ASA contra empenamento.",
-                default_on=True
-            ))
+        else:
+            if raw_brim != "outer_only":
+                advices.append(Advice(
+                    scope="process", slot=None, key="brim_type",
+                    current=str(raw_brim or "auto_brim (padrão)"), proposed="outer_only",
+                    title="Ativar Brim Externo (Borda)",
+                    why="O ABS sofre forte contração térmica nos cantos. Uma borda externa garante ancoragem à mesa texturizada.",
+                    default_on=True
+                ))
+            if "brim_width" in proc and _as_float(proc.get("brim_width", "5"), 5.0) < 5.0:
+                advices.append(Advice(
+                    scope="process", slot=None, key="brim_width",
+                    current=str(proc.get("brim_width")), proposed="5",
+                    title="Aumentar Largura do Brim para 5 mm",
+                    why="Borda de pelo menos 5 mm ajuda a segurar cantos de peças em ABS/ASA contra empenamento.",
+                    default_on=True
+                ))
 
         # Moderação de velocidades para solda intercamadas em ABS/ASA
         _propose_speed_cap(
@@ -954,3 +964,64 @@ def apply_advice(plan: ConversionPlan, approved: list[Advice]) -> ConversionPlan
         filament_settings=tuple(new_filaments),
         forced_process_keys=tuple(forced_keys),
     )
+
+
+def build_print_summary(
+    project: ProjectInfo,
+    plan: ConversionPlan,
+    goal: PrintGoal,
+    advices: list[Advice] | tuple[Advice, ...] = (),
+) -> str:
+    """Monta o quadro-resumo objetivo (Task 14) para exibição no diálogo do Professor."""
+    from .labels import priority_label, purpose_label
+
+    preview_plan = apply_advice(plan, [adv for adv in advices if adv.default_on])
+    proc = preview_plan.process_settings
+
+    used_slots = {
+        str(s) for s in (getattr(project, "used_filament_slots", ()) or ())
+        if s and str(s) != "0"
+    }
+    src_mats = [
+        f.material for f in project.filaments
+        if not used_slots or str(f.slot) in used_slots
+    ] or [f.material for f in project.filaments] or ["Desconhecido"]
+    dst_mats = [
+        _as_str(cfg.get("filament_type", "Desconhecido"))
+        for idx, cfg in enumerate(preview_plan.filament_settings, 1)
+        if not used_slots or str(idx) in used_slots
+    ] or [_as_str(cfg.get("filament_type", "Desconhecido")) for cfg in preview_plan.filament_settings] or ["Desconhecido"]
+
+    src_summary = "/".join(dict.fromkeys(src_mats))
+    dst_summary = "/".join(dict.fromkeys(dst_mats))
+    is_abs_asa = any(m.upper() in {"ABS", "ASA"} for m in dst_mats)
+
+    if is_abs_asa:
+        fans = [
+            f"{_as_int(cfg.get('fan_max_speed', '35'), 35)}%"
+            for idx, cfg in enumerate(preview_plan.filament_settings, 1)
+            if (not used_slots or str(idx) in used_slots)
+            and _as_str(cfg.get("filament_type", "")).upper() in {"ABS", "ASA"}
+        ]
+        fan_txt = "/".join(dict.fromkeys(fans)) if fans else "25%–35%"
+        cooling_line = (
+            f"Ventilação reduzida ({fan_txt}) e ventoinha lateral desligada para garantir "
+            "boa solda térmica entre camadas com câmara fechada."
+        )
+    else:
+        cooling_line = "Resfriamento padrão do perfil ELEGOO preservado para boa definição de pontes e saliências."
+
+    walls = _as_str(proc.get("wall_loops", "2"))
+    top_layers = _as_str(proc.get("top_shell_layers", "3"))
+    infill = _as_str(proc.get("sparse_infill_density", "15%"))
+    pattern = _as_str(proc.get("sparse_infill_pattern", "grid"))
+    layer_h = _as_str(proc.get("layer_height", "0.2"))
+
+    lines = [
+        f"• Material: {src_summary} → {dst_summary}",
+        f"• Uso e prioridade: {purpose_label(goal.purpose)} · {priority_label(goal.priority)}",
+        f"• Ventilação e solda entre camadas: {cooling_line}",
+        f"• Reforço e estrutura: {walls} paredes · topo {top_layers} camadas · preenchimento {infill} ({pattern}) · camada {layer_h} mm",
+        "• O que conferir no ELEGOO Slicer: posição/apoio na mesa, suportes ou pintura de cores, costura e prévia da 1ª camada.",
+    ]
+    return "\n".join(lines)
