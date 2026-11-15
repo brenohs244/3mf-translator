@@ -18,18 +18,18 @@
 
 ## Task 1: Evidence and Codex adapter
 
-- [ ] Test an allowlisted payload and rejection of identifiers and geometry.
-- [ ] Implement evidence builder and subprocess adapter with ephemeral, read-only, isolated Codex execution and strict JSON parsing.
-- [ ] Test missing CLI, timeout, cancellation and malformed output.
+- [x] Test an allowlisted payload and rejection of identifiers and geometry.
+- [x] Implement evidence builder and subprocess adapter with ephemeral, read-only, isolated Codex execution and strict JSON parsing.
+- [x] Test missing CLI, timeout, cancellation and malformed output.
 
 ## Task 2: Recommendation gates
 
-- [ ] Test that only known, sliced orientation IDs and safe support keys can be proposed.
-- [ ] Implement local comparison and re-slice proposed support settings before marking verified.
-- [ ] Keep unverified ideas descriptive and non-applicable.
+- [x] Test that only known, sliced orientation IDs and safe support keys can be proposed.
+- [x] Implement local comparison and re-slice proposed support settings before marking verified.
+- [x] Keep unverified ideas descriptive and non-applicable.
 
 ## Task 3: UI and release
 
-- [ ] Test consent denial causes no Codex invocation and front/profile changes invalidate prior analysis.
-- [ ] Add provider selection, visible payload review, progress and approved-application flow.
+- [x] Test consent denial causes no Codex invocation and front/profile changes invalidate prior analysis.
+- [x] Add provider selection, visible payload review, progress and approved-application flow.
 - [ ] Run full suite, real ELEGOO Slicer validation, Graphify, Understand Anything, code review, Windows build, EXE smoke and ZIP integrity.

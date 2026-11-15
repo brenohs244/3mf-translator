@@ -30,22 +30,22 @@
 
 **Files:** `src/maker_elegoo/profiles.py`, `tests/test_profiles.py`.
 
-- [ ] Escrever testes de descoberta, herança, bico e compatibilidade e confirmar falha.
-- [ ] Implementar descoberta dos diretórios locais e filtros por dados resolvidos.
-- [ ] Rodar testes de perfil até passar.
+- [x] Escrever testes de descoberta, herança, bico e compatibilidade e confirmar falha.
+- [x] Implementar descoberta dos diretórios locais e filtros por dados resolvidos.
+- [x] Rodar testes de perfil até passar.
 
 ### Task 2: Seleção de máquina na interface e conversão
 
 **Files:** `src/maker_elegoo/ui.py`, `src/maker_elegoo/mapping.py`, `tests/test_mapping.py`.
 
-- [ ] Escrever teste que aceite máquina personalizada com processo compatível com a máquina ancestral e confirmar falha.
-- [ ] Exibir máquinas e bicos locais; usar a máquina selecionada ao converter.
-- [ ] Rodar suíte completa.
+- [x] Escrever teste que aceite máquina personalizada com processo compatível com a máquina ancestral e confirmar falha.
+- [x] Exibir máquinas e bicos locais; usar a máquina selecionada ao converter.
+- [x] Rodar suíte completa.
 
 ### Task 3: Distribuição
 
 **Files:** `docs/DEVELOPMENT.md`, `scripts/README-DISTRIBUTION.txt`.
 
-- [ ] Documentar descoberta local e ausência de perfis embutidos.
+- [x] Documentar descoberta local e ausência de perfis embutidos.
 - [ ] Atualizar Graphify e Understand Anything conforme instruções do projeto.
-- [ ] Recompilar, verificar ZIP e executar smoke test do executável.
+- [x] Recompilar, verificar ZIP e executar smoke test do executável.

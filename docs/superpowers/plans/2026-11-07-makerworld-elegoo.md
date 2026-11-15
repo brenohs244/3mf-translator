@@ -36,11 +36,11 @@
 
 **Interfaces:** `python -m maker_elegoo` abre a interface; `python -m unittest discover -s tests` roda testes.
 
-- [ ] Criar teste de importação e chamada da função `main()` injetando um launcher falso.
-- [ ] Rodar teste e confirmar falha inicial.
-- [ ] Inicializar Git, criar estrutura `src`, configuração de pacote, ignores de artefatos, README e AGENTS.md com fluxo Superpowers/Graphify/Understand Anything.
-- [ ] Implementar entrada mínima e rodar teste até passar.
-- [ ] Commit: `chore: initialize maker elegoo project`.
+- [x] Criar teste de importação e chamada da função `main()` injetando um launcher falso.
+- [x] Rodar teste e confirmar falha inicial.
+- [x] Inicializar Git, criar estrutura `src`, configuração de pacote, ignores de artefatos, README e AGENTS.md com fluxo Superpowers/Graphify/Understand Anything.
+- [x] Implementar entrada mínima e rodar teste até passar.
+- [x] Commit: `chore: initialize maker elegoo project`.
 
 ### Task 2: Leitura segura de 3MF
 
@@ -48,11 +48,11 @@
 
 **Interfaces:** `inspect_project(path: Path) -> ProjectInfo`; `ProjectInfo` contém `source_settings`, `filaments`, `plates`, `objects`, `archive_entries` e `warnings`.
 
-- [ ] Escrever testes com 3MF mínimo, ZIP inválido, caminho perigoso, entrada duplicada, arrays de dois filamentos e três placas.
-- [ ] Confirmar falhas iniciais.
-- [ ] Implementar validação ZIP, leitura JSON/XML, inspeção de filamentos, placas e objetos; limitar recursos descompactados.
-- [ ] Rodar testes e inspecionar os três exemplos reais, registrando contagens sem modificar os arquivos.
-- [ ] Commit: `feat: inspect 3mf projects safely`.
+- [x] Escrever testes com 3MF mínimo, ZIP inválido, caminho perigoso, entrada duplicada, arrays de dois filamentos e três placas.
+- [x] Confirmar falhas iniciais.
+- [x] Implementar validação ZIP, leitura JSON/XML, inspeção de filamentos, placas e objetos; limitar recursos descompactados.
+- [x] Rodar testes e inspecionar os três exemplos reais, registrando contagens sem modificar os arquivos.
+- [x] Commit: `feat: inspect 3mf projects safely`.
 
 ### Task 3: Descoberta e resolução de perfis ELEGOO
 
@@ -60,11 +60,11 @@
 
 **Interfaces:** `discover_slicer() -> SlicerInstall`; `list_profiles(install, kind, nozzle) -> list[Profile]`; `resolve_profile(profile, install) -> dict`.
 
-- [ ] Testar detecção de instalação fictícia, seleção por bico, perfil do usuário, herança, pai ausente e ciclo.
-- [ ] Confirmar falhas iniciais.
-- [ ] Implementar leitura dos diretórios de perfil do app e `%APPDATA%`, herança sem executar código, tipos de perfil e compatibilidade com Centauri Carbon 2.
-- [ ] Rodar testes e conferir perfis reais deste PC para 0,2, 0,4 e 0,8 mm.
-- [ ] Commit: `feat: discover elegoo profiles`.
+- [x] Testar detecção de instalação fictícia, seleção por bico, perfil do usuário, herança, pai ausente e ciclo.
+- [x] Confirmar falhas iniciais.
+- [x] Implementar leitura dos diretórios de perfil do app e `%APPDATA%`, herança sem executar código, tipos de perfil e compatibilidade com Centauri Carbon 2.
+- [x] Rodar testes e conferir perfis reais deste PC para 0,2, 0,4 e 0,8 mm.
+- [x] Commit: `feat: discover elegoo profiles`.
 
 ### Task 4: Mapeamento e análise de material
 
@@ -72,11 +72,11 @@
 
 **Interfaces:** `build_conversion(source: ProjectInfo, machine: Profile, process: Profile, filaments: list[Profile]) -> ConversionPlan`; `analyze_material_change(source: ProjectInfo, target_filaments: list[Profile]) -> list[Finding]`.
 
-- [ ] Testar associação posicional de filamentos, chaves compartilhadas, prioridade de limites ELEGOO e diferenças PLA/PETG/ABS em temperatura, mesa, ventoinha e vazão.
-- [ ] Confirmar falhas iniciais.
-- [ ] Implementar lista explícita de parâmetros de processo transferíveis, relatório de chaves sem mapeamento e análise material sem prometer desempenho mecânico.
-- [ ] Rodar testes e gerar relatório de prévia para os exemplos reais.
-- [ ] Commit: `feat: plan profile and material conversion`.
+- [x] Testar associação posicional de filamentos, chaves compartilhadas, prioridade de limites ELEGOO e diferenças PLA/PETG/ABS em temperatura, mesa, ventoinha e vazão.
+- [x] Confirmar falhas iniciais.
+- [x] Implementar lista explícita de parâmetros de processo transferíveis, relatório de chaves sem mapeamento e análise material sem prometer desempenho mecânico.
+- [x] Rodar testes e gerar relatório de prévia para os exemplos reais.
+- [x] Commit: `feat: plan profile and material conversion`.
 
 ### Task 5: Exportação e validação pelo ELEGOO Slicer
 
@@ -84,12 +84,12 @@
 
 **Interfaces:** `SlicerCLI.export(source, plan, destination) -> ExportResult`; `SlicerCLI.validate(destination, plate_count) -> ValidationResult`; `convert_project(...) -> ConversionResult`.
 
-- [ ] Testar composição de argumentos sem shell, arquivo de saída ausente, timeout, código de erro, múltiplas placas e comparação estrutural da geometria.
-- [ ] Confirmar falhas iniciais.
-- [ ] Verificar a CLI real (`--load-settings`, `--load-filaments`, `--export-3mf`, `--slice`) com cópias temporárias dos 3MF; definir os argumentos exatos pelo resultado observado.
-- [ ] Implementar presets resolvidos em arquivos temporários, exportação para novo nome, fatiamento de todas as placas, coleta de avisos e relatório de fidelidade.
+- [x] Testar composição de argumentos sem shell, arquivo de saída ausente, timeout, código de erro, múltiplas placas e comparação estrutural da geometria.
+- [x] Confirmar falhas iniciais.
+- [x] Verificar a CLI real (`--load-settings`, `--load-filaments`, `--export-3mf`, `--slice`) com cópias temporárias dos 3MF; definir os argumentos exatos pelo resultado observado.
+- [x] Implementar presets resolvidos em arquivos temporários, exportação para novo nome, fatiamento de todas as placas, coleta de avisos e relatório de fidelidade.
 - [ ] Rodar testes, executar conversão de ao menos um projeto Bambu real e abrir o resultado no ELEGOO Slicer. Se a CLI desta versão não suportar o fluxo, registrar evidência e revisar o adaptador sem declarar sucesso indevido.
-- [ ] Commit: `feat: export and validate converted projects`.
+- [x] Commit: `feat: export and validate converted projects`.
 
 ### Task 6: Interface desktop e configuração local
 
@@ -97,11 +97,11 @@
 
 **Interfaces:** `launch_app()`; UI escolhe 3MF, bico, processo e perfil por filamento, mostra prévia, validação e botão para abrir no ELEGOO Slicer.
 
-- [ ] Testar persistência de preferências locais e caminhos não encontrados.
-- [ ] Confirmar falhas iniciais.
-- [ ] Implementar Tkinter com tarefas longas em thread, atualização segura da UI e erros legíveis; não armazenar API key em texto simples nas preferências.
+- [x] Testar persistência de preferências locais e caminhos não encontrados.
+- [x] Confirmar falhas iniciais.
+- [x] Implementar Tkinter com tarefas longas em thread, atualização segura da UI e erros legíveis; não armazenar API key em texto simples nas preferências.
 - [ ] Rodar testes e fazer uma inspeção manual da janela em resolução comum.
-- [ ] Commit: `feat: add desktop conversion workflow`.
+- [x] Commit: `feat: add desktop conversion workflow`.
 
 ### Task 7: Análise opcional com Gemini
 
@@ -109,11 +109,11 @@
 
 **Interfaces:** `suggest_equivalences(unmapped, elegoo_keys, context, api_key) -> list[Suggestion]`; `validate_suggestion(suggestion, schema) -> bool`.
 
-- [ ] Testar corpo de requisição sem geometria, resposta JSON válida, chaves inexistentes, valores fora de faixa, G-code livre e erro de cota/rede.
-- [ ] Confirmar falhas iniciais.
-- [ ] Implementar cliente HTTPS Gemini por `urllib` com modelo configurável e saída JSON estrita; UI mostra sugestões e exige escolha explícita antes da exportação.
-- [ ] Rodar testes com servidor falso; chamada real apenas se usuário fornecer chave.
-- [ ] Commit: `feat: add optional ai mapping review`.
+- [x] Testar corpo de requisição sem geometria, resposta JSON válida, chaves inexistentes, valores fora de faixa, G-code livre e erro de cota/rede.
+- [x] Confirmar falhas iniciais.
+- [x] Implementar cliente HTTPS Gemini por `urllib` com modelo configurável e saída JSON estrita; UI mostra sugestões e exige escolha explícita antes da exportação.
+- [x] Rodar testes com servidor falso; chamada real apenas se usuário fornecer chave.
+- [x] Commit: `feat: add optional ai mapping review`.
 
 ### Task 8: Distribuição e grafos de manutenção
 
@@ -121,11 +121,11 @@
 
 **Interfaces:** `scripts/build.ps1` produz executável Windows; Graphify e Understand Anything documentados e executados no código implementado.
 
-- [ ] Criar script de build reproduzível com PyInstaller e testar o executável fora do diretório fonte.
-- [ ] Instalar Graphify Local com pacote oficial `graphifyy` no escopo do projeto, gerar grafo e registrar comando de atualização.
-- [ ] Executar Understand Anything no repositório, gerar grafo de arquitetura e registrar como atualizar e visualizar.
-- [ ] Rodar suíte, compilação/importação e conversão real novamente; documentar limites observados e instruções de instalação em outro Windows.
-- [ ] Commit: `build: package app and document development graphs`.
+- [x] Criar script de build reproduzível com PyInstaller e testar o executável fora do diretório fonte.
+- [x] Instalar Graphify Local com pacote oficial `graphifyy` no escopo do projeto, gerar grafo e registrar comando de atualização.
+- [x] Executar Understand Anything no repositório, gerar grafo de arquitetura e registrar como atualizar e visualizar.
+- [x] Rodar suíte, compilação/importação e conversão real novamente; documentar limites observados e instruções de instalação em outro Windows.
+- [x] Commit: `build: package app and document development graphs`.
 
 ---
 

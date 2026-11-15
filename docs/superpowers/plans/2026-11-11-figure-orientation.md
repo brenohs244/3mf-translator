@@ -33,10 +33,10 @@
 
 **Interfaces:** `load_scene(path: Path) -> Scene`; `render_front_views(scene: Scene, size: int = 220) -> dict[str, bytes]` gera PPM para `+X`, `-X`, `+Y`, `-Y`.
 
-- [ ] Escrever testes com 3MF sintético de uma instância, transformação existente, figura vazia e arquivo com duas instâncias; confirmar falha inicial.
-- [ ] Implementar leitura por streaming, limites de vértices/triângulos e extração de transformação. Recusar casos fora do escopo com `OrientationError`.
-- [ ] Implementar quatro vistas locais de profundidade sem dependência externa; testar dimensões e diferença entre frente e costas de uma malha assimétrica.
-- [ ] Rodar `python -m unittest tests.test_orientation -v` até passar.
+- [x] Escrever testes com 3MF sintético de uma instância, transformação existente, figura vazia e arquivo com duas instâncias; confirmar falha inicial.
+- [x] Implementar leitura por streaming, limites de vértices/triângulos e extração de transformação. Recusar casos fora do escopo com `OrientationError`.
+- [x] Implementar quatro vistas locais de profundidade sem dependência externa; testar dimensões e diferença entre frente e costas de uma malha assimétrica.
+- [x] Rodar `python -m unittest tests.test_orientation -v` até passar.
 
 ### Task 2: Pontuar e criar candidatas
 
@@ -44,10 +44,10 @@
 
 **Interfaces:** `rank_orientations(scene: Scene, front: str, printable_area: list[str], printable_height: float) -> list[Candidate]`; `write_oriented_copy(source: Path, candidate: Candidate, destination: Path) -> Path`.
 
-- [ ] Testar seis eixos principais, inclinações pequenas, área de apoio, altura/encaixe, risco frontal e regra de manter a posição atual quando não há ganho suficiente; confirmar falha.
-- [ ] Implementar pontuação geométrica determinística, rejeição de candidatos sem apoio/fora da mesa, e relatório de medidas com rótulo de estimativa.
-- [ ] Testar transformação 3MF em cópia, arquivo original intacto e malha igual, incluindo rotação prévia e XML com ordem de atributos diferente; confirmar falha e implementar escrita segura.
-- [ ] Rodar testes de orientação e suíte completa.
+- [x] Testar seis eixos principais, inclinações pequenas, área de apoio, altura/encaixe, risco frontal e regra de manter a posição atual quando não há ganho suficiente; confirmar falha.
+- [x] Implementar pontuação geométrica determinística, rejeição de candidatos sem apoio/fora da mesa, e relatório de medidas com rótulo de estimativa.
+- [x] Testar transformação 3MF em cópia, arquivo original intacto e malha igual, incluindo rotação prévia e XML com ordem de atributos diferente; confirmar falha e implementar escrita segura.
+- [x] Rodar testes de orientação e suíte completa.
 
 ### Task 3: Medir com o fatiador e recomendar
 
@@ -55,9 +55,9 @@
 
 **Interfaces:** `evaluate_orientations(project: ProjectInfo, plan: ConversionPlan, front: str, slicer: SlicerCLI, *, progress: Callable | None = None, cancelled: Callable | None = None) -> OrientationAnalysis`.
 
-- [ ] Testar que posição atual e melhores candidatas são exportadas/fatiadas, falhas não são recomendadas, nenhuma candidata boa preserva a atual, cancelamento apaga temporários; confirmar falha.
-- [ ] Implementar avaliação em diretórios temporários, comparação estrutural e coleta de tempo/material só quando o G-code tiver campos identificáveis; registrar métricas ausentes.
-- [ ] Rodar testes do serviço e suíte completa.
+- [x] Testar que posição atual e melhores candidatas são exportadas/fatiadas, falhas não são recomendadas, nenhuma candidata boa preserva a atual, cancelamento apaga temporários; confirmar falha.
+- [x] Implementar avaliação em diretórios temporários, comparação estrutural e coleta de tempo/material só quando o G-code tiver campos identificáveis; registrar métricas ausentes.
+- [x] Rodar testes do serviço e suíte completa.
 
 ### Task 4: Fluxo Tkinter e confirmação
 
@@ -65,8 +65,8 @@
 
 **Interfaces:** diálogo **Analisar orientação de figura** abre quatro vistas, escolhe a frente e mostra recomendação; **Aplicar em cópia** pede novo caminho, executa a conversão/validação e permite abrir resultado no ELEGOO Slicer.
 
-- [ ] Testar com cena e fatiador falsos que nenhuma escrita de destino ocorre antes da confirmação e que cancelamento mantém o projeto intacto; confirmar falha.
-- [ ] Implementar trabalho pesado fora da thread Tkinter, progresso, cancelamento e erros legíveis.
+- [x] Testar com cena e fatiador falsos que nenhuma escrita de destino ocorre antes da confirmação e que cancelamento mantém o projeto intacto; confirmar falha.
+- [x] Implementar trabalho pesado fora da thread Tkinter, progresso, cancelamento e erros legíveis.
 - [ ] Rodar suíte, smoke da UI e revisar layout em 980x760.
 
 ### Task 5: Exemplo real e distribuição

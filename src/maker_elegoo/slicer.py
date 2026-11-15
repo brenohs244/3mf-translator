@@ -65,11 +65,18 @@ def _gcode_metrics(path: Path) -> tuple[int | None, float | None]:
 def _details(result: subprocess.CompletedProcess, folder: Path) -> str:
     output = "\n".join(part.strip() for part in (result.stderr, result.stdout) if part and part.strip())
     if output:
-        return output[-2000:]
-    logs = sorted(folder.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
-    if logs:
-        return logs[0].read_text(encoding="utf-8", errors="replace")[-2000:].strip()
-    return f"ELEGOO Slicer terminou com código {result.returncode}"
+        tech = output[-2000:]
+    else:
+        logs = sorted(folder.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True)
+        if logs:
+            tech = logs[0].read_text(encoding="utf-8", errors="replace")[-2000:].strip()
+        else:
+            tech = f"ELEGOO Slicer terminou com código {result.returncode}"
+    return (
+        f"O ELEGOO Slicer retornou erro ao processar o projeto (código {result.returncode}). "
+        "Causas comuns: perfil de impressora/filamento ausente, parâmetro incompatível ou falha de leitura do 3MF.\n\n"
+        f"Detalhes técnicos:\n{tech}"
+    )
 
 
 def next_available_destination(path: Path) -> Path:

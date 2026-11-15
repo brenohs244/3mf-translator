@@ -78,7 +78,21 @@ SAFE_FILAMENT_KEYS = {
     "overhang_fan_speed",
     "additional_cooling_fan_speed",
     "during_print_exhaust_fan_speed",
+    "close_fan_the_first_x_layers",
+    "slow_down_layer_time",
+    "fan_cooling_layer_time",
     "filament_shrink",
+}
+
+FILAMENT_INT_BOUNDS: dict[str, tuple[int, int]] = {
+    "fan_max_speed": (0, 100),
+    "fan_min_speed": (0, 100),
+    "overhang_fan_speed": (0, 100),
+    "additional_cooling_fan_speed": (0, 100),
+    "during_print_exhaust_fan_speed": (0, 100),
+    "close_fan_the_first_x_layers": (0, 10),
+    "slow_down_layer_time": (0, 30),
+    "fan_cooling_layer_time": (0, 60),
 }
 
 SAFE_MACHINE_KEYS = {
@@ -165,7 +179,10 @@ def _base_polymer(material: str) -> str:
     upper = (material or "").strip().upper()
     if not upper:
         return "DESCONHECIDO"
-    for polymer in ("PETG", "PLA", "ASA", "ABS", "TPU", "PA", "PC"):
+    if "NYLON" in upper:
+        return "PA"
+    # Verifica PC antes de ABS para que PC-ABS seja classificado na família PC (alta temp/umidade)
+    for polymer in ("PETG", "PLA", "PC", "PA", "TPU", "ASA", "ABS"):
         if re.search(rf"(?<![A-Z]){polymer}(?![A-Z])", upper):
             return polymer
     return upper.split()[0]
@@ -344,16 +361,22 @@ def validate_change(scope: str, key: str, value: str, plan: ConversionPlan, slot
                 return math.isfinite(pct) and 96.0 <= pct <= 102.0
             except ValueError:
                 return False
-        if key not in cfg:
+        if key not in cfg or key not in FILAMENT_INT_BOUNDS:
             return False
         try:
             val_int = int(value)
-            orig_int = int(_as_str(cfg.get(key, "100")))
+            lo, hi = FILAMENT_INT_BOUNDS[key]
+            if not (lo <= val_int <= hi):
+                return False
             if key == "fan_max_speed" and "fan_min_speed" in cfg:
                 min_fan = _as_int(cfg.get("fan_min_speed", "0"), 0)
                 if val_int < min_fan:
                     return False
-            return 0 <= val_int <= orig_int
+            if key == "fan_min_speed" and "fan_max_speed" in cfg:
+                max_fan = _as_int(cfg.get("fan_max_speed", "100"), 100)
+                if val_int > max_fan:
+                    return False
+            return True
         except ValueError:
             return False
 
@@ -641,6 +664,213 @@ def _build_easy_support_advices(
         )
 
 
+def _append_outdoor_polymer_alerts(
+    advices: list[Advice],
+    used_target_cfgs: list[tuple[int, dict[str, Any]]],
+    conf: str,
+    *,
+    outdoor_purpose: bool,
+) -> None:
+    """Emite alertas térmicos/UV para PLA e ABS expostos a sol ou ambiente externo."""
+    seen_pla = False
+    seen_abs = False
+    for _, cfg in used_target_cfgs:
+        poly = _base_polymer(_as_str(cfg.get("filament_type", "")))
+        if poly == "PLA" and not seen_pla:
+            seen_pla = True
+            advices.append(Advice(
+                scope="alert", slot=None, key="", current="", proposed="",
+                title="Alerta: Resistência Térmica e UV (PLA)" if outdoor_purpose else "Calor/Sol Informado com Filamento PLA",
+                why=(
+                    "O PLA tende a amolecer por volta de 45–50 °C sob sol direto ou dentro de veículos. Para uso externo, avalie PETG ou ASA."
+                    if outdoor_purpose else
+                    "PLA tende a deformar acima de ~45–50 °C (interior de carro ou sol direto). Considere PETG ou ASA."
+                ),
+                expected_effect="Prevenir deformação térmica em campo." if outdoor_purpose else "Evitar amolecimento rápido em uso real.",
+                what_to_check="Substitua o filamento físico por PETG/ASA se houver exposição ao sol.",
+                evidence_class="depende_teste_fisico",
+                requires_physical_test=True,
+                confidence=conf,
+                default_on=False,
+            ))
+        elif poly == "ABS" and not seen_abs:
+            seen_abs = True
+            advices.append(Advice(
+                scope="alert", slot=None, key="", current="", proposed="",
+                title="Alerta: ABS Exposto a Sol/UV (Prefira ASA)",
+                why=(
+                    "Embora suporte calor melhor que o PLA, o ABS sofre degradação por radiação UV (amarelamento, ressecamento "
+                    "e microfissuras) ao sol. Para uso externo/UV contínuo, prefira ASA."
+                ),
+                expected_effect="Evitar perda prematura de acabamento e tenacidade sob radiação UV.",
+                what_to_check="Se a peça ficar sob sol direto frequente, considere trocar o carretel para ASA.",
+                evidence_class="depende_teste_fisico",
+                requires_physical_test=True,
+                confidence=conf,
+                default_on=False,
+            ))
+
+
+def _append_polymer_family_guidance(
+    advices: list[Advice],
+    plan: ConversionPlan,
+    goal: PrintGoal,
+    used_target_cfgs: list[tuple[int, dict[str, Any]]],
+    *,
+    is_articulated: bool,
+    conf: str,
+) -> None:
+    """Cobertura por família de polímero (PETG, TPU, PA/PC, compostos -CF/-GF) e mistura multi-slot."""
+    used_polys: list[str] = []
+    has_composite = False
+    for _, cfg in used_target_cfgs:
+        raw_mat = _as_str(cfg.get("filament_type", ""))
+        if _is_composite_material(raw_mat):
+            has_composite = True
+        poly = _base_polymer(raw_mat)
+        if poly and poly != "DESCONHECIDO" and poly not in used_polys:
+            used_polys.append(poly)
+
+    if has_composite:
+        advices.append(Advice(
+            scope="alert", slot=None, key="", current="", proposed="",
+            title="Filamento Composto (-CF/-GF): Exige Bico Endurecido",
+            why=(
+                "Fibras de carbono (-CF) ou vidro (-GF) desgastam rapidamente bicos de latão comuns, alterando diâmetro e fluxo. "
+                "Também costumam reduzir a aderência entre camadas em Z frente ao polímero puro."
+            ),
+            expected_effect="Evitar desgaste prematuro do bico e variação dimensional ao longo da impressão.",
+            what_to_check="Confirme uso de bico de aço endurecido na ECC2 antes de imprimir e teste esforços em Z.",
+            evidence_class="depende_teste_fisico",
+            requires_physical_test=True,
+            confidence=conf,
+            default_on=False,
+        ))
+
+    def _family(p: str) -> str:
+        return "ABS_ASA" if p in {"ABS", "ASA"} else p
+
+    families = list(dict.fromkeys(_family(p) for p in used_polys))
+    if len(families) >= 2:
+        advices.append(Advice(
+            scope="alert", slot=None, key="", current="", proposed="",
+            title="Polímeros Incompatíveis nos Slots Usados",
+            why=(
+                f"O projeto combina {', '.join(used_polys)} na mesma placa/impressão. Polímeros de famílias diferentes exigem "
+                "temperaturas de mesa/câmara conflitantes e não fundem bem entre si estruturalmente."
+            ),
+            expected_effect="Evitar descolamento da placa e falha de união entre cores/materiais distintos.",
+            what_to_check="Confirme se a mistura é intencional (ex.: interface de suporte separável) ou padronize todos os slots usados.",
+            evidence_class="verificado_3mf",
+            requires_physical_test=True,
+            confidence="alta",
+            default_on=False,
+        ))
+
+    if "PETG" in used_polys:
+        advices.append(Advice(
+            scope="alert", slot=None, key="", current="", proposed="",
+            title="PETG: Controle de Umidade, Stringing e Liberação da PEI",
+            why=(
+                "PETG absorve umidade rapidamente (causando fiapos/bolhas) e pode aderir com força excessiva na placa PEI texturizada "
+                "se puxado ainda quente."
+            ),
+            expected_effect="Reduzir stringing e evitar danos no revestimento da mesa.",
+            what_to_check="Seque o carretel se houver estalos/fiapos e aguarde a mesa esfriar (< 40 °C) antes de destacar a peça.",
+            evidence_class="depende_teste_fisico",
+            requires_physical_test=True,
+            confidence=conf,
+            default_on=False,
+        ))
+
+    if "TPU" in used_polys:
+        _propose_speed_cap(
+            plan, "outer_wall_speed", 80.0,
+            "Limitar Velocidade Externa para TPU Flexível (80 mm/s)",
+            "Velocidades altas de PLA em filamento flexível elevam pressão no hotend e podem causar dobra/engasgo na extrusora.",
+            advices,
+            expected_effect="Fluxo mais estável em parede externa (aumenta tempo estimado no fatiador).",
+            what_to_check="Acompanhe as primeiras camadas observando se há subextrusão ou falhas de tração.",
+            confidence=conf,
+        )
+        advices.append(Advice(
+            scope="alert", slot=None, key="", current="", proposed="",
+            title="TPU Flexível: Velocidade, Retração e Umidade",
+            why=(
+                "TPU exige extrusão suave sem retrações longas/rápidas e absorve umidade com facilidade. "
+                "Na PEI texturizada, pode grudar fortemente se não houver agente separador (cola em bastão)."
+            ),
+            expected_effect="Prevenir enrosco na extrusora, fiapos excessivos e rasgo na remoção da mesa.",
+            what_to_check="Mantenha filamento seco, avalie camada fina de cola na PEI e evite retração agressiva.",
+            evidence_class="depende_teste_fisico",
+            requires_physical_test=True,
+            confidence=conf,
+            default_on=False,
+        ))
+
+    if "PA" in used_polys or "PC" in used_polys:
+        poly_label = "/".join(p for p in ("PA", "PC") if p in used_polys)
+        advices.append(Advice(
+            scope="alert", slot=None, key="", current="", proposed="",
+            title=f"{poly_label}: Secagem Obrigatória e Alto Empenamento em Câmara Passiva",
+            why=(
+                f"Filamentos {poly_label} (incluindo blend PC-ABS) são altamente higroscópicos (exigem secagem prévia 70–80 °C) "
+                "e apresentam contração severa na câmara passiva (support_chamber_temp_control = 0)."
+            ),
+            expected_effect="Reduzir bolhas de vapor, delaminação e descolamento violento dos cantos.",
+            what_to_check="Pré-aqueça a câmara passiva fechada, aplique adesivo adequado na PEI e valide em peça pequena.",
+            evidence_class="depende_teste_fisico",
+            requires_physical_test=True,
+            confidence=conf,
+            default_on=False,
+        ))
+        if not is_articulated and plan.process_settings.get("brim_type") != "outer_only":
+            _add_if_valid(
+                advices,
+                Advice(
+                    scope="process", slot=None, key="brim_type",
+                    current=str(plan.process_settings.get("brim_type") or "auto_brim (padrão)"),
+                    proposed="outer_only",
+                    title=f"Ativar Brim Externo para {poly_label}",
+                    why=f"Ajuda a segurar os cantos sob forte tensão térmica do {poly_label} em câmara passiva.",
+                    expected_effect="Aumenta ancoragem periférica na 1ª camada.",
+                    what_to_check="Confira na prévia se o brim não fecha furos críticos.",
+                    evidence_class="estimado_regra_ia",
+                    requires_physical_test=False,
+                    confidence=conf,
+                    default_on=True,
+                ),
+                plan,
+            )
+
+
+def _maybe_propose_elephant_foot(
+    advices: list[Advice],
+    proc: dict[str, Any],
+    plan: ConversionPlan,
+    conf: str,
+    *,
+    why: str = "Recua levemente o contorno da 1ª camada para reduzir chance de junta colada na mesa.",
+) -> None:
+    if "elefant_foot_compensation" in proc and _as_float(proc.get("elefant_foot_compensation", "0.1"), 0.1) < 0.15:
+        _add_if_valid(
+            advices,
+            Advice(
+                scope="process", slot=None, key="elefant_foot_compensation",
+                current=str(proc.get("elefant_foot_compensation")), proposed="0.15",
+                title="Compensação Pé de Elefante (0.15 mm)",
+                why=why,
+                expected_effect="Frestas um pouco mais abertas no contato com a mesa (se soltar da placa, reduza para 0.1).",
+                what_to_check="Verifique a fixação das menores peças na 1ª camada durante a impressão.",
+                evidence_class="estimado_regra_ia",
+                requires_physical_test=True,
+                confidence=conf,
+                default_on=True,
+            ),
+            plan,
+        )
+
+
 def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) -> list[Advice]:
     advices: list[Advice] = []
     proc = plan.process_settings
@@ -665,6 +895,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
     is_composite_abs = all(_is_composite_material(_as_str(cfg.get("filament_type", ""))) for _, cfg in abs_slots) if abs_slots else False
     geom = getattr(project, "geometry_summary", None)
     has_heavy_overhang = bool(geom is not None and getattr(geom, "overhang_mm2", 0.0) >= 250.0)
+    is_articulated = goal.purpose in {"moveis", "chaveiro_articulado"} or goal.fit_clearance == "partes_moveis"
 
     # 0. Alerta de confiança quando houver itens em 'Não sei'
     if conf_reasons:
@@ -777,8 +1008,49 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                     plan,
                 )
 
+            cur_close_x = _as_int(cfg.get("close_fan_the_first_x_layers", "3"), 3)
+            if "close_fan_the_first_x_layers" in cfg and cur_close_x < 3:
+                _add_if_valid(
+                    advices,
+                    Advice(
+                        scope="filament", slot=idx, key="close_fan_the_first_x_layers",
+                        current=str(cur_close_x), proposed="3",
+                        title=f"Manter Ventoinha Desligada nas 3 Primeiras Camadas (Filamento {idx})",
+                        why="Desligar a ventoinha da peça nas camadas 1–3 evita resfriamento brusco da base em ABS/ASA.",
+                        expected_effect="Menor risco de levantamento precoce dos cantos na 1ª camada.",
+                        what_to_check="Confira aderência dos cantos nas primeiras camadas.",
+                        evidence_class="estimado_regra_ia",
+                        requires_physical_test=False,
+                        confidence=conf,
+                        default_on=True,
+                    ),
+                    plan,
+                )
+
+            target_slow = 8 if (geom is not None and getattr(geom, "has_slender_parts", False)) else 6
+            cur_slow = _as_int(cfg.get("slow_down_layer_time", str(target_slow)), target_slow)
+            if "slow_down_layer_time" in cfg and cur_slow < target_slow:
+                _add_if_valid(
+                    advices,
+                    Advice(
+                        scope="filament", slot=idx, key="slow_down_layer_time",
+                        current=str(cur_slow), proposed=str(target_slow),
+                        title=f"Ampliar Tempo Mínimo por Camada para {target_slow}s (Filamento {idx})",
+                        why=(
+                            "Camadas pequenas impressas rápido demais acumulam calor sem tempo de estabilização; "
+                            f"aumentar slow_down_layer_time de {cur_slow}s para {target_slow}s desacelera em seções estreitas sem depender de vento forte."
+                        ),
+                        expected_effect="Melhor definição em pontas/hastes finas com menos deformação térmica.",
+                        what_to_check="Confira o acabamento em regiões estreitas/altas na prévia.",
+                        evidence_class="estimado_regra_ia",
+                        requires_physical_test=False,
+                        confidence=conf,
+                        default_on=True,
+                    ),
+                    plan,
+                )
+
         # Conflito explícito Brim vs Articulações / Encaixes
-        is_articulated = goal.purpose in {"moveis", "chaveiro_articulado"} or goal.fit_clearance == "partes_moveis"
         raw_brim = proc.get("brim_type")
         if is_articulated:
             advices.append(Advice(
@@ -858,7 +1130,8 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
             confidence=conf,
         )
 
-        # Reforço de ponto de partida para ABS/ASA em peças não decorativas
+        # Reforço de ponto de partida para ABS/ASA (paredes extras em peças não decorativas;
+        # topo, enchimento >=20% e gyroid protegem todas as peças ABS/ASA contra afundamento e colisão)
         if goal.purpose != "decorativa":
             cur_walls = _as_int(proc.get("wall_loops", "2"), 2)
             if "wall_loops" in proc and cur_walls < 3:
@@ -878,60 +1151,60 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                     ),
                     plan,
                 )
-            cur_top = _as_int(proc.get("top_shell_layers", "3"), 3)
-            if "top_shell_layers" in proc and cur_top < 4:
-                _add_if_valid(
-                    advices,
-                    Advice(
-                        scope="process", slot=None, key="top_shell_layers",
-                        current=str(cur_top), proposed="4",
-                        title="Aumentar Camadas de Topo para ABS/ASA (≥ 4)",
-                        why="Com menos ventoinha no ABS/ASA, pontes internas sobre o preenchimento podem afundar com poucas camadas superiores.",
-                        expected_effect="Melhor fechamento de topos planos sobre o núcleo.",
-                        what_to_check="Inspecione visualmente as superfícies horizontais superiores após imprimir.",
-                        evidence_class="estimado_regra_ia",
-                        requires_physical_test=False,
-                        confidence=conf,
-                        default_on=True,
-                    ),
-                    plan,
-                )
-            cur_infill = proc.get("sparse_infill_density", "15%")
-            if "sparse_infill_density" in proc and _as_float(cur_infill, 15.0) < 20.0:
-                _add_if_valid(
-                    advices,
-                    Advice(
-                        scope="process", slot=None, key="sparse_infill_density",
-                        current=str(cur_infill), proposed="20%",
-                        title="Preenchimento Inicial 20% para ABS/ASA",
-                        why="Aumenta pontos de apoio interno sem excesso de massa; em ABS, tensões de resfriamento pedem núcleo mais contínuo.",
-                        expected_effect="Maior sustentação interna para o fechamento superior (maior tempo/material).",
-                        what_to_check="Compare tempo e gramas antes de fatiar o lote completo.",
-                        evidence_class="estimado_regra_ia",
-                        requires_physical_test=False,
-                        confidence=conf,
-                        default_on=True,
-                    ),
-                    plan,
-                )
-            cur_pattern = proc.get("sparse_infill_pattern", "rectilinear")
-            if "sparse_infill_pattern" in proc and cur_pattern != "gyroid":
-                _add_if_valid(
-                    advices,
-                    Advice(
-                        scope="process", slot=None, key="sparse_infill_pattern",
-                        current=str(cur_pattern), proposed="gyroid",
-                        title="Padrão Gyroid para ABS/ASA",
-                        why="Ondulação contínua sem cruzamentos na mesma camada evita colisão do bico comum no padrão grid durante contração.",
-                        expected_effect="Menor risco de arrasto de bico no núcleo interno.",
-                        what_to_check="Confira o desenho interno na prévia por camada.",
-                        evidence_class="estimado_regra_ia",
-                        requires_physical_test=False,
-                        confidence=conf,
-                        default_on=True,
-                    ),
-                    plan,
-                )
+        cur_top = _as_int(proc.get("top_shell_layers", "3"), 3)
+        if "top_shell_layers" in proc and cur_top < 4:
+            _add_if_valid(
+                advices,
+                Advice(
+                    scope="process", slot=None, key="top_shell_layers",
+                    current=str(cur_top), proposed="4",
+                    title="Aumentar Camadas de Topo para ABS/ASA (≥ 4)",
+                    why="Com menos ventoinha no ABS/ASA, pontes internas sobre o preenchimento podem afundar com poucas camadas superiores.",
+                    expected_effect="Melhor fechamento de topos planos sobre o núcleo.",
+                    what_to_check="Inspecione visualmente as superfícies horizontais superiores após imprimir.",
+                    evidence_class="estimado_regra_ia",
+                    requires_physical_test=False,
+                    confidence=conf,
+                    default_on=True,
+                ),
+                plan,
+            )
+        cur_infill = proc.get("sparse_infill_density", "15%")
+        if "sparse_infill_density" in proc and _as_float(cur_infill, 15.0) < 20.0:
+            _add_if_valid(
+                advices,
+                Advice(
+                    scope="process", slot=None, key="sparse_infill_density",
+                    current=str(cur_infill), proposed="20%",
+                    title="Preenchimento Inicial 20% para ABS/ASA",
+                    why="Aumenta pontos de apoio interno sem excesso de massa; em ABS, tensões de resfriamento pedem núcleo mais contínuo.",
+                    expected_effect="Maior sustentação interna para o fechamento superior (maior tempo/material).",
+                    what_to_check="Compare tempo e gramas antes de fatiar o lote completo.",
+                    evidence_class="estimado_regra_ia",
+                    requires_physical_test=False,
+                    confidence=conf,
+                    default_on=True,
+                ),
+                plan,
+            )
+        cur_pattern = proc.get("sparse_infill_pattern", "rectilinear")
+        if "sparse_infill_pattern" in proc and cur_pattern != "gyroid":
+            _add_if_valid(
+                advices,
+                Advice(
+                    scope="process", slot=None, key="sparse_infill_pattern",
+                    current=str(cur_pattern), proposed="gyroid",
+                    title="Padrão Gyroid para ABS/ASA",
+                    why="Ondulação contínua sem cruzamentos na mesma camada evita colisão do bico comum no padrão grid durante contração.",
+                    expected_effect="Menor risco de arrasto de bico no núcleo interno.",
+                    what_to_check="Confira o desenho interno na prévia por camada.",
+                    evidence_class="estimado_regra_ia",
+                    requires_physical_test=False,
+                    confidence=conf,
+                    default_on=True,
+                ),
+                plan,
+            )
 
         # Alerta específico de ambiente/câmara e de contração diferenciando PLA, PETG e Mista
         advices.append(Advice(
@@ -1004,17 +1277,26 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 default_on=False,
             ))
 
+    # 1B. Orientações por família de polímero (PETG, TPU, PA/PC, -CF/-GF) e compatibilidade multi-slot
+    _append_polymer_family_guidance(advices, plan, goal, used_target_cfgs, is_articulated=is_articulated, conf=conf)
+
     # 2. Ajustes por Uso Real da Peça
     if goal.purpose == "esforco":
+        wall_target = 5 if goal.load_type == "flexao_lateral" else 4
         cur_walls = _min_effective_int(project, proc, "wall_loops", 2)
-        if "wall_loops" in proc and cur_walls < 4:
+        if "wall_loops" in proc and cur_walls < wall_target:
+            wall_why = (
+                "Na flexão lateral, os perímetros externos absorvem a maior tensão longitudinal; 5 paredes ampliam a rigidez da casca (requer ensaio físico)."
+                if goal.load_type == "flexao_lateral" else
+                "A casca perimetral contribui diretamente para rigidez local no plano das camadas; sozinha, porém, não comprova resistência mecânica."
+            )
             _add_if_valid(
                 advices,
                 Advice(
                     scope="process", slot=None, key="wall_loops",
-                    current=str(cur_walls), proposed="4",
-                    title="Aumentar Paredes Perimétricas (≥ 4)",
-                    why="A casca perimetral contribui diretamente para rigidez local no plano das camadas; sozinha, porém, não comprova resistência mecânica.",
+                    current=str(cur_walls), proposed=str(wall_target),
+                    title=f"Aumentar Paredes Perimétricas (≥ {wall_target})",
+                    why=wall_why,
                     expected_effect="Elevar espessura da parede externa com acréscimo de tempo e filamento.",
                     what_to_check="Confirme a orientação em relação à força e faça ensaio físico na peça pronta.",
                     evidence_class="estimado_regra_ia",
@@ -1042,15 +1324,21 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 ),
                 plan,
             )
+        infill_target = 40 if goal.load_type == "compressao" else 30
         infill_num = _min_effective_float(project, proc, "sparse_infill_density", 15.0)
-        if "sparse_infill_density" in proc and infill_num < 30.0:
+        if "sparse_infill_density" in proc and infill_num < float(infill_target):
+            infill_why = (
+                "Sob compressão/esmagamento, 40% reduz o vão interno entre colunas evitando colapso da face apertada (sujeito a ensaio físico)."
+                if goal.load_type == "compressao" else
+                "Reduz vazios internos sob compressão/fixação com parafusos (aumento de massa e tempo; sem promessa de carga)."
+            )
             _add_if_valid(
                 advices,
                 Advice(
                     scope="process", slot=None, key="sparse_infill_density",
-                    current=f"{infill_num:g}%", proposed="30%",
-                    title="Aumentar Densidade de Preenchimento para 30%",
-                    why="Reduz vazios internos sob compressão/fixação com parafusos (aumento de massa e tempo; sem promessa de carga).",
+                    current=f"{infill_num:g}%", proposed=f"{infill_target}%",
+                    title=f"Aumentar Densidade de Preenchimento para {infill_target}%",
+                    why=infill_why,
                     expected_effect="Núcleo mais denso sob faces de aperto ou compressão.",
                     what_to_check="Compare tempo e gramas antes de fatiar e valide a fixação fisicamente.",
                     evidence_class="estimado_regra_ia",
@@ -1183,57 +1471,66 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 advices,
                 confidence=conf,
             )
-            if not effective_support and "enable_support" in proc:
-                _add_if_valid(
-                    advices,
-                    Advice(
-                        scope="process", slot=None, key="enable_support",
-                        current=_as_str(proc.get("enable_support", "0")), proposed="1",
-                        title="Ativar Suporte Automático em Peça Decorativa",
-                        why=(
-                            "Peças decorativas quase sempre têm queixo, mãos, dobras ou balanços > 45°; vem ativado por padrão "
-                            "com suporte em árvore fino e folgas Z/XY de fácil remoção. Se sua peça for 100% plana, você pode desmarcar."
-                        ),
-                        expected_effect="Gera suportes árvore automáticos nas saliências mantendo folgas otimizadas para destacar limpo.",
-                        what_to_check="Confira na prévia onde os galhos tocam a peça antes de imprimir.",
-                        evidence_class="estimado_regra_ia",
-                        requires_physical_test=False,
-                        confidence=conf,
-                        default_on=True,
-                    ),
-                    plan,
-                )
-            cur_stype = _as_str(proc.get("support_type", ""))
-            if ("support_type" in proc and not obj_only_support
-                    and "manual" not in cur_stype.lower() and cur_stype != "tree(auto)"):
-                _add_if_valid(
-                    advices,
-                    Advice(
-                        scope="process", slot=None, key="support_type",
-                        current=cur_stype, proposed="tree(auto)",
-                        title="Usar Suporte em Árvore Automático (tree(auto))",
-                        why="Em peças decorativas e orgânicas, árvores tocam menos pontos e saem mais fácil que pilares retos.",
-                        expected_effect="Menos marcas de contato e retirada mais rápida.",
-                        what_to_check="Veja os pontos de apoio das pontas na prévia 3D.",
-                        evidence_class="estimado_regra_ia",
-                        requires_physical_test=False,
-                        confidence=conf,
-                        default_on=True,
-                    ),
-                    plan,
-                )
-            if effective_support and obj_only_support:
-                advices.append(Advice(
-                    scope="alert", slot=None, key="", current="", proposed="",
-                    title="Suporte Definido Por Objeto no 3MF",
-                    why="O suporte foi ativado apenas em objetos específicos dentro do arquivo; revise na aba Objetos do ELEGOO Slicer se necessário.",
-                    expected_effect="Evitar remoção ou aplicação acidental de suportes locais.",
-                    what_to_check="Abra a lista de Objetos no ELEGOO Slicer e confirme onde há suporte.",
-                    evidence_class="verificado_3mf",
+
+        support_default_on = (
+            (geom is None or has_heavy_overhang)
+            and goal.fit_clearance != "partes_moveis"
+        )
+        if not effective_support and "enable_support" in proc:
+            sup_why = (
+                "Peças decorativas quase sempre têm queixo, mãos, dobras ou balanços > 45°; vem ativado por padrão "
+                "com suporte em árvore fino e folgas Z/XY de fácil remoção. Se sua peça for 100% plana, você pode desmarcar."
+                if support_default_on else
+                f"A pré-análise geométrica encontrou pouca área em balanço ({getattr(geom, 'overhang_mm2', 0.0):.0f} mm² < 250 mm²); "
+                "ficou desmarcado por padrão, mas já com árvore e folgas de fácil remoção pré-configuradas caso decida ativar."
+            )
+            _add_if_valid(
+                advices,
+                Advice(
+                    scope="process", slot=None, key="enable_support",
+                    current=_as_str(proc.get("enable_support", "0")), proposed="1",
+                    title="Ativar Suporte Automático em Peça Decorativa",
+                    why=sup_why,
+                    expected_effect="Gera suportes árvore automáticos nas saliências mantendo folgas otimizadas para destacar limpo.",
+                    what_to_check="Confira na prévia onde os galhos tocam a peça antes de imprimir.",
+                    evidence_class="estimado_regra_ia",
                     requires_physical_test=False,
-                    confidence="alta",
-                    default_on=False,
-                ))
+                    confidence=conf,
+                    default_on=support_default_on,
+                ),
+                plan,
+            )
+        cur_stype = _as_str(proc.get("support_type", ""))
+        if ("support_type" in proc and not obj_only_support
+                and "manual" not in cur_stype.lower() and cur_stype != "tree(auto)"):
+            _add_if_valid(
+                advices,
+                Advice(
+                    scope="process", slot=None, key="support_type",
+                    current=cur_stype, proposed="tree(auto)",
+                    title="Usar Suporte em Árvore Automático (tree(auto))",
+                    why="Em peças decorativas e orgânicas, árvores tocam menos pontos e saem mais fácil que pilares retos.",
+                    expected_effect="Menos marcas de contato e retirada mais rápida.",
+                    what_to_check="Veja os pontos de apoio das pontas na prévia 3D.",
+                    evidence_class="estimado_regra_ia",
+                    requires_physical_test=False,
+                    confidence=conf,
+                    default_on=True,
+                ),
+                plan,
+            )
+        if effective_support and obj_only_support:
+            advices.append(Advice(
+                scope="alert", slot=None, key="", current="", proposed="",
+                title="Suporte Definido Por Objeto no 3MF",
+                why="O suporte foi ativado apenas em objetos específicos dentro do arquivo; revise na aba Objetos do ELEGOO Slicer se necessário.",
+                expected_effect="Evitar remoção ou aplicação acidental de suportes locais.",
+                what_to_check="Abra a lista de Objetos no ELEGOO Slicer e confirme onde há suporte.",
+                evidence_class="verificado_3mf",
+                requires_physical_test=False,
+                confidence="alta",
+                default_on=False,
+            ))
         has_var_layer = any(
             entry.replace("\\", "/") == "Metadata/layer_heights_profile.txt"
             for entry in getattr(project, "archive_entries", ())
@@ -1498,7 +1795,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 plan,
             )
         raw_brim = proc.get("brim_type")
-        if not is_abs_asa and raw_brim != "no_brim":
+        if raw_brim != "no_brim":
             _add_if_valid(
                 advices,
                 Advice(
@@ -1515,23 +1812,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 ),
                 plan,
             )
-        if "elefant_foot_compensation" in proc and _as_float(proc.get("elefant_foot_compensation", "0.1"), 0.1) < 0.15:
-            _add_if_valid(
-                advices,
-                Advice(
-                    scope="process", slot=None, key="elefant_foot_compensation",
-                    current=str(proc.get("elefant_foot_compensation")), proposed="0.15",
-                    title="Compensação Pé de Elefante (0.15 mm)",
-                    why="Recua levemente o contorno da 1ª camada para reduzir chance de junta colada na mesa.",
-                    expected_effect="Frestas um pouco mais abertas no contato com a mesa (se soltar da placa, reduza para 0.1).",
-                    what_to_check="Verifique a fixação das menores peças na 1ª camada durante a impressão.",
-                    evidence_class="estimado_regra_ia",
-                    requires_physical_test=True,
-                    confidence=conf,
-                    default_on=True,
-                ),
-                plan,
-            )
+        _maybe_propose_elephant_foot(advices, proc, plan, conf)
         if "ironing_type" in proc and proc.get("ironing_type") != "no ironing":
             _add_if_valid(
                 advices,
@@ -1617,24 +1898,11 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 ),
                 plan,
             )
-        for _, cfg in used_target_cfgs:
-            if _base_polymer(_as_str(cfg.get("filament_type"))) == "PLA":
-                advices.append(Advice(
-                    scope="alert", slot=None, key="", current="", proposed="",
-                    title="Alerta: Resistência Térmica e UV (PLA)",
-                    why="O PLA tende a amolecer por volta de 45–50 °C sob sol direto ou dentro de veículos. Para uso externo, avalie PETG ou ASA.",
-                    expected_effect="Prevenir deformação térmica em campo.",
-                    what_to_check="Substitua o filamento físico por PETG/ASA se houver exposição ao sol.",
-                    evidence_class="depende_teste_fisico",
-                    requires_physical_test=True,
-                    confidence=conf,
-                    default_on=False,
-                ))
-                break
+        _append_outdoor_polymer_alerts(advices, used_target_cfgs, conf, outdoor_purpose=True)
 
     elif goal.purpose == "moveis":
         raw_brim = proc.get("brim_type")
-        if not is_abs_asa and raw_brim != "no_brim":
+        if raw_brim != "no_brim":
             _add_if_valid(
                 advices,
                 Advice(
@@ -1651,6 +1919,10 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 ),
                 plan,
             )
+        _maybe_propose_elephant_foot(
+            advices, proc, plan, conf,
+            why="Recua levemente a base para reduzir risco de juntas móveis coladas pelo esmagamento da 1ª camada.",
+        )
         advices.append(Advice(
             scope="alert", slot=None, key="", current="", proposed="",
             title="Folgas e Partes Móveis",
@@ -1664,6 +1936,58 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
         ))
 
     # 2B. Regras contextuais adicionais (direção de carga, criticidade, encaixe, calor/sol)
+    if goal.load_type == "impacto":
+        cur_walls = _min_effective_int(project, proc, "wall_loops", 2)
+        if "wall_loops" in proc and cur_walls < 4:
+            _add_if_valid(
+                advices,
+                Advice(
+                    scope="process", slot=None, key="wall_loops",
+                    current=str(cur_walls), proposed="4",
+                    title="Reforçar Paredes contra Impacto/Choque (≥ 4)",
+                    why="Cargas de impacto, vibração ou travas de encaixe repetido concentram tensão na casca; 4 paredes amortecem melhor trincas iniciais.",
+                    expected_effect="Casca mais espessa frente a batidas e flexões rápidas de encaixe.",
+                    what_to_check="Execute ciclos reais de encaixe/impacto na peça impressa.",
+                    evidence_class="estimado_regra_ia",
+                    requires_physical_test=True,
+                    confidence=conf,
+                    default_on=True,
+                ),
+                plan,
+            )
+        cur_pat = proc.get("sparse_infill_pattern", "rectilinear")
+        if "sparse_infill_pattern" in proc and cur_pat != "gyroid":
+            _add_if_valid(
+                advices,
+                Advice(
+                    scope="process", slot=None, key="sparse_infill_pattern",
+                    current=str(cur_pat), proposed="gyroid",
+                    title="Padrão Gyroid para Impacto e Vibração",
+                    why="Geometria ondulada distribui energia de choque em todas as direções em vez de abrir planos retos de fratura.",
+                    expected_effect="Menor propagação de trinca no núcleo sob impacto.",
+                    what_to_check="Teste a peça em uso cíclico real.",
+                    evidence_class="estimado_regra_ia",
+                    requires_physical_test=False,
+                    confidence=conf,
+                    default_on=True,
+                ),
+                plan,
+            )
+        advices.append(Advice(
+            scope="alert", slot=None, key="", current="", proposed="",
+            title="Carga de Impacto / Vibração: Atenção à Fragilidade do Material",
+            why=(
+                "Você informou esforço de impacto ou encaixe repetido. PLA padrão e compostos -CF rígidos tendem a quebrar "
+                "de forma frágil sob choque súbito; PETG, TPU ou ABS apresentam maior absorção de energia (validável só com teste físico)."
+            ),
+            expected_effect="Evitar quebra frágil em travas elásticas e batidas.",
+            what_to_check="Submeta a peça de teste a quedas ou ciclos reais de montagem após resfriar.",
+            evidence_class="depende_teste_fisico",
+            requires_physical_test=True,
+            confidence=conf,
+            default_on=False,
+        ))
+
     if goal.load_type == "tracao_eixo_z":
         advices.append(Advice(
             scope="alert", slot=None, key="", current="", proposed="",
@@ -1697,7 +2021,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
         ))
 
     if goal.fit_clearance == "partes_moveis" and goal.purpose not in {"moveis", "chaveiro_articulado"}:
-        if not is_abs_asa and proc.get("brim_type") != "no_brim":
+        if proc.get("brim_type") != "no_brim":
             _add_if_valid(
                 advices,
                 Advice(
@@ -1714,23 +2038,13 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 ),
                 plan,
             )
+        _maybe_propose_elephant_foot(
+            advices, proc, plan, conf,
+            why="Você informou partes móveis: compensação de pé de elefante evita que a 1ª camada sele as frestas.",
+        )
 
     if goal.heat_exposure in {"calor_sol", "agua_externo"} and goal.purpose != "externa":
-        for _, cfg in used_target_cfgs:
-            poly = _base_polymer(_as_str(cfg.get("filament_type")))
-            if poly == "PLA":
-                advices.append(Advice(
-                    scope="alert", slot=None, key="", current="", proposed="",
-                    title="Calor/Sol Informado com Filamento PLA",
-                    why="PLA tende a deformar acima de ~45–50 °C (interior de carro ou sol direto). Considere PETG ou ASA.",
-                    expected_effect="Evitar amolecimento rápido em uso real.",
-                    what_to_check="Avalie trocar o filamento físico antes de imprimir ou faça teste térmico.",
-                    evidence_class="depende_teste_fisico",
-                    requires_physical_test=True,
-                    confidence=conf,
-                    default_on=False,
-                ))
-                break
+        _append_outdoor_polymer_alerts(advices, used_target_cfgs, conf, outdoor_purpose=False)
 
     # 3. Ajustes por Prioridade (compatíveis com bico/perfil)
     nozzle = _as_float(plan.machine_settings.get("nozzle_diameter", "0.4"), 0.4)
@@ -1803,17 +2117,23 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
     elif goal.priority == "economia":
         cur_infill = proc.get("sparse_infill_density", "15%")
         infill_num = _as_float(cur_infill, 15.0)
-        if "sparse_infill_density" in proc and infill_num > 10.0 and goal.purpose not in {
+        target_eco = 20.0 if is_abs_asa else 10.0
+        target_eco_str = "20%" if is_abs_asa else "10%"
+        if "sparse_infill_density" in proc and infill_num > target_eco and goal.purpose not in {
             "esforco", "chaveiro_rigido", "chaveiro_articulado"
         }:
             _add_if_valid(
                 advices,
                 Advice(
                     scope="process", slot=None, key="sparse_infill_density",
-                    current=str(cur_infill), proposed="10%",
-                    title="Redução Econômica de Preenchimento (10%)",
-                    why="Reduz consumo de material mantendo estrutura mínima para sustentar o fechamento superior em peças sem esforço.",
-                    expected_effect="Menor gasto de gramas no fatiamento e menor rigidez interna.",
+                    current=str(cur_infill), proposed=target_eco_str,
+                    title=f"Redução Econômica Segura de Preenchimento ({target_eco_str})",
+                    why=(
+                        "Reduz consumo mantendo o piso mínimo de 20% recomendado para ABS/ASA contra empenamento."
+                        if is_abs_asa else
+                        "Reduz consumo de material mantendo estrutura mínima para sustentar o fechamento superior em peças sem esforço."
+                    ),
+                    expected_effect="Menor gasto de gramas no fatiamento sem sacrificar o mínimo térmico do material.",
                     what_to_check="Verifique na prévia se áreas horizontais grandes não ficam sem apoio.",
                     evidence_class="estimado_regra_ia",
                     requires_physical_test=False,
@@ -1824,7 +2144,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
             )
 
     elif goal.priority == "velocidade":
-        if "layer_height" in proc:
+        if "layer_height" in proc and not is_articulated:
             cur_h = _as_float(proc.get("layer_height"), 0.2)
             target_h = min(max_h, round(0.6 * nozzle, 2), round(0.75 * nozzle, 2))
             proposed_h = f"{target_h:g}"
@@ -1948,7 +2268,11 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 confidence="alta",
                 default_on=False,
             ))
-        if geom.has_slender_parts and proc.get("brim_type") == "no_brim":
+        planned_brim = next(
+            (a.proposed for a in reversed(advices) if a.scope == "process" and a.key == "brim_type" and a.default_on),
+            _as_str(proc.get("brim_type", "")),
+        )
+        if geom.has_slender_parts and planned_brim == "no_brim":
             advices.append(Advice(
                 scope="alert", slot=None, key="", current="", proposed="",
                 title="Peça Esguia ou Pequena com Risco de Descolar",
@@ -1974,7 +2298,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
             ))
         if (not geom.has_slender_parts and geom.contact_mm2 >= 800.0
                 and not is_abs_asa and goal.purpose == "decorativa"
-                and proc.get("brim_type") in {"auto_brim", "outer_only"}):
+                and planned_brim in {"auto_brim", "outer_only"}):
             advices.append(Advice(
                 scope="alert", slot=None, key="", current="", proposed="",
                 title="Base Larga em PLA (Brim Opcional)",
@@ -2010,16 +2334,26 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
 
 
 def merge_with_offline_alerts(ai_advices: list[Advice], offline_advices: list[Advice]) -> list[Advice]:
-    """Combina sugestões da IA com alertas diagnósticos determinísticos locais sem duplicar títulos."""
+    """Combina sugestões da IA com ajustes não cobertos e alertas locais, consolidando conflitos."""
     merged = list(ai_advices)
     seen_titles = {adv.title.strip().lower() for adv in merged if adv.scope == "alert"}
+    seen_keys = {
+        (adv.scope, adv.slot, adv.key)
+        for adv in merged
+        if adv.scope != "alert" and adv.key
+    }
     for adv in offline_advices:
         if adv.scope == "alert":
             norm = adv.title.strip().lower()
             if norm not in seen_titles:
                 seen_titles.add(norm)
                 merged.append(adv)
-    return merged
+            continue
+        identity = (adv.scope, adv.slot, adv.key)
+        if identity not in seen_keys:
+            seen_keys.add(identity)
+            merged.append(adv)
+    return _consolidate_advices(merged)
 
 
 def apply_advice(plan: ConversionPlan, approved: list[Advice]) -> ConversionPlan:
@@ -2027,24 +2361,33 @@ def apply_advice(plan: ConversionPlan, approved: list[Advice]) -> ConversionPlan
     new_process = dict(plan.process_settings)
     new_filaments = [dict(f) for f in plan.filament_settings]
     forced_keys = list(getattr(plan, "forced_process_keys", ()) or ())
+    cur_plan = replace(
+        plan,
+        machine_settings=new_machine,
+        process_settings=new_process,
+        filament_settings=tuple(dict(f) for f in new_filaments),
+        forced_process_keys=tuple(forced_keys),
+    )
 
     for adv in approved:
         if adv.scope == "machine":
-            if validate_change("machine", adv.key, adv.proposed, plan):
+            if validate_change("machine", adv.key, adv.proposed, cur_plan):
                 if adv.key == "passive_preheat_seconds":
                     new_machine["machine_start_gcode"] = inject_passive_preheat_gcode(
                         str(new_machine.get("machine_start_gcode", "")),
                         int(adv.proposed),
                     )
+                cur_plan = replace(cur_plan, machine_settings=new_machine)
         elif adv.scope == "process":
-            if validate_change("process", adv.key, adv.proposed, plan):
+            if validate_change("process", adv.key, adv.proposed, cur_plan):
                 new_process[adv.key] = adv.proposed
                 if adv.key not in forced_keys:
                     forced_keys.append(adv.key)
+                cur_plan = replace(cur_plan, process_settings=new_process, forced_process_keys=tuple(forced_keys))
         elif adv.scope == "filament" and adv.slot is not None:
-            if validate_change("filament", adv.key, adv.proposed, plan, adv.slot):
-                cfg = new_filaments[adv.slot - 1]
-                cfg[adv.key] = [adv.proposed]
+            if validate_change("filament", adv.key, adv.proposed, cur_plan, adv.slot):
+                new_filaments[adv.slot - 1][adv.key] = [adv.proposed]
+                cur_plan = replace(cur_plan, filament_settings=tuple(dict(f) for f in new_filaments))
 
     return replace(
         plan,
@@ -2184,12 +2527,21 @@ def build_print_summary(
             and _is_abs_asa_material(_as_str(cfg.get("filament_type", "")))
         ]
         fan_txt = "/".join(dict.fromkeys(fans)) if fans else "perfil ELEGOO"
-        has_aux = any(
-            "additional_cooling_fan_speed" in cfg
+        aux_values = [
+            _as_str(cfg.get("additional_cooling_fan_speed", ""))
             for idx, cfg in enumerate(preview_plan.filament_settings, 1)
-            if not used_slots or str(idx) in used_slots
-        )
-        aux_txt = " e ventoinha auxiliar em 0%" if has_aux else ""
+            if (not used_slots or str(idx) in used_slots)
+            and _is_abs_asa_material(_as_str(cfg.get("filament_type", "")))
+            and "additional_cooling_fan_speed" in cfg
+            and _as_str(cfg.get("additional_cooling_fan_speed", "")) != ""
+        ]
+        if aux_values and all(_as_int(v, -1) == 0 for v in aux_values):
+            aux_txt = " e ventoinha auxiliar (AUX) desligada (0%)"
+        elif aux_values:
+            non_zero = "/".join(dict.fromkeys(f"{v}%" for v in aux_values if _as_int(v, 0) != 0))
+            aux_txt = f" (ATENÇÃO: ventoinha AUX em {non_zero} no perfil — desligue para 0%)"
+        else:
+            aux_txt = ""
         cooling_line = (
             f"Hipótese de regra: teto de ventoinha da peça em {fan_txt}{aux_txt} para tentar conter "
             "choque térmico/empenamento em câmara passiva (requer peça de teste para validar união intercamadas)."

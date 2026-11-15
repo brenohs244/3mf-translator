@@ -334,3 +334,125 @@ class UIBeginnerFlowTests(unittest.TestCase):
                     self.assertEqual(saved_records[0].visual_result, "empenou_soltou")
                 finally:
                     app.destroy()
+
+    def test_task27_ux_safety_missing_slicer_unknown_material_invalid_open_and_feedback(self):
+        from maker_elegoo.history import load_feedback_history
+        from maker_elegoo.labels import PURPOSE_LABELS
+        from maker_elegoo.profiles import ProfileError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env_empty = {
+                "APPDATA": str(root / "EmptyAppData"),
+                "ProgramFiles": str(root / "EmptyProgramFiles"),
+                "MAKER_ELEGOO_CONFIG_DIR": str(root / "prefs_empty"),
+            }
+            with patch.dict(os.environ, env_empty):
+                app_no_slicer = MakerElegooApp()
+                try:
+                    self.assertIsNone(app_no_slicer.install)
+                    self.assertFalse(app_no_slicer.advanced_visible.get())
+                    self.assertNotEqual(app_no_slicer.missing_slicer_banner.winfo_manager(), "")
+                finally:
+                    app_no_slicer.destroy()
+
+            env = _setup_fake_slicer_env(root)
+            proj = ProjectInfo(
+                root / "peca.3mf",
+                {"printer_model": "Bambu Lab A1", "layer_height": "0.20"},
+                (FilamentInfo(1, "PLA", "#FFFFFF", "Bambu PLA"),),
+                (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+                ("Peca",),
+                (),
+                (),
+                used_filament_slots=("1",),
+            )
+            with patch.dict(os.environ, env):
+                app = MakerElegooApp()
+                try:
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj):
+                        app.file_var.set(str(proj.path))
+                        app._inspect_file()
+
+                    # Não permite confirmar 'Não sei informar'
+                    app.physical_filament_confirmed_var.set(True)
+                    app._on_physical_filament_changed()
+                    self.assertFalse(app.physical_filament_confirmed_var.get())
+
+                    with patch("maker_elegoo.ui.messagebox.showwarning") as warn_spy, \
+                         patch("maker_elegoo.ui.messagebox.askyesno") as ask_spy:
+                        app._convert()
+                        warn_spy.assert_called_once()
+                        ask_spy.assert_not_called()
+                        self.assertFalse(app.physical_filament_confirmed_var.get())
+
+                    # Falha com arquivo existente no disco NÃO pode liberar Abrir no ELEGOO Slicer
+                    out_file = root / "saida_invalida.3mf"
+                    out_file.write_bytes(b"fake")
+                    bad_res = ConversionResult(
+                        False, out_file, "Validação falhou",
+                        ExportResult(True, out_file, "ok"),
+                        ValidationResult(False, 0, "Falha"),
+                        None, proj, {}, proj.plates,
+                    )
+                    plan_obj = app._build_current_plan(*app._selected_profiles())
+                    app.worker_queue.put((bad_res, plan_obj, (), (), None, None))
+                    app._poll_worker()
+                    self.assertEqual(str(app.open_button.cget("state")), "disabled")
+                    self.assertEqual(str(app.open_folder_button.cget("state")), "disabled")
+                    self.assertIn("NÃO imprima", app.result_banner_var.get())
+
+                    good_res = ConversionResult(
+                        True, out_file, "Todas as placas foram fatiadas",
+                        ExportResult(True, out_file, "ok"),
+                        ValidationResult(True, 1, "Todas as placas foram fatiadas", (), 600, 12.0),
+                        None, proj, {}, proj.plates,
+                    )
+                    app.worker_queue.put((good_res, plan_obj, (), (), None, None))
+                    app._poll_worker()
+                    self.assertEqual(str(app.open_button.cget("state")), "normal")
+                    self.assertEqual(str(app.open_folder_button.cget("state")), "normal")
+                    self.assertIn("Pronto", app.result_banner_var.get())
+
+                    # Erro em _update_context_preview não deixa cartão antigo preso
+                    app.preconversion_var.set("CARTAO ANTIGO STALE")
+                    with patch.object(app, "_selected_profiles", side_effect=ProfileError("Sem perfil")):
+                        app._update_context_preview()
+                    self.assertNotIn("CARTAO ANTIGO STALE", app.preconversion_var.get())
+                    self.assertIn("Não foi possível", app.preconversion_var.get())
+
+                    # Feedback usa rótulos amigáveis e pede confirmação ao limpar
+                    app.save_history_var.set(True)
+                    app._record_feedback(target_material="PLA", purpose="esforco", visual_result="aprovado")
+                    dlg = app._open_feedback_dialog()
+                    try:
+                        combos = []
+                        def _walk(w):
+                            for ch in w.winfo_children():
+                                if ch.winfo_class() == "TCombobox":
+                                    combos.append(tuple(ch.cget("values")))
+                                _walk(ch)
+                        _walk(dlg)
+                        purpose_vals = next(v for v in combos if PURPOSE_LABELS["esforco"] in v)
+                        self.assertNotIn("chaveiro_rigido", purpose_vals)
+                        clear_btn = None
+                        def _find_btn(w):
+                            nonlocal clear_btn
+                            for ch in w.winfo_children():
+                                if ch.winfo_class() == "TButton" and str(ch.cget("text")) == "Limpar histórico":
+                                    clear_btn = ch
+                                _find_btn(ch)
+                        _find_btn(dlg)
+                        self.assertIsNotNone(clear_btn)
+                        with patch("maker_elegoo.ui.messagebox.askyesno", return_value=False) as confirm_clear:
+                            clear_btn.invoke()
+                            confirm_clear.assert_called_once()
+                        self.assertEqual(len(load_feedback_history()), 1)
+                    finally:
+                        dlg.destroy()
+
+                    # Fila dedicada para calibração (sem self.after de worker thread)
+                    self.assertTrue(hasattr(app, "calib_queue"))
+                finally:
+                    app.destroy()
+

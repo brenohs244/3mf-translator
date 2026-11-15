@@ -102,21 +102,47 @@ def advise_gemini(
     plan: ConversionPlan,
     goal: PrintGoal,
 ) -> list[Advice]:
-    # Preparar contexto seguro
+    # Preparar contexto seguro restrito aos slots realmente usados quando disponíveis
+    used_slots = {
+        str(s) for s in (getattr(project, "used_filament_slots", ()) or ())
+        if s and str(s) != "0"
+    }
     target_materials = [
-        str(f.get("filament_type", ["Desconhecido"])[0])
+        str((f.get("filament_type") or ["Desconhecido"])[0])
+        for idx, f in enumerate(plan.filament_settings, 1)
+        if not used_slots or str(idx) in used_slots
+    ] or [
+        str((f.get("filament_type") or ["Desconhecido"])[0])
         for f in plan.filament_settings
     ]
-    source_materials = [f.material for f in project.filaments]
+    source_materials = [
+        f.material for idx, f in enumerate(project.filaments, 1)
+        if not used_slots or str(getattr(f, "slot", idx)) in used_slots
+    ] or [f.material for f in project.filaments]
 
     safe_process = {
         k: str(v) for k, v in plan.process_settings.items() if k in SAFE_PROCESS_KEYS
     }
     safe_process.setdefault("brim_type", str(plan.process_settings.get("brim_type") or "auto_brim"))
     safe_filaments = [
-        {k: str(v[0]) if isinstance(v, list) else str(v)
-         for k, v in f.items() if k in SAFE_FILAMENT_KEYS or k == "filament_type"}
-        for f in plan.filament_settings
+        {
+            "slot": idx,
+            **{
+                k: str(v[0]) if isinstance(v, list) else str(v)
+                for k, v in f.items() if k in SAFE_FILAMENT_KEYS or k == "filament_type"
+            },
+        }
+        for idx, f in enumerate(plan.filament_settings, 1)
+        if not used_slots or str(idx) in used_slots
+    ] or [
+        {
+            "slot": idx,
+            **{
+                k: str(v[0]) if isinstance(v, list) else str(v)
+                for k, v in f.items() if k in SAFE_FILAMENT_KEYS or k == "filament_type"
+            },
+        }
+        for idx, f in enumerate(plan.filament_settings, 1)
     ]
 
     min_h = plan.machine_settings.get("min_layer_height", ["0.08"])
@@ -136,6 +162,7 @@ def advise_gemini(
         "source_materials": source_materials,
         "target_materials": target_materials,
         "used_filament_slots": list(getattr(project, "used_filament_slots", ()) or ()),
+        "chamber": "passiva fechada (support_chamber_temp_control = 0; sem aquecimento ativo controlado por software)",
         "max_colors_on_single_plate": int(max_plate_colors),
         "advanced_features": list(getattr(project, "advanced_features", ()) or ()),
         "has_object_overrides": bool(getattr(project, "object_overrides", ())),
@@ -171,7 +198,8 @@ def advise_gemini(
         "2. Para 'filament', informe o 'slot' (1-based) e use chaves existentes em current_filaments (como fan_max_speed, fan_min_speed, overhang_fan_speed, during_print_exhaust_fan_speed) respeitando fan_min_speed <= fan_max_speed.\n"
         "3. Nunca prometa nem afirme resistência mecânica garantida, estabilidade dimensional ou solda perfeita sem ensaio físico; informe 'expected_effect' e 'what_to_check' em linguagem simples.\n"
         "4. Diferencie origem PLA vs PETG vs mista; nunca rotule PETG como PLA.\n"
-        "5. Em 'default_on', use true para recomendações padrão compatíveis e false para alertas de odor/exaustão, câmara ou itens que dependam de teste físico.\n\n"
+        "5. A ELEGOO Centauri Carbon 2 possui câmara passiva (support_chamber_temp_control = 0), sem aquecimento ativo controlado por software.\n"
+        "6. Em 'default_on', use true para recomendações padrão compatíveis e false para alertas de odor/exaustão, câmara ou itens que dependam de teste físico.\n\n"
         f"Contexto do Projeto:\n{json.dumps(context_payload, ensure_ascii=False, indent=2)}\n\n"
         "Responda SOMENTE um JSON no formato:\n"
         "{\n"
@@ -191,7 +219,17 @@ def advise_gemini(
         if not isinstance(item, dict):
             continue
         scope = str(item.get("scope", ""))
-        slot = item.get("slot")
+        raw_slot = item.get("slot")
+        slot: int | None
+        if scope == "process" or scope == "alert":
+            slot = None
+        elif raw_slot is None or raw_slot == "" or isinstance(raw_slot, bool):
+            continue
+        else:
+            try:
+                slot = int(raw_slot)
+            except (TypeError, ValueError):
+                continue
         key = str(item.get("key", ""))
         proposed = str(item.get("proposed", ""))
         title = str(item.get("title", ""))[:80]
@@ -214,11 +252,11 @@ def advise_gemini(
 
         if scope in {"process", "filament"}:
             if validate_change(scope, key, proposed, plan, slot=slot):
-                current_val = (
-                    str(plan.process_settings.get(key, ""))
-                    if scope == "process"
-                    else str(plan.filament_settings[slot - 1].get(key, [""])[0])
-                )
+                if scope == "process":
+                    current_val = str(plan.process_settings.get(key, ""))
+                else:
+                    raw_cur = plan.filament_settings[slot - 1].get(key, "")
+                    current_val = str(raw_cur[0] if isinstance(raw_cur, list) and raw_cur else raw_cur)
                 verified.append(
                     Advice(
                         scope, slot, key, current_val, proposed, title, why, default_on,

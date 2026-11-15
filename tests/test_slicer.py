@@ -151,4 +151,20 @@ class SlicerTests(unittest.TestCase):
             ),
         )
 
+    def test_validation_error_prefixes_portuguese_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "converted.3mf"
+            project.touch()
+
+            def runner(args, **kwargs):
+                return subprocess.CompletedProcess(args, 2, "", "Error: Invalid filament configuration")
+
+            result = SlicerCLI(Path("elegoo-slicer.exe"), runner=runner).validate(project, 1)
+
+        self.assertFalse(result.success)
+        self.assertIn("O ELEGOO Slicer retornou erro", result.message)
+        self.assertIn("Detalhes técnicos:", result.message)
+        self.assertIn("Invalid filament configuration", result.message)
+
+
 

@@ -268,6 +268,93 @@ class ProfessorConfiavelTests(unittest.TestCase):
             clear_feedback_history()
             self.assertEqual(load_feedback_history(), [])
 
+    def test_task28_decorativa_all_priorities_abs_economia_articulados_velocidade_and_aux_summary(self):
+        from dataclasses import replace
+        from maker_elegoo.geometry_check import GeometrySummary
+        from maker_elegoo.professor import PrintGoal, advise_offline, build_print_summary
+
+        # (a) Decorativa em equilibrio e velocidade também ativam suporte otimizado
+        # when overhang >= 250 (ou sem geom), e desativam default_on quando overhang < 250 mm²
+        proj_big_oh = replace(
+            self._proj(("PLA",)),
+            geometry_summary=GeometrySummary(1000, 1, (0, 0, 0, 40, 40, 50), 40.0, 40.0, 50.0, 1600.0, 420.0, False),
+        )
+        proj_small_oh = replace(
+            self._proj(("PLA",)),
+            geometry_summary=GeometrySummary(1000, 1, (0, 0, 0, 40, 40, 50), 40.0, 40.0, 50.0, 1600.0, 80.0, False),
+        )
+        plan_pla = self._plan(self.fil_pla, self.pla_settings, enable_support="0")
+        for prio in ("qualidade", "equilibrio", "velocidade"):
+            goal = PrintGoal("decorativa", prio, physical_material="PLA")
+            adv_big = advise_offline(proj_big_oh, plan_pla, goal)
+            sup_big = next((a for a in adv_big if a.key == "enable_support"), None)
+            self.assertIsNotNone(sup_big, f"enable_support ausente em decorativa/{prio}")
+            self.assertEqual(sup_big.proposed, "1")
+            self.assertTrue(sup_big.default_on, f"enable_support deveria vir ligado para overhang>=250 em {prio}")
+
+            adv_small = advise_offline(proj_small_oh, plan_pla, goal)
+            sup_small = next((a for a in adv_small if a.key == "enable_support"), None)
+            self.assertIsNotNone(sup_small, f"enable_support ausente em decorativa/{prio} pequeno")
+            self.assertFalse(sup_small.default_on, f"enable_support deveria ficar default_on=False para overhang<250 em {prio}")
+
+        # (b) ABS + economia nunca rebaixa enchimento abaixo de 20%
+        plan_abs_high_infill = self._plan(self.fil_abs, self.abs_settings, sparse_infill_density="20%")
+        goal_abs_eco = PrintGoal("decorativa", "economia", physical_material="ABS")
+        adv_eco = advise_offline(self._proj(("PLA",)), plan_abs_high_infill, goal_abs_eco)
+        infill_eco = [a for a in adv_eco if a.key == "sparse_infill_density"]
+        for adv in infill_eco:
+            self.assertGreaterEqual(int(adv.proposed.rstrip("%")), 20)
+
+        plan_abs_low_infill = self._plan(self.fil_abs, self.abs_settings, sparse_infill_density="12%")
+        adv_eco_low = advise_offline(self._proj(("PLA",)), plan_abs_low_infill, goal_abs_eco)
+        infill_low = next((a for a in adv_eco_low if a.key == "sparse_infill_density"), None)
+        self.assertIsNotNone(infill_low)
+        self.assertGreaterEqual(int(infill_low.proposed.rstrip("%")), 20)
+
+        # (c) ABS em peças articuladas (moveis / chaveiro_articulado / partes_moveis) deve propor brim_type="no_brim"
+        for purp, clearance in (("moveis", "normal"), ("chaveiro_articulado", "normal"), ("encaixe", "partes_moveis")):
+            plan_abs_brim = self._plan(self.fil_abs, self.abs_settings, brim_type="auto_brim")
+            goal_art = PrintGoal(purp, "equilibrio", fit_clearance=clearance, physical_material="ABS")
+            adv_art = advise_offline(self._proj(("PLA",)), plan_abs_brim, goal_art)
+            brim_adv = next((a for a in adv_art if a.key == "brim_type"), None)
+            self.assertIsNotNone(brim_adv, f"brim_type='no_brim' ausente em ABS + {purp}/{clearance}")
+            self.assertEqual(brim_adv.proposed, "no_brim")
+
+        # E alerta de peça esbelta avalia contra o brim planejado (não dispara alerta de 'sem brim' quando brim já foi proposto!)
+        proj_slender = replace(
+            self._proj(("PLA",)),
+            geometry_summary=GeometrySummary(1000, 1, (0, 0, 0, 12, 12, 80), 12.0, 12.0, 80.0, 100.0, 10.0, True),
+        )
+        plan_abs_nobrim = self._plan(self.fil_abs, self.abs_settings, brim_type="no_brim")
+        adv_slender = advise_offline(proj_slender, plan_abs_nobrim, PrintGoal("esforco", "equilibrio", physical_material="ABS"))
+        brim_planned = next((a for a in adv_slender if a.key == "brim_type" and a.default_on), None)
+        self.assertIsNotNone(brim_planned)
+        self.assertNotEqual(brim_planned.proposed, "no_brim")
+        self.assertFalse(
+            any("esbelta" in a.title.lower() and "sem brim" in a.title.lower() for a in adv_slender),
+            "Não deve alertar 'peça esbelta sem brim' quando outer_brim já foi planejado!",
+        )
+
+        # (d) velocidade não pode subir layer_height para 0.24 em usos articulados
+        plan_pla_016 = self._plan(self.fil_pla, self.pla_settings, layer_height="0.16")
+        for purp, clearance in (("moveis", "normal"), ("chaveiro_articulado", "normal"), ("encaixe", "partes_moveis")):
+            adv_vel = advise_offline(proj_big_oh, plan_pla_016, PrintGoal(purp, "velocidade", fit_clearance=clearance, physical_material="PLA"))
+            lh_adv = next((a for a in adv_vel if a.key == "layer_height"), None)
+            if lh_adv is not None:
+                self.assertLessEqual(float(lh_adv.proposed), 0.20)
+
+        # (e) build_print_summary verifica explicitamente se additional_cooling_fan_speed == "0" nos slots ABS
+        abs_aux_bad = {**self.abs_settings, "additional_cooling_fan_speed": ["60"]}
+        plan_aux_bad = self._plan(self.fil_abs, abs_aux_bad)
+        sum_bad = build_print_summary(self._proj(("PLA",)), plan_aux_bad, PrintGoal("esforco", "equilibrio", physical_material="ABS"), [])
+        self.assertIn("aux", sum_bad.lower())
+        self.assertIn("60", sum_bad)
+
+        abs_aux_ok = {**self.abs_settings, "additional_cooling_fan_speed": ["0"]}
+        plan_aux_ok = self._plan(self.fil_abs, abs_aux_ok)
+        sum_ok = build_print_summary(self._proj(("PLA",)), plan_aux_ok, PrintGoal("esforco", "equilibrio", physical_material="ABS"), [])
+        self.assertIn("desligada", sum_ok.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

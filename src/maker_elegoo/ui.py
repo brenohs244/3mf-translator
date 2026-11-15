@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import queue
-import json
 import base64
+import json
+import os
+import queue
 import subprocess
 import tempfile
 import threading
@@ -24,6 +25,7 @@ from .codex_evidence import (build_codex_evidence,
                              validate_codex_recommendations, verify_process_recommendation)
 from .credentials import clear_gemini_key, get_gemini_key, save_gemini_key
 from .gcode_audit import summarize_gcode_audit
+from .geometry_check import analyze_project_geometry
 from .history import (
     VISUAL_RESULTS,
     FeedbackRecord,
@@ -377,11 +379,15 @@ class MakerElegooApp(tk.Tk):
         self.professor_queue: queue.Queue = queue.Queue()
         self.orientation_queue: queue.Queue = queue.Queue()
         self.comparison_queue: queue.Queue = queue.Queue()
+        self.inspect_queue: queue.Queue = queue.Queue()
+        self.preview_queue: queue.Queue = queue.Queue()
+        self.calib_queue: queue.Queue = queue.Queue()
         self.orientation_cancel = threading.Event()
         self.orientation_dialog: tk.Toplevel | None = None
         self.orientation_analysis: OrientationAnalysis | None = None
         self.orientation_plan: ConversionPlan | None = None
         self.orientation_generation = 0
+        self._inspect_generation = 0
         self._pending_scale_advices: list[Advice] = []
 
         self.file_var = tk.StringVar()
@@ -405,6 +411,7 @@ class MakerElegooApp(tk.Tk):
         self.preconversion_var = tk.StringVar(
             value="Escolha um projeto 3MF e confirme o filamento físico carregado na ELEGOO."
         )
+        self.result_banner_var = tk.StringVar(value="")
         self.ai_model_var = tk.StringVar(value=self.preferences.get("ai_model", "gemini-3.8-flash"))
         self.scale_mode_var = tk.StringVar(value="Original (100%)")
         self.scale_value_var = tk.StringVar(value="")
@@ -432,10 +439,16 @@ class MakerElegooApp(tk.Tk):
         self._professor_after = self.after(150, self._poll_professor)
         self._orientation_after = self.after(150, self._poll_orientation)
         self._comparison_after = self.after(150, self._poll_comparison)
+        self._inspect_after = self.after(150, self._poll_inspect)
+        self._preview_after = self.after(100, self._poll_preview)
+        self._calib_after = self.after(150, self._poll_calib)
 
     def destroy(self):
         self.orientation_cancel.set()
-        for name in ("_worker_after", "_ai_after", "_professor_after", "_orientation_after", "_comparison_after"):
+        for name in (
+            "_worker_after", "_ai_after", "_professor_after", "_orientation_after",
+            "_comparison_after", "_inspect_after", "_preview_after", "_calib_after",
+        ):
             callback = getattr(self, name, None)
             if callback is not None:
                 self.after_cancel(callback)
@@ -444,12 +457,13 @@ class MakerElegooApp(tk.Tk):
     def _build_layout(self):
         menu = tk.Menu(self)
         tools_menu = tk.Menu(menu, tearoff=False)
+        tools_menu.add_command(label="Localizar ELEGOO Slicer", command=self._choose_slicer)
         tools_menu.add_command(label="Configurar Chave Google Gemini", command=self._configure_gemini_key)
         tools_menu.add_command(label="Ajuste guiado sem API (copiar/colar JSON)", command=self._manual_ai)
         tools_menu.add_command(label="Analisar orientação de figura", command=self._orientation_open)
         tools_menu.add_command(label="Prévia de compatibilidade", command=self._preview_compatibility)
         tools_menu.add_command(label="Salvar relatório", command=self._save_report)
-        tools_menu.add_command(label="Comparar objetivos de impressão", command=self._compare_objectives)
+        tools_menu.add_command(label="Comparar objetivos de impressão (5 alternativas)", command=self._compare_objectives)
         tools_menu.add_command(label="Comparar placas antes/depois", command=self._show_plate_comparison)
         tools_menu.add_command(label="Prévia visual: 1ª camada e overhangs", command=self._preview_layer1_dialog)
         tools_menu.add_command(label="Gerar 3MF de calibração (50 mm + folgas)", command=self._generate_calibration_dialog)
@@ -495,6 +509,19 @@ class MakerElegooApp(tk.Tk):
             command=self._on_physical_filament_changed,
         )
         self.physical_confirm_chk.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.missing_slicer_banner = ttk.Frame(printer_simple)
+        self.missing_slicer_banner.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        ttk.Label(
+            self.missing_slicer_banner,
+            text="⚠ ELEGOO Slicer não encontrado automaticamente neste PC.",
+            foreground="#B00020",
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            self.missing_slicer_banner,
+            text="Localizar ELEGOO Slicer",
+            command=self._choose_slicer,
+        ).pack(side="left")
+        self.missing_slicer_banner.grid_remove()
 
         consultant = ttk.LabelFrame(outer, text="3  Professor de Impressão e Cartão Pré-Conversão", padding=10)
         consultant.pack(fill="x", pady=(0, 8))
@@ -545,6 +572,8 @@ class MakerElegooApp(tk.Tk):
         self.convert_button.pack(side="left")
         self.open_button = ttk.Button(actions, text="Abrir no ELEGOO Slicer", command=self._open_result, state="disabled")
         self.open_button.pack(side="left", padx=(8, 0))
+        self.open_folder_button = ttk.Button(actions, text="Abrir pasta", command=self._open_result_folder, state="disabled")
+        self.open_folder_button.pack(side="left", padx=(6, 0))
         self.feedback_button = ttk.Button(actions, text="Registrar resultado da impressão", command=self._open_feedback_dialog)
         self.feedback_button.pack(side="left", padx=(8, 0))
         self.advanced_toggle_btn = ttk.Button(actions, text="Mostrar detalhes avançados ▾", command=self._toggle_advanced)
@@ -613,6 +642,14 @@ class MakerElegooApp(tk.Tk):
 
         self.report_frame = ttk.LabelFrame(outer, text="4  Análise e relatório", padding=8)
         self.report_frame.pack(fill="both", expand=True)
+        self.result_banner_label = ttk.Label(
+            self.report_frame,
+            textvariable=self.result_banner_var,
+            foreground="#146C2E",
+            wraplength=920,
+            justify="left",
+        )
+        self.result_banner_label.pack(anchor="w", pady=(0, 4))
         self.report = scrolledtext.ScrolledText(self.report_frame, wrap="word", font=("Consolas", 10), state="disabled")
         self.report.pack(fill="both", expand=True)
         self._set_report("O arquivo original permanece intacto. O G-code de validação é temporário e nunca é enviado à impressora.")
@@ -664,11 +701,12 @@ class MakerElegooApp(tk.Tk):
             messagebox.showerror("Comparação", str(exc))
             return
         project, install = self.project, self.install
+        goal = self._current_goal()
         self.status_var.set("Fatiando variantes...")
 
         def work():
             try:
-                variants = compare_objectives(project, plan, Path(folder), SlicerCLI(install.executable))
+                variants = compare_objectives(project, plan, Path(folder), SlicerCLI(install.executable), goal=goal)
                 self.comparison_queue.put((variants, None))
             except Exception as exc:
                 self.comparison_queue.put((None, exc))
@@ -767,9 +805,12 @@ class MakerElegooApp(tk.Tk):
 
     def _on_physical_filament_changed(self):
         raw_mat = self.physical_material_var.get().strip()
-        if (
-            raw_mat not in {"", "Não sei informar"}
-            and self.project is not None
+        if raw_mat in {"", "Não sei informar"}:
+            if self.physical_filament_confirmed_var.get():
+                self.physical_filament_confirmed_var.set(False)
+                self.status_var.set("Escolha o material físico carregado (não use 'Não sei informar')")
+        elif (
+            self.project is not None
             and self.filament_profiles
             and self.filament_vars
         ):
@@ -800,7 +841,11 @@ class MakerElegooApp(tk.Tk):
         else:
             self.confidence_var.set(f"Confiança da recomendação: {conf_txt}")
 
-        if not self.project or not self.install:
+        if not self.project:
+            self.preconversion_var.set("Escolha um projeto 3MF e confirme o filamento físico carregado na ELEGOO.")
+            return
+        if not self.install:
+            self.preconversion_var.set("Localize o ELEGOO Slicer para carregar perfis e montar o cartão pré-conversão.")
             return
         try:
             machine, process, filaments = self._selected_profiles()
@@ -816,8 +861,8 @@ class MakerElegooApp(tk.Tk):
                 advices=advices,
             )
             self.preconversion_var.set(card)
-        except (ValueError, IndexError, StopIteration, ProfileError):
-            pass
+        except (ValueError, IndexError, StopIteration, ProfileError) as exc:
+            self.preconversion_var.set(f"Não foi possível montar o cartão pré-conversão: {exc}")
 
     def _save_preferences(self):
         save_settings({
@@ -866,6 +911,8 @@ class MakerElegooApp(tk.Tk):
                 standard = f"Elegoo Centauri Carbon 2 {nozzle} nozzle"
                 self.machine_var.set(standard if standard in options else options[0])
             self._refresh_dependents()
+            if hasattr(self, "missing_slicer_banner"):
+                self.missing_slicer_banner.grid_remove()
             self.status_var.set(f"Perfis carregados para bico {nozzle} mm")
             self._save_preferences()
         except (ProfileError, OSError) as exc:
@@ -875,6 +922,8 @@ class MakerElegooApp(tk.Tk):
             self.filament_profiles = []
             self.machine_combo["values"] = ()
             self.process_combo["values"] = ()
+            if hasattr(self, "missing_slicer_banner"):
+                self.missing_slicer_banner.grid()
             self.status_var.set(str(exc))
         finally:
             self._refreshing_profiles = False
@@ -924,11 +973,13 @@ class MakerElegooApp(tk.Tk):
         if self.orientation_dialog and self.orientation_dialog.winfo_exists():
             self._orientation_close()
         try:
-            self.project = inspect_project(Path(self.file_var.get()))
+            src_path = Path(self.file_var.get())
+            self.project = inspect_project(src_path, include_geometry=False)
             self.result = None
             self.last_plan = None
             self.orientation_analysis = None
             self.orientation_plan = None
+            self.result_banner_var.set("")
             # Nunca presumir filamento físico == 3MF ao analisar novo projeto
             self.physical_filament_confirmed_var.set(False)
             self.physical_material_var.set("Não sei informar")
@@ -936,15 +987,53 @@ class MakerElegooApp(tk.Tk):
             self.ai_button.configure(state="disabled")
             self.orientation_button.configure(state="normal")
             self.open_button.configure(state="disabled")
+            self.open_folder_button.configure(state="disabled")
             self._set_report(format_project_summary(self.project))
             self._refresh_dependents(prefer_suggested=True)
             self._update_context_preview()
-            self.status_var.set("Projeto analisado — confirme o filamento físico")
+            self._inspect_generation += 1
+            gen = self._inspect_generation
+            if getattr(self.project, "geometry_summary", None) is None and src_path.is_file():
+                self.status_var.set("Projeto analisado (lendo geometria 3D...) — confirme o filamento físico")
+
+                def work_geom():
+                    geom = None
+                    try:
+                        parsed = analyze_project_geometry(src_path)
+                        if parsed.triangle_count > 0:
+                            geom = parsed
+                    except Exception:
+                        geom = None
+                    self.inspect_queue.put((gen, src_path, geom))
+
+                threading.Thread(target=work_geom, daemon=True).start()
+            else:
+                self.status_var.set("Projeto analisado — confirme o filamento físico")
             self._save_preferences()
         except Exception as exc:
             self.project = None
+            self.result_banner_var.set("")
             self.orientation_button.configure(state="disabled")
+            self.open_button.configure(state="disabled")
+            self.open_folder_button.configure(state="disabled")
+            self._update_context_preview()
             messagebox.showerror("Não foi possível analisar", str(exc))
+
+    def _poll_inspect(self):
+        try:
+            gen, src_path, geom = self.inspect_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if (gen == self._inspect_generation and self.project is not None
+                    and self.project.path == src_path and geom is not None):
+                self.project = replace(self.project, geometry_summary=geom)
+                if self.result is None:
+                    self._set_report(format_project_summary(self.project))
+                self._update_context_preview()
+                if "lendo geometria 3D" in self.status_var.get():
+                    self.status_var.set("Projeto analisado — confirme o filamento físico")
+        self._inspect_after = self.after(150, self._poll_inspect)
 
     def _render_filaments(self):
         for child in self.filament_frame.winfo_children():
@@ -1164,8 +1253,7 @@ class MakerElegooApp(tk.Tk):
                     self.orientation_report.configure(state="disabled")
                     self.orientation_message.set("Cópia validada" if payload.success else "Falha; confira o relatório")
                     self.status_var.set(self.orientation_message.get())
-                    if payload.destination.exists():
-                        self.open_button.configure(state="normal")
+                    self._apply_result_actions(payload)
                     self.orientation_analyze_button.configure(state="normal")
                 elif kind == "error":
                     self.orientation_busy = False
@@ -1177,7 +1265,7 @@ class MakerElegooApp(tk.Tk):
             pass
         self._orientation_after = self.after(150, self._poll_orientation)
 
-    def _configure_gemini_key(self):
+    def _configure_gemini_key(self, *, on_saved=None):
         dialog = tk.Toplevel(self)
         dialog.title("Configurar Chave Google Gemini")
         dialog.geometry("540x260")
@@ -1210,6 +1298,8 @@ class MakerElegooApp(tk.Tk):
                 save_gemini_key(k)
                 messagebox.showinfo("Sucesso", "Chave salva com sucesso!", parent=dialog)
                 dialog.destroy()
+                if on_saved is not None:
+                    on_saved()
             else:
                 messagebox.showwarning("Aviso", "Informe uma chave de API válida.", parent=dialog)
 
@@ -1277,11 +1367,29 @@ class MakerElegooApp(tk.Tk):
         return None, num
 
     def _convert(self):
-        if not self.project or not self.install:
-            messagebox.showinfo("Dados incompletos", "Analise um 3MF e localize o ELEGOO Slicer primeiro.")
+        if not self.project:
+            messagebox.showinfo("Dados incompletos", "Escolha e analise um projeto 3MF primeiro.", parent=self)
+            return
+        if not self.install:
+            if messagebox.askyesno(
+                "ELEGOO Slicer não encontrado",
+                "Nenhum executável do ELEGOO Slicer está configurado.\n\nDeseja localizar elegoo-slicer.exe agora?",
+                parent=self,
+            ):
+                self._choose_slicer()
+            return
+        mat_label = self.physical_material_var.get().strip()
+        if mat_label in {"", "Não sei informar"}:
+            self.physical_filament_confirmed_var.set(False)
+            messagebox.showwarning(
+                "Informe o filamento físico",
+                "Selecione em '2  Sua ELEGOO e Filamento Físico' qual filamento realmente está carregado na impressora (ex.: PLA, PETG, ABS, ASA).\n\n"
+                "Não é possível confirmar 'Não sei informar'.",
+                parent=self,
+            )
+            self.status_var.set("Selecione o filamento físico carregado antes de traduzir")
             return
         if not self.physical_filament_confirmed_var.get():
-            mat_label = self.physical_material_var.get()
             if not messagebox.askyesno(
                 "Confirmar filamento físico",
                 f"Filamento selecionado: {mat_label}.\n\n"
@@ -1356,29 +1464,33 @@ class MakerElegooApp(tk.Tk):
 
         # Obter conselhos do Professor (Offline ou IA em thread separada)
         if self.mode_var.get() == "ai":
+            def _launch_gemini(api_key: str) -> None:
+                if not api_key:
+                    return
+                consent = messagebox.askyesno(
+                    "Autorizar envio ao Google Gemini",
+                    "Enviar resumo textual (materiais de origem/destino, uso, prioridade, bico e parâmetros permitidos) ao Google Gemini?\n\n"
+                    "O arquivo 3MF, a malha e o G-code NÃO serão enviados.",
+                    parent=self,
+                )
+                if not consent:
+                    self.status_var.set("Conversão cancelada pelo usuário")
+                    return
+                self.convert_button.configure(state="disabled")
+                self.status_var.set("Consultando Professor IA (Google Gemini)...")
+                self._start_gemini_professor(self.project, plan, goal, destination, api_key, self.ai_model_var.get())
+
             key = get_gemini_key()
             if not key:
-                if messagebox.askyesno("Chave Ausente", "Nenhuma chave Gemini salva. Deseja configurar agora?"):
-                    self._configure_gemini_key()
+                if messagebox.askyesno("Chave Ausente", "Nenhuma chave Gemini salva. Deseja configurar agora?", parent=self):
+                    self._configure_gemini_key(on_saved=lambda: _launch_gemini(get_gemini_key() or ""))
                     return
                 self.mode_var.set("offline")
                 advices = advise_offline(self.project, plan, goal)
                 self._finish_professor_lookup(plan, destination, advices, goal=goal)
                 return
 
-            consent = messagebox.askyesno(
-                "Autorizar envio ao Google Gemini",
-                "Enviar resumo textual (materiais de origem/destino, uso, prioridade, bico e parâmetros permitidos) ao Google Gemini?\n\n"
-                "O arquivo 3MF, a malha e o G-code NÃO serão enviados.",
-                parent=self,
-            )
-            if not consent:
-                self.status_var.set("Conversão cancelada pelo usuário")
-                return
-
-            self.convert_button.configure(state="disabled")
-            self.status_var.set("Consultando Professor IA (Google Gemini)...")
-            self._start_gemini_professor(self.project, plan, goal, destination, key, self.ai_model_var.get())
+            _launch_gemini(key)
             return
 
         advices = advise_offline(self.project, plan, goal)
@@ -1663,7 +1775,7 @@ class MakerElegooApp(tk.Tk):
         if mat_default in {"", "Não sei informar"}:
             mat_default = "PLA"
         mat_var = tk.StringVar(value=mat_default)
-        purp_var = tk.StringVar(value=purpose_code(self.purpose_var.get()))
+        purp_label_var = tk.StringVar(value=purpose_label(purpose_code(self.purpose_var.get())))
         result_by_label = {label: code for code, label in VISUAL_RESULTS.items()}
         vis_label_var = tk.StringVar(value=VISUAL_RESULTS["aprovado"])
         brand_var = tk.StringVar()
@@ -1684,8 +1796,8 @@ class MakerElegooApp(tk.Tk):
         ).grid(row=0, column=1, sticky="ew")
         ttk.Label(form, text="Marca / cor / lote:").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
         ttk.Entry(form, textvariable=brand_var).grid(row=1, column=1, sticky="ew", pady=(6, 0))
-        ttk.Label(form, text="Uso principal (código):").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        ttk.Combobox(form, textvariable=purp_var, values=tuple(PURPOSE_LABELS.keys()), state="readonly").grid(
+        ttk.Label(form, text="Uso principal:").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
+        ttk.Combobox(form, textvariable=purp_label_var, values=tuple(PURPOSE_LABELS.values()), state="readonly").grid(
             row=2, column=1, sticky="ew", pady=(6, 0)
         )
         ttk.Label(form, text="Resultado observado:").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
@@ -1748,7 +1860,7 @@ class MakerElegooApp(tk.Tk):
             vis_code = result_by_label.get(vis_label_var.get(), "aprovado")
             self._record_feedback(
                 target_material=mat_var.get(),
-                purpose=purp_var.get(),
+                purpose=purpose_code(purp_label_var.get()),
                 visual_result=vis_code,
                 notes=notes_var.get(),
                 filament_brand=brand_var.get(),
@@ -1760,6 +1872,12 @@ class MakerElegooApp(tk.Tk):
             dialog.destroy()
 
         def clear_hist():
+            if not messagebox.askyesno(
+                "Confirmar limpeza",
+                "Apagar todo o histórico local de impressões salvo neste computador?",
+                parent=dialog,
+            ):
+                return
             clear_feedback_history()
             self.status_var.set("Histórico local limpo")
             self._update_context_preview()
@@ -1787,30 +1905,57 @@ class MakerElegooApp(tk.Tk):
                 neck_z = geom.neck_findings[0].z_mm
         if src_path is None:
             messagebox.showinfo("Prévia visual", "Analise um projeto 3MF primeiro.", parent=self)
-            return
-        preview = render_layer1_and_overhang_preview(src_path, gcode_audit=audit_plate, neck_z_mm=neck_z)
+            return None
         dialog = tk.Toplevel(self)
         dialog.title("Prévia local: 1ª camada e saliências (>45°)")
-        dialog.geometry("420x460")
+        dialog.geometry("420x470")
         dialog.transient(self)
         frame = ttk.Frame(dialog, padding=12)
         frame.pack(fill="both", expand=True)
-        img = tk.PhotoImage(data=preview.ppm_bytes)
-        lbl = ttk.Label(frame, image=img)
-        lbl.image = img
-        lbl.pack(pady=(0, 8))
-        ttk.Label(frame, text=preview.legend, wraplength=380, foreground="#1F3A52").pack(anchor="w")
-        stats_txt = (
-            f"Apoio estimado na mesa: {preview.contact_area_mm2:.0f} mm² · "
-            f"Saliências >45°: {preview.overhang_area_mm2:.0f} mm²"
-        )
-        if audit_plate is not None:
-            stats_txt += f" · Ilhas na 1ª camada: {audit_plate.layer1_island_count}"
-        if neck_z is not None:
-            stats_txt += f" · Pescoço detectado em Z≈{neck_z:.1f} mm"
-        ttk.Label(frame, text=stats_txt, wraplength=380).pack(anchor="w", pady=(4, 8))
+        img_lbl = ttk.Label(frame, text="Renderizando prévia visual em segundo plano...")
+        img_lbl.pack(pady=(0, 8))
+        legend_lbl = ttk.Label(frame, text="", wraplength=380, foreground="#1F3A52")
+        legend_lbl.pack(anchor="w")
+        stats_lbl = ttk.Label(frame, text="", wraplength=380)
+        stats_lbl.pack(anchor="w", pady=(4, 8))
         ttk.Button(frame, text="Fechar", command=dialog.destroy).pack(anchor="e")
+
+        def work_preview():
+            try:
+                preview = render_layer1_and_overhang_preview(src_path, gcode_audit=audit_plate, neck_z_mm=neck_z)
+                self.preview_queue.put((dialog, img_lbl, legend_lbl, stats_lbl, audit_plate, neck_z, preview, None))
+            except Exception as exc:
+                self.preview_queue.put((dialog, img_lbl, legend_lbl, stats_lbl, audit_plate, neck_z, None, exc))
+
+        threading.Thread(target=work_preview, daemon=True).start()
         return dialog
+
+    def _poll_preview(self):
+        try:
+            dialog, img_lbl, legend_lbl, stats_lbl, audit_plate, neck_z, preview, error = self.preview_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if dialog.winfo_exists():
+                if error:
+                    img_lbl.configure(text="Falha ao renderizar prévia visual.")
+                    stats_lbl.configure(text=str(error))
+                    messagebox.showerror("Prévia visual", str(error), parent=dialog)
+                elif preview is not None:
+                    img = tk.PhotoImage(data=preview.ppm_bytes)
+                    img_lbl.configure(image=img, text="")
+                    img_lbl.image = img
+                    legend_lbl.configure(text=preview.legend)
+                    stats_txt = (
+                        f"Apoio estimado na mesa: {preview.contact_area_mm2:.0f} mm² · "
+                        f"Saliências >45°: {preview.overhang_area_mm2:.0f} mm²"
+                    )
+                    if audit_plate is not None:
+                        stats_txt += f" · Ilhas na 1ª camada: {audit_plate.layer1_island_count}"
+                    if neck_z is not None:
+                        stats_txt += f" · Pescoço detectado em Z≈{neck_z:.1f} mm"
+                    stats_lbl.configure(text=stats_txt)
+        self._preview_after = self.after(100, self._poll_preview)
 
     def _generate_calibration_dialog(self):
         if not self.install:
@@ -1822,6 +1967,7 @@ class MakerElegooApp(tk.Tk):
             messagebox.showinfo("Calibração", "Selecione bico, processo e filamento primeiro.", parent=self)
             return
         fil = filaments[0]
+        install = self.install
         dest = filedialog.asksaveasfilename(
             title="Salvar 3MF de calibração (barra 50 mm + folgas)",
             initialfile="Calibracao_CC2_50mm_Folgas.3mf",
@@ -1837,11 +1983,23 @@ class MakerElegooApp(tk.Tk):
 
         def run_calib():
             try:
-                res = export_calibration_3mf(self.install, machine, process, fil, dest_path)
+                res = export_calibration_3mf(install, machine, process, fil, dest_path)
+                self.calib_queue.put((dest_path, res, None))
             except Exception as exc:
-                self.after(0, lambda: messagebox.showerror("Calibração", str(exc), parent=self))
-                return
-            def finish():
+                self.calib_queue.put((dest_path, None, exc))
+
+        threading.Thread(target=run_calib, daemon=True).start()
+
+    def _poll_calib(self):
+        try:
+            dest_path, res, error = self.calib_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            if error:
+                self.status_var.set("Falha ao gerar calibração")
+                messagebox.showerror("Calibração", str(error), parent=self)
+            elif res is not None:
                 self.status_var.set("Calibração pronta" if res.success else "Falha ao fatiar calibração")
                 if res.success:
                     time_txt = format_duration(res.validation.estimated_seconds) if res.validation else "n/d"
@@ -1856,9 +2014,7 @@ class MakerElegooApp(tk.Tk):
                     )
                 else:
                     messagebox.showerror("Calibração", res.message, parent=self)
-            self.after(0, finish)
-
-        threading.Thread(target=run_calib, daemon=True).start()
+        self._calib_after = self.after(150, self._poll_calib)
 
     def _execute_conversion(self, plan: ConversionPlan, destination: str,
                             *, professor_advices: list[Advice] | tuple[Advice, ...] = ()):
@@ -1910,6 +2066,12 @@ class MakerElegooApp(tk.Tk):
             if error:
                 self.status_var.set("Falha na conversão")
                 self._set_report(str(error))
+                self.open_button.configure(state="disabled")
+                self.open_folder_button.configure(state="disabled")
+                self.result_banner_label.configure(foreground="#B3261E")
+                self.result_banner_var.set(
+                    "Erro durante a conversão: NÃO imprima. Confira os detalhes no relatório abaixo."
+                )
             else:
                 self.result = result
                 self.last_plan = plan
@@ -1919,8 +2081,7 @@ class MakerElegooApp(tk.Tk):
                         f"  • {item.target_key} = {item.value}: {item.reason}" for item in approved)
                 self._set_report(report)
                 self.status_var.set("Concluído" if result.success else "Falha; confira o relatório")
-                if result.destination.exists():
-                    self.open_button.configure(state="normal")
+                self._apply_result_actions(result)
                 if result.output_project:
                     self.ai_button.configure(state="normal")
         self._worker_after = self.after(150, self._poll_worker)
@@ -2007,8 +2168,22 @@ class MakerElegooApp(tk.Tk):
         if self.ai_provider_var.get() == "Codex":
             self._analyze_codex()
             return
-        key = get_gemini_key() or simpledialog.askstring("Gemini", "Chave de API Gemini (não será salva):", show="*", parent=self)
+        key = get_gemini_key()
         if not key:
+            if messagebox.askyesno(
+                "Chave Gemini Ausente",
+                "Nenhuma chave Gemini salva. Deseja configurar e salvar com segurança (Windows DPAPI) agora?\n\n"
+                "(Se escolher 'Não', você ainda poderá informar uma chave apenas para esta análise.)",
+                parent=self,
+            ):
+                self._configure_gemini_key(on_saved=lambda: self._run_gemini_unmapped_analysis(get_gemini_key() or ""))
+                return
+            key = simpledialog.askstring("Gemini", "Chave de API Gemini (não será salva):", show="*", parent=self)
+        if key:
+            self._run_gemini_unmapped_analysis(key)
+
+    def _run_gemini_unmapped_analysis(self, key: str):
+        if not key or not self.result or not self.last_plan:
             return
         consent = messagebox.askyesno(
             "Autorizar envio ao Gemini",
@@ -2120,8 +2295,7 @@ class MakerElegooApp(tk.Tk):
                     self.last_plan = plan
                     self._set_report(format_conversion_report(result, plan))
                     self.status_var.set("Cópia orientada validada" if result.success else "Falha; confira relatório")
-                    if result.success and result.destination.exists():
-                        self.open_button.configure(state="normal")
+                    self._apply_result_actions(result)
                 self._ai_after = self.after(150, self._poll_ai)
                 return
             if len(item) == 6 and item[0] == "codex":
@@ -2234,26 +2408,63 @@ class MakerElegooApp(tk.Tk):
             label = "Equivalência" if item.kind == "mapping" else "Recurso ELEGOO"
             listing.insert("end", f"{label}: {item.source_key or 'extra'} → {item.target_key} = {item.value} [{item.confidence}] — {item.reason}")
 
-        def approve():
+        def _select_and_approve(*, reconvert: bool):
             if single and (self.project, self.last_plan, self.orientation_analysis) != context:
                 messagebox.showerror("Análise desatualizada", "Projeto ou perfis mudaram. Repita a análise.")
                 dialog.destroy()
                 return
-            self.ai_approved = [suggestions[index] for index in listing.curselection()]
+            chosen = [suggestions[index] for index in listing.curselection()]
+            if reconvert and not chosen:
+                messagebox.showinfo("Nenhuma sugestão selecionada", "Selecione ao menos uma sugestão na lista.", parent=dialog)
+                return
+            self.ai_approved = chosen
             self.status_var.set(f"{len(self.ai_approved)} sugestões aprovadas; converta novamente para aplicá-las")
             dialog.destroy()
+            if reconvert:
+                self._convert()
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(10, 0))
-        ttk.Button(buttons, text="Aplicar selecionadas na próxima conversão", command=approve).pack(side="left")
+        ttk.Button(buttons, text="Aprovar e converter novamente agora",
+                   command=lambda: _select_and_approve(reconvert=True)).pack(side="left")
+        ttk.Button(buttons, text="Aplicar selecionadas na próxima conversão",
+                   command=lambda: _select_and_approve(reconvert=False)).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="right")
 
+    def _apply_result_actions(self, result):
+        valid = bool(result and result.success and result.destination.exists())
+        state = "normal" if valid else "disabled"
+        self.open_button.configure(state=state)
+        self.open_folder_button.configure(state=state)
+        if valid:
+            self.result_banner_label.configure(foreground="#146C2E")
+            self.result_banner_var.set(
+                f"Pronto! Arquivo validado pelo ELEGOO Slicer: {result.destination.name} — você já pode abrir no fatiador."
+            )
+        else:
+            self.result_banner_label.configure(foreground="#B3261E")
+            self.result_banner_var.set(
+                "Conversão falhou na validação: NÃO imprima este arquivo. Confira os detalhes no relatório abaixo."
+            )
+
     def _open_result(self):
-        if self.result and self.result.destination.exists() and self.install:
+        if self.result and self.result.success and self.result.destination.exists() and self.install:
             try:
                 subprocess.Popen([str(self.install.executable), str(self.result.destination)])
             except OSError as exc:
                 messagebox.showerror("Não foi possível abrir", str(exc))
+
+    def _open_result_folder(self):
+        if not self.result or not self.result.success or not self.result.destination.exists():
+            return
+        target_dir = self.result.destination.parent
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(str(target_dir))
+            else:
+                subprocess.Popen(["explorer", str(target_dir)])
+        except OSError as exc:
+            messagebox.showerror("Não foi possível abrir pasta", str(exc))
 
 
 def launch_app() -> None:
