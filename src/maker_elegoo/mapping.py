@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .materials import Finding, analyze_material_change
 from .profiles import Profile, SlicerInstall, machine_family_names, resolve_profile
 from .project import ProjectInfo
+from .supports import compute_easy_support_settings, resolve_target_polymer
 
 
 # Ajustes de intenção do modelo; velocidades, acelerações e temperaturas vêm do ELEGOO.
@@ -14,8 +15,11 @@ TRANSFERABLE = {
     "wall_loops", "wall_generator", "top_shell_layers", "bottom_shell_layers",
     "sparse_infill_density", "sparse_infill_pattern",
     "enable_support", "support_type", "support_style",
-    "support_top_z_distance", "support_interface_top_layers", "support_threshold_angle",
-    "support_on_build_plate_only", "brim_type", "brim_width",
+    "support_top_z_distance", "support_bottom_z_distance", "support_object_xy_distance",
+    "support_interface_top_layers", "support_interface_bottom_layers",
+    "support_interface_spacing", "support_interface_pattern",
+    "support_threshold_angle", "support_on_build_plate_only",
+    "brim_type", "brim_width",
     "seam_position", "ironing_type", "detect_thin_wall", "enable_prime_tower",
 }
 
@@ -69,14 +73,28 @@ def _valid_transfer(key: str, value: object) -> bool:
             "default", "grid", "snug",
             "tree_auto", "tree_slim", "tree_strong", "tree_hybrid", "organic",
         }
-    if key == "support_top_z_distance":
+    if key in {"support_top_z_distance", "support_bottom_z_distance"}:
         try:
             dist = float(value)
             return 0.0 <= dist <= 1.0
         except ValueError:
             return False
-    if key == "support_interface_top_layers":
+    if key == "support_object_xy_distance":
+        try:
+            dist = float(value)
+            return 0.0 <= dist <= 2.0
+        except ValueError:
+            return False
+    if key in {"support_interface_top_layers", "support_interface_bottom_layers"}:
         return value.isdigit() and 0 <= int(value) <= 10
+    if key == "support_interface_spacing":
+        try:
+            sp = float(value)
+            return 0.0 <= sp <= 2.0
+        except ValueError:
+            return False
+    if key == "support_interface_pattern":
+        return value in {"auto", "rectilinear", "rectilinear_interlaced", "concentric", "grid"}
     if key == "support_threshold_angle":
         try:
             angle = float(value)
@@ -165,6 +183,27 @@ def build_conversion(project: ProjectInfo, install: SlicerInstall, machine: Prof
     )
     if single_plate_multicolor and "enable_prime_tower" in process_settings:
         process_settings["enable_prime_tower"] = "1"
+    # Pré-configura distâncias/interface de fácil remoção conforme altura de camada, bico e polímero,
+    # preservando eventuais overrides explícitos trazidos do projeto de origem.
+    try:
+        base_lh = float(str(process_settings.get("layer_height", "0.2")))
+    except ValueError:
+        base_lh = 0.2
+    try:
+        nozzle_val = float(nozzle)
+    except ValueError:
+        nozzle_val = 0.4
+    target_poly = resolve_target_polymer(project, filament_settings)
+    eff_stype = str(process_settings.get("support_type", "tree(auto)"))
+    easy_support = compute_easy_support_settings(
+        base_lh,
+        nozzle_val,
+        target_poly,
+        support_type=eff_stype,
+    )
+    for skey, sval in easy_support.items():
+        if skey in process_settings and skey not in transferred:
+            process_settings[skey] = sval
     repairs: dict[str, str | None] = {
         key: replacement for key, replacement in SOURCE_REPAIRS.items()
         if project.source_settings.get(key) == "-1"

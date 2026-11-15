@@ -113,7 +113,8 @@ class ProfessorV2AndKeychainsTests(unittest.TestCase):
         self.assertEqual(by_key.get("inner_wall_speed"), "120")
         self.assertEqual(by_key.get("top_surface_speed"), "100")
         self.assertEqual(by_key.get("support_style"), "tree_slim")
-        self.assertEqual(by_key.get("support_top_z_distance"), "0.16")
+        # Em camada de 0.12 mm, fácil remoção usa 2× camada (0.24 mm) em vez de 0.16 mm apertado.
+        self.assertEqual(by_key.get("support_top_z_distance"), "0.24")
 
         # Suporte via object_override quando global está desligado
         proj_obj_sup = ProjectInfo(
@@ -130,7 +131,7 @@ class ProfessorV2AndKeychainsTests(unittest.TestCase):
         adv_obj = advise_offline(proj_obj_sup, plan_global_off, PrintGoal("decorativa", "qualidade"))
         obj_keys = {a.key: a.proposed for a in adv_obj if a.key}
         self.assertEqual(obj_keys.get("support_style"), "tree_slim")
-        self.assertEqual(obj_keys.get("support_top_z_distance"), "0.16")
+        self.assertEqual(obj_keys.get("support_top_z_distance"), "0.24")
         self.assertTrue(any(a.scope == "alert" and "cli" in a.why.lower() and "detectada" in a.why.lower() for a in adv_obj))
 
         # Não-decorativa + qualidade mantém 0.16 e 80

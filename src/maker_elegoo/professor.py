@@ -19,6 +19,7 @@ from .labels import (
 )
 from .mapping import ConversionPlan
 from .project import ProjectInfo
+from .supports import compute_easy_support_settings, resolve_target_polymer
 
 PURPOSES = (
     "decorativa",
@@ -57,8 +58,15 @@ SAFE_PROCESS_KEYS = {
     "top_surface_speed",
     "seam_position",
     "ironing_type",
+    "enable_support",
+    "support_type",
     "support_style",
     "support_top_z_distance",
+    "support_bottom_z_distance",
+    "support_object_xy_distance",
+    "support_interface_top_layers",
+    "support_interface_bottom_layers",
+    "support_interface_spacing",
     "elefant_foot_compensation",
     "xy_contour_compensation",
     "xy_hole_compensation",
@@ -275,16 +283,37 @@ def validate_change(scope: str, key: str, value: str, plan: ConversionPlan, slot
             return value in {"aligned", "back", "nearest", "random"}
         if key == "ironing_type":
             return value in {"no ironing", "top"}
+        if key == "enable_support":
+            return value in {"0", "1"}
+        if key == "support_type":
+            return value in {"normal(auto)", "tree(auto)", "normal(manual)", "tree(manual)"}
         if key == "support_style":
             return value in {
                 "default", "grid", "snug",
                 "tree_auto", "tree_slim", "tree_strong", "tree_hybrid", "organic",
             }
-        if key == "support_top_z_distance":
+        if key in {"support_top_z_distance", "support_bottom_z_distance"}:
             try:
                 dist = float(value)
                 nozzle = float(_as_str(plan.machine_settings.get("nozzle_diameter", "0.4")))
-                return math.isfinite(dist) and 0.08 <= dist <= min(0.28, round(0.75 * nozzle + 1e-6, 4))
+                max_z = round(max(0.16, min(0.48, 0.80 * nozzle)), 4)
+                return math.isfinite(dist) and 0.08 <= dist <= max_z
+            except ValueError:
+                return False
+        if key == "support_object_xy_distance":
+            try:
+                dist = float(value)
+                nozzle = float(_as_str(plan.machine_settings.get("nozzle_diameter", "0.4")))
+                max_xy = round(max(1.2, 2.0 * nozzle), 4)
+                return math.isfinite(dist) and 0.25 <= dist <= max_xy
+            except ValueError:
+                return False
+        if key in {"support_interface_top_layers", "support_interface_bottom_layers"}:
+            return value.isdigit() and 0 <= int(value) <= 6
+        if key == "support_interface_spacing":
+            try:
+                sp = float(value)
+                return math.isfinite(sp) and 0.0 <= sp <= 1.0
             except ValueError:
                 return False
         if key == "elefant_foot_compensation":
@@ -485,6 +514,131 @@ def build_abs_asa_checklist(
             "reduzi-la busca reter calor passivo, porém eleva o odor/emissão de estireno no local (use apenas em ambiente bem ventilado)."
         ),
     ]
+
+
+def _build_easy_support_advices(
+    advices: list[Advice],
+    project: ProjectInfo,
+    plan: ConversionPlan,
+    goal: PrintGoal,
+    nozzle: float,
+    conf: str,
+) -> None:
+    """Mantém folgas Z/XY e interface de fácil remoção alinhadas à camada final planejada."""
+    proc = plan.process_settings
+    planned_lh = next(
+        (_as_float(a.proposed, 0.2) for a in reversed(advices)
+         if a.scope == "process" and a.key == "layer_height" and a.default_on),
+        _as_float(proc.get("layer_height"), 0.2),
+    )
+    planned_stype = next(
+        (a.proposed for a in reversed(advices)
+         if a.scope == "process" and a.key == "support_type" and a.default_on),
+        "",
+    )
+    if not planned_stype:
+        obj_types = [
+            o.settings.get("support_type", "")
+            for o in (getattr(project, "object_overrides", ()) or ())
+            if o.settings.get("support_type")
+        ]
+        if any("tree" in t.lower() for t in obj_types):
+            planned_stype = next(t for t in obj_types if "tree" in t.lower())
+        else:
+            planned_stype = _as_str(proc.get("support_type", "tree(auto)")) or "tree(auto)"
+
+    target_poly = resolve_target_polymer(project, plan.filament_settings)
+    easy = compute_easy_support_settings(
+        planned_lh,
+        nozzle,
+        target_poly,
+        support_type=planned_stype,
+    )
+    descriptors = {
+        "support_style": (
+            f"Estilo de Suporte Fácil Remoção ({easy['support_style']})",
+            "Galhos finos ou estilo justo reduzem marcas de contato e facilitam o destacamento limpo.",
+            "Menor cicatriz na peça e retirada mais simples com alicate.",
+        ),
+        "support_top_z_distance": (
+            f"Folga Z de Topo para Fácil Remoção ({easy['support_top_z_distance']} mm)",
+            (
+                f"Calculada para camada de {planned_lh:g} mm, bico {nozzle:g} mm e material {target_poly}: "
+                "evita que o suporte solde na peça e respeita múltiplos inteiros de camada do ELEGOO Slicer."
+            ),
+            "Suporte destaca sem arrancar camadas; se houver queda leve em ponte longa, reduza em 1 passo.",
+        ),
+        "support_bottom_z_distance": (
+            f"Folga Z da Base do Suporte ({easy['support_bottom_z_distance']} mm)",
+            "Mantém folga equivalente quando o suporte apoia sobre partes inferiores do próprio modelo.",
+            "Evita soldagem quando a base da árvore nasce sobre a peça.",
+        ),
+        "support_object_xy_distance": (
+            f"Folga Horizontal XY Suporte↔Peça ({easy['support_object_xy_distance']} mm)",
+            (
+                f"Proporcional ao bico ({nozzle:g} mm) e à fluidez do {target_poly}: afasta paredes laterais "
+                "para a árvore não colar em detalhes verticais."
+            ),
+            "Permite soltar troncos próximos a paredes finas sem raspar a lateral.",
+        ),
+        "support_interface_top_layers": (
+            f"Camadas de Interface de Suporte ({easy['support_interface_top_layers']})",
+            "3 camadas formam uma película coesa que descola inteira em vez de esfarelar presa na saliencia.",
+            "Remoção em lâmina contínua mantendo apoio firme.",
+        ),
+        "support_interface_bottom_layers": (
+            f"Camadas de Interface Inferior ({easy['support_interface_bottom_layers']})",
+            "Garante base estável quando o suporte nasce sobre o modelo.",
+            "Facilita destaque inferior sem deixar resíduos colados.",
+        ),
+        "support_interface_spacing": (
+            f"Espaçamento da Interface ({easy['support_interface_spacing']} mm)",
+            "Deixa micro-aberturas entre os fios da interface para reduzir adesão direta em impressão mono-material.",
+            "Quebra fácil sem virar uma chapa sólida grudada na peça.",
+        ),
+    }
+    numeric_keys = {
+        "support_top_z_distance",
+        "support_bottom_z_distance",
+        "support_object_xy_distance",
+        "support_interface_top_layers",
+        "support_interface_bottom_layers",
+        "support_interface_spacing",
+    }
+    for key, proposed in easy.items():
+        if key not in proc:
+            continue
+        if key == "support_style" and "manual" in planned_stype.lower():
+            continue
+        cur_raw = _as_str(proc.get(key))
+        if key in numeric_keys:
+            try:
+                if abs(float(cur_raw) - float(proposed)) <= 1e-4:
+                    continue
+            except ValueError:
+                pass
+        elif cur_raw == proposed:
+            continue
+        title, why, effect = descriptors[key]
+        _add_if_valid(
+            advices,
+            Advice(
+                scope="process",
+                slot=None,
+                key=key,
+                current=cur_raw,
+                proposed=proposed,
+                title=title,
+                why=why,
+                expected_effect=effect,
+                what_to_check="Confira na prévia após fatiar e remova os suportes somente com a peça fria.",
+                evidence_class="estimado_regra_ia",
+                requires_physical_test=(key == "support_top_z_distance"),
+                confidence=conf,
+                default_on=True,
+            ),
+            plan,
+        )
 
 
 def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) -> list[Advice]:
@@ -1029,55 +1183,57 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 advices,
                 confidence=conf,
             )
-            if effective_support:
-                if "tree" in effective_support_type.lower() or "support_style" in proc:
-                    cur_style = str(proc.get("support_style", "default"))
-                    if "support_style" in proc and cur_style not in {"tree_slim", "organic"}:
-                        _add_if_valid(
-                            advices,
-                            Advice(
-                                scope="process", slot=None, key="support_style",
-                                current=cur_style, proposed="tree_slim",
-                                title="Estilo de Suporte Árvore Fino (tree_slim)",
-                                why="Árvores finas reduzem pontos de contato na malha decorativa e facilitam remoção.",
-                                expected_effect="Menos cicatrizes em detalhes finos (exige conferência visual na prévia).",
-                                what_to_check="Verifique na prévia se os galhos alcançam todas as ilhas suspensas sem quebrar.",
-                                evidence_class="estimado_regra_ia",
-                                requires_physical_test=False,
-                                confidence=conf,
-                                default_on=True,
-                            ),
-                            plan,
-                        )
-                if "support_top_z_distance" in proc and _as_float(proc.get("support_top_z_distance"), 0.2) > 0.16:
-                    _add_if_valid(
-                        advices,
-                        Advice(
-                            scope="process", slot=None, key="support_top_z_distance",
-                            current=str(proc.get("support_top_z_distance")), proposed="0.16",
-                            title="Ajustar Distância Z do Suporte (0.16 mm)",
-                            why="Folga ligeiramente menor que 0.20 mm pode melhorar o aspecto sob saliências em PLA mantendo destacamento aceitável.",
-                            expected_effect="Superfície sustentada menos áspera; se soldar demais no seu filamento, volte a 0.20 mm.",
-                            what_to_check="Faça teste pequeno se houver grandes áreas horizontais apoiadas em suporte.",
-                            evidence_class="estimado_regra_ia",
-                            requires_physical_test=True,
-                            confidence=conf,
-                            default_on=True,
+            if not effective_support and "enable_support" in proc:
+                _add_if_valid(
+                    advices,
+                    Advice(
+                        scope="process", slot=None, key="enable_support",
+                        current=_as_str(proc.get("enable_support", "0")), proposed="1",
+                        title="Ativar Suporte Automático em Peça Decorativa",
+                        why=(
+                            "Peças decorativas quase sempre têm queixo, mãos, dobras ou balanços > 45°; vem ativado por padrão "
+                            "com suporte em árvore fino e folgas Z/XY de fácil remoção. Se sua peça for 100% plana, você pode desmarcar."
                         ),
-                        plan,
-                    )
-                if obj_only_support:
-                    advices.append(Advice(
-                        scope="alert", slot=None, key="", current="", proposed="",
-                        title="Suporte Definido Por Objeto no 3MF",
-                        why="O suporte foi ativado apenas em objetos específicos dentro do arquivo; revise na aba Objetos do ELEGOO Slicer se necessário.",
-                        expected_effect="Evitar remoção ou aplicação acidental de suportes locais.",
-                        what_to_check="Abra a lista de Objetos no ELEGOO Slicer e confirme onde há suporte.",
-                        evidence_class="verificado_3mf",
+                        expected_effect="Gera suportes árvore automáticos nas saliências mantendo folgas otimizadas para destacar limpo.",
+                        what_to_check="Confira na prévia onde os galhos tocam a peça antes de imprimir.",
+                        evidence_class="estimado_regra_ia",
                         requires_physical_test=False,
-                        confidence="alta",
-                        default_on=False,
-                    ))
+                        confidence=conf,
+                        default_on=True,
+                    ),
+                    plan,
+                )
+            cur_stype = _as_str(proc.get("support_type", ""))
+            if ("support_type" in proc and not obj_only_support
+                    and "manual" not in cur_stype.lower() and cur_stype != "tree(auto)"):
+                _add_if_valid(
+                    advices,
+                    Advice(
+                        scope="process", slot=None, key="support_type",
+                        current=cur_stype, proposed="tree(auto)",
+                        title="Usar Suporte em Árvore Automático (tree(auto))",
+                        why="Em peças decorativas e orgânicas, árvores tocam menos pontos e saem mais fácil que pilares retos.",
+                        expected_effect="Menos marcas de contato e retirada mais rápida.",
+                        what_to_check="Veja os pontos de apoio das pontas na prévia 3D.",
+                        evidence_class="estimado_regra_ia",
+                        requires_physical_test=False,
+                        confidence=conf,
+                        default_on=True,
+                    ),
+                    plan,
+                )
+            if effective_support and obj_only_support:
+                advices.append(Advice(
+                    scope="alert", slot=None, key="", current="", proposed="",
+                    title="Suporte Definido Por Objeto no 3MF",
+                    why="O suporte foi ativado apenas em objetos específicos dentro do arquivo; revise na aba Objetos do ELEGOO Slicer se necessário.",
+                    expected_effect="Evitar remoção ou aplicação acidental de suportes locais.",
+                    what_to_check="Abra a lista de Objetos no ELEGOO Slicer e confirme onde há suporte.",
+                    evidence_class="verificado_3mf",
+                    requires_physical_test=False,
+                    confidence="alta",
+                    default_on=False,
+                ))
         has_var_layer = any(
             entry.replace("\\", "/") == "Metadata/layer_heights_profile.txt"
             for entry in getattr(project, "archive_entries", ())
@@ -1708,6 +1864,9 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 plan,
             )
 
+    # 3B. Suportes de fácil remoção sincronizados com a altura de camada final e o bico
+    _build_easy_support_advices(advices, project, plan, goal, nozzle, conf)
+
     # 4. Alertas diagnósticos aprendidos em projetos reais
     global_infill = _as_float(proc.get("sparse_infill_density", "15%"), 15.0)
     low_infill_objs = [
@@ -2046,6 +2205,16 @@ def build_print_summary(
     pattern = _as_str(proc.get("sparse_infill_pattern", "grid"))
     layer_h = _as_str(proc.get("layer_height", "0.2"))
 
+    sup_on = _as_str(proc.get("enable_support", "0")) == "1"
+    sup_z = _as_str(proc.get("support_top_z_distance", "0.2"))
+    sup_xy = _as_str(proc.get("support_object_xy_distance", "0.5"))
+    sup_style = _as_str(proc.get("support_style", "tree_slim"))
+    sup_iface = _as_str(proc.get("support_interface_top_layers", "3"))
+    sup_line = (
+        f"• Suportes (fácil remoção): {'Ativados (' + sup_style + ')' if sup_on else 'Desativados (já pré-configurados caso ative)'} "
+        f"— folga Z {sup_z} mm · folga XY {sup_xy} mm · {sup_iface} camadas de interface."
+    )
+
     slicing_line = sliced_summary or "Estimativas de tempo e gramas serão obtidas após fatiamento real no ELEGOO Slicer."
     lines = [
         f"• Material: {src_summary} → {dst_summary}",
@@ -2053,6 +2222,7 @@ def build_print_summary(
         f"• {evidence_label('verificado_3mf')}: {len(project.plates)} placa(s) · {len(project.objects)} objeto(s) · camada original {project.source_settings.get('layer_height', '?')} mm.",
         f"• {evidence_label('verificado_fatiamento')}: {slicing_line}",
         f"• {evidence_label('estimado_regra_ia')} (Confiança {confidence_label(conf).split(' (')[0]}): {cooling_line} Ponto de partida estrutural: {walls} paredes · topo {top_layers} camadas · preenchimento {infill} ({pattern}) · camada {layer_h} mm.",
+        sup_line,
     ]
     if is_abs_asa:
         checklist = build_abs_asa_checklist(project, preview_plan, goal)
