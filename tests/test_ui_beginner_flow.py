@@ -75,6 +75,39 @@ def _setup_fake_slicer_env(root: Path) -> dict[str, str]:
                 "compatible_printers": [base],
             },
         ),
+        (
+            "system/Elegoo/filament/Generic/petg.json",
+            {
+                "type": "filament",
+                "name": "Elegoo PETG @ECC2",
+                "filament_type": ["PETG"],
+                "fan_min_speed": ["20"],
+                "fan_max_speed": ["50"],
+                "compatible_printers": [base],
+            },
+        ),
+        (
+            "system/Elegoo/filament/Generic/tpu.json",
+            {
+                "type": "filament",
+                "name": "Elegoo TPU 95A @ECC2",
+                "filament_type": ["TPU"],
+                "fan_min_speed": ["50"],
+                "fan_max_speed": ["80"],
+                "compatible_printers": [base],
+            },
+        ),
+        (
+            "system/Elegoo/filament/Generic/abs_cf.json",
+            {
+                "type": "filament",
+                "name": "Generic ABS-CF @ECC2",
+                "filament_type": ["ABS-CF"],
+                "fan_min_speed": ["10"],
+                "fan_max_speed": ["30"],
+                "compatible_printers": [base],
+            },
+        ),
     ]
     for rel, payload in entries:
         path = data_dir / rel
@@ -117,11 +150,17 @@ class UIBeginnerFlowTests(unittest.TestCase):
                 (),
                 used_filament_slots=("1",),
             )
-            # 2) Jornada 2: Multi-filamento declarado (5 slots declarados, 1 usado em múltiplas placas)
+            # 2) Jornada 2: Multi-filamento declarado (5 slots declarados, slots 1-2 usados com materiais distintos)
             proj_multi = ProjectInfo(
                 root / "multi.3mf",
                 {"printer_model": "Bambu Lab P1S", "layer_height": "0.20"},
-                tuple(FilamentInfo(i, "PETG" if i == 1 else "PLA", "#FFFFFF", f"Slot {i}") for i in range(1, 6)),
+                (
+                    FilamentInfo(1, "PLA", "#FFFFFF", "Slot 1"),
+                    FilamentInfo(2, "TPU", "#111111", "Slot 2"),
+                    FilamentInfo(3, "ABS-ESD", "#222222", "Slot 3 não usado"),
+                    FilamentInfo(4, "PLA", "#333333", "Slot 4 não usado"),
+                    FilamentInfo(5, "PLA", "#444444", "Slot 5 não usado"),
+                ),
                 (
                     PlateInfo(1, 1, ("1",), ("1",), ("1",)),
                     PlateInfo(2, 2, ("2", "3"), ("1", "2"), ("1", "2")),
@@ -163,20 +202,40 @@ class UIBeginnerFlowTests(unittest.TestCase):
                         card_unconfirmed = app.preconversion_var.get()
                         self.assertIn("PENDENTE", card_unconfirmed)
 
-                        # Decisão 2: confirmar filamento físico explicitamente
-                        app.physical_material_var.set(mat_choice)
-                        app.physical_filament_confirmed_var.set(True)
-                        app._on_physical_filament_changed()
-                        decisions += 2  # (1) 3MF + (2) confirmação de filamento físico
+                        if jornada == "1-filamento":
+                            # Decisão 2: confirmar filamento físico explicitamente
+                            app.physical_material_var.set(mat_choice)
+                            app.physical_filament_confirmed_var.set(True)
+                            app._on_physical_filament_changed()
+                            decisions += 2  # (1) 3MF + (2) confirmação de filamento físico
 
-                        card_ready = app.preconversion_var.get()
-                        self.assertIn("CARTÃO PRÉ-CONVERSÃO", card_ready)
-                        self.assertIn("Confirmado", card_ready)
-                        self.assertIn(f"{len(proj.plates)} placa", card_ready)
+                            card_ready = app.preconversion_var.get()
+                            self.assertIn("CARTÃO PRÉ-CONVERSÃO", card_ready)
+                            self.assertIn("Confirmado", card_ready)
+                            self.assertIn(f"{len(proj.plates)} placa", card_ready)
+                        else:
+                            # Multisslot PLA+TPU: escolher ABS global NÃO transforma em ABS+ABS nem confirma slots
+                            app.physical_material_var.set("ABS")
+                            app.physical_filament_confirmed_var.set(True)
+                            app._on_physical_filament_changed()
+                            self.assertFalse(app.physical_filament_confirmed_var.get())
+                            self.assertIn("PLA", app.filament_vars[0].get())
+                            self.assertNotIn("ABS", app.filament_vars[1].get())
 
-                        if mat_choice == "ABS":
-                            # Verifica se a troca de filamento físico atualizou o slot usado para Elegoo ABS @ECC2 sem abrir avançados
-                            self.assertIn("ABS", app.filament_vars[0].get())
+                            # Confirmação é explícita por slot usado (slot 3 não usado não bloqueia)
+                            app.slot_target_vars[1].set("PLA")
+                            app.slot_target_vars[2].set("TPU 95A")
+                            self.assertIn("TPU", app.filament_vars[1].get())
+                            app.slot_confirmed_vars[1].set(True)
+                            app._on_slot_confirmed_toggled(1)
+                            app.slot_confirmed_vars[2].set(True)
+                            app._on_slot_confirmed_toggled(2)
+                            decisions += 2
+
+                            card_ready = app.preconversion_var.get()
+                            self.assertIn("CARTÃO PRÉ-CONVERSÃO", card_ready)
+                            self.assertIn("Confirmado", card_ready)
+                            self.assertIn(f"{len(proj.plates)} placa", card_ready)
 
                         # Quando usuário indica uso mecânico sem preencher detalhes ('Não sei'), confiança cai para baixa
                         from maker_elegoo.labels import purpose_label
@@ -455,4 +514,90 @@ class UIBeginnerFlowTests(unittest.TestCase):
                     self.assertTrue(hasattr(app, "calib_queue"))
                 finally:
                     app.destroy()
+
+    def test_task1_blocks_missing_material_resets_confirmation_on_change_and_supports_planned_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "OnlyComposite" / "AppData" / "ElegooSlicer"
+            exe_dir = root / "OnlyComposite" / "ProgramFiles" / "ElegooSlicer"
+            exe_dir.mkdir(parents=True)
+            (exe_dir / "elegoo-slicer.exe").touch()
+            base = "Elegoo Centauri Carbon 2 0.4 nozzle"
+            for rel, payload in (
+                ("system/Elegoo/machine/ECC2/base.json", {"type": "machine", "name": base, "printer_model": "Elegoo Centauri Carbon 2", "nozzle_diameter": ["0.4"]}),
+                ("system/Elegoo/process/ECC2/std.json", {"type": "process", "name": "0.20mm Standard @Elegoo CC2 0.4 nozzle", "layer_height": "0.20", "compatible_printers": [base]}),
+                ("system/Elegoo/filament/Generic/pla.json", {"type": "filament", "name": "Generic PLA @ECC2", "filament_type": ["PLA"], "compatible_printers": [base]}),
+                ("system/Elegoo/filament/Generic/abs_cf.json", {"type": "filament", "name": "Generic ABS-CF @ECC2", "filament_type": ["ABS-CF"], "compatible_printers": [base]}),
+            ):
+                p = data_dir / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps(payload), encoding="utf-8")
+            env_comp = {
+                "APPDATA": str(root / "OnlyComposite" / "AppData"),
+                "ProgramFiles": str(root / "OnlyComposite" / "ProgramFiles"),
+                "MAKER_ELEGOO_CONFIG_DIR": str(root / "OnlyComposite" / "prefs"),
+            }
+            proj = ProjectInfo(
+                root / "peca.3mf",
+                {"printer_model": "Bambu Lab A1", "layer_height": "0.20"},
+                (FilamentInfo(1, "PLA", "#FFFFFF", "Bambu PLA"),),
+                (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+                ("Peca",),
+                (),
+                (),
+                used_filament_slots=("1",),
+            )
+            with patch.dict(os.environ, env_comp):
+                app = MakerElegooApp()
+                try:
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj):
+                        app.file_var.set(str(proj.path))
+                        app._inspect_file()
+                    app.physical_material_var.set("PLA")
+                    app.physical_filament_confirmed_var.set(True)
+                    app._on_physical_filament_changed()
+                    self.assertTrue(app.physical_filament_confirmed_var.get())
+
+                    # Selecionar ABS sem ABS puro (apenas ABS-CF): NÃO seleciona ABS-CF, NÃO mantém PLA confirmado e BLOQUEIA conversão
+                    app.physical_material_var.set("ABS")
+                    app._on_physical_filament_changed()
+                    self.assertFalse(app.physical_filament_confirmed_var.get())
+                    self.assertEqual(app.filament_vars[0].get(), "")
+                    with patch("maker_elegoo.ui.messagebox.showwarning") as warn_spy, \
+                         patch("maker_elegoo.ui.filedialog.asksaveasfilename") as save_spy:
+                        app._convert()
+                        warn_spy.assert_called_once()
+                        save_spy.assert_not_called()
+                finally:
+                    app.destroy()
+
+            # Ambiente completo: troca de perfil invalida confirmação; modo planejado diferencia texto de carregado
+            env_full = _setup_fake_slicer_env(root / "Full")
+            with patch.dict(os.environ, env_full):
+                app2 = MakerElegooApp()
+                try:
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj):
+                        app2.file_var.set(str(proj.path))
+                        app2._inspect_file()
+                    app2.physical_material_var.set("PLA")
+                    app2.physical_filament_confirmed_var.set(True)
+                    app2._on_physical_filament_changed()
+                    self.assertTrue(app2.physical_filament_confirmed_var.get())
+
+                    # Mudança manual de perfil invalida confirmação e cria bloqueio de divergência
+                    app2.filament_vars[0].set("Elegoo ABS @ECC2")
+                    self.assertFalse(app2.physical_filament_confirmed_var.get())
+                    self.assertIn("diverge", app2.slot_issue_vars[1].get().lower())
+
+                    # Modo planejado: diferencia texto e nunca afirma que está carregado
+                    app2.material_readiness_var.set("planejado")
+                    app2.physical_material_var.set("PLA")
+                    app2.physical_filament_confirmed_var.set(True)
+                    app2._on_physical_filament_changed()
+                    card = app2.preconversion_var.get()
+                    self.assertIn("Material PLANEJADO", card)
+                    self.assertIn("NÃO afirmado como carregado", card)
+                finally:
+                    app2.destroy()
+
 

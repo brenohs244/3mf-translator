@@ -136,6 +136,7 @@ class PrintGoal:
     fit_clearance: str = "nao_sei"
     heat_exposure: str = "nao_sei"
     physical_material: str = "nao_sei"
+    material_mode: str = "carregado"
 
 
 @dataclass(frozen=True)
@@ -2408,8 +2409,12 @@ def needs_user_intervention(
 ) -> tuple[bool, list[str]]:
     """Define se há ambiguidade, incompatibilidade ou risco que exige decisão do usuário."""
     reasons: list[str] = []
+    is_planned = getattr(goal, "material_mode", "carregado") == "planejado"
     if not physical_confirmed:
-        reasons.append("Filamento físico carregado na impressora ainda não foi confirmado.")
+        if is_planned:
+            reasons.append("Material planejado para preparação do arquivo ainda não foi confirmado.")
+        else:
+            reasons.append("Filamento físico carregado na impressora ainda não foi confirmado.")
 
     conf, conf_reasons = goal_confidence(goal)
     if conf == "baixa":
@@ -2451,11 +2456,20 @@ def build_preconversion_card(
     ] or [_as_str(cfg.get("filament_type", "Desconhecido")) for cfg in plan.filament_settings] or ["Desconhecido"]
     dst_label = "/".join(dict.fromkeys(dst_mats))
 
-    phys_status = (
-        f"Confirmado ({goal.physical_material if goal.physical_material != 'nao_sei' else dst_label})"
-        if physical_confirmed
-        else "PENDENTE (nunca presumir igual ao 3MF — confirme abaixo)"
-    )
+    is_planned = getattr(goal, "material_mode", "carregado") == "planejado"
+    mat_txt = goal.physical_material if goal.physical_material != "nao_sei" else dst_label
+    if is_planned:
+        phys_status = (
+            f"Material PLANEJADO ({mat_txt}) — preparando 3MF para depois; NÃO afirmado como carregado na impressora"
+            if physical_confirmed
+            else "PENDENTE — escolha e confirme o material planejado por slot"
+        )
+    else:
+        phys_status = (
+            f"Confirmado (carregado: {mat_txt})"
+            if physical_confirmed
+            else "PENDENTE (nunca presumir igual ao 3MF — confirme por slot abaixo)"
+        )
 
     slot_count = len(used_slots) if used_slots else len(project.filaments)
     plate_count = len(getattr(project, "plates", ())) or 1
@@ -2568,8 +2582,13 @@ def build_print_summary(
     )
 
     slicing_line = sliced_summary or "Estimativas de tempo e gramas serão obtidas após fatiamento real no ELEGOO Slicer."
+    mode_note = (
+        " [PLANEJADO para imprimir depois — confira o(s) carretel(éis) físico(s) antes de enviar]"
+        if getattr(goal, "material_mode", "carregado") == "planejado"
+        else ""
+    )
     lines = [
-        f"• Material: {src_summary} → {dst_summary}",
+        f"• Material: {src_summary} → {dst_summary}{mode_note}",
         f"• Uso, contexto e prioridade: {purpose_label(goal.purpose)} · {priority_label(goal.priority)} · Carga: {load_type_label(goal.load_type)}",
         f"• {evidence_label('verificado_3mf')}: {len(project.plates)} placa(s) · {len(project.objects)} objeto(s) · camada original {project.source_settings.get('layer_height', '?')} mm.",
         f"• {evidence_label('verificado_fatiamento')}: {slicing_line}",
