@@ -225,6 +225,45 @@ class RevisaoAIAndOptimizationTests(unittest.TestCase):
         self.assertTrue(any(a.scope == "process" and a.key == "seam_position" and a.proposed == "back" for a in merged))
         self.assertTrue(any(a.scope == "alert" and "conflito" in a.title.lower() for a in merged))
 
+    def test_compare_objectives_moveis_velocidade_never_coarsens_layer_by_fallback_and_tracks_filament_changes(self):
+        proj = self._proj(("PLA",), used=("1",))
+        plan = self._plan()
+        plan.filament_settings[0]["fan_max_speed"] = ["80"]
+        plan.filament_settings[0]["additional_cooling_fan_speed"] = ["50"]
+        goal = PrintGoal(
+            "moveis",
+            "velocidade",
+            fit_clearance="partes_moveis",
+            physical_material="ABS",
+        )
+        seen_plans = {}
+
+        def fake_convert(p, variant_plan, dest, cli):
+            obj = dest.stem.rsplit("_", 1)[-1]
+            seen_plans[obj] = variant_plan
+            dest.write_bytes(b"ok")
+            return ConversionResult(
+                True, dest, "ok",
+                ExportResult(True, dest, "ok"),
+                ValidationResult(True, 1, "ok", (), 1100, 18.0),
+                None, proj, {}, proj.plates,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp, patch("maker_elegoo.optimization.convert_project", side_effect=fake_convert):
+            variants = {
+                v.objective: v
+                for v in compare_objectives(proj, plan, Path(tmp), SlicerCLI(Path("fake.exe")), goal=goal)
+            }
+
+        self.assertEqual(seen_plans["velocidade"].process_settings["layer_height"], "0.2")
+        self.assertNotIn("layer_height", variants["velocidade"].changed)
+        fil_changes = variants["velocidade"].changes_by_scope.get("filament", {})
+        self.assertEqual(fil_changes.get("Slot 1.additional_cooling_fan_speed"), "0")
+        self.assertIn("Slot 1.fan_max_speed", fil_changes)
+        report = format_objective_comparison(tuple(variants.values()), goal=goal)
+        self.assertIn("additional_cooling_fan_speed", report)
+        self.assertIn("fan_max_speed", report)
+
 
 if __name__ == "__main__":
     unittest.main()

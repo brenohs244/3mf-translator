@@ -59,11 +59,11 @@
 
 **Interfaces:** `is_recommendable(variant: Variant) -> bool`; `_recommended_objective(...) -> str | None`. Exigir `result.success`, validação aprovada e métricas finitas utilizáveis. Acrescentar `Variant.changes_by_scope: dict[str, dict[str, str]]` com default vazio, preservando `changed` para compatibilidade. Usar política da Task 2 para cada alternativa.
 
-- [ ] Testar sucesso de fatiamento com geometria alterada: não elegível; todas falham: retorno None e mensagem “Nenhuma alternativa validada”; métricas ausentes/NaN não entram em comparação; alternativa válida continua disponível quando outra falha.
-- [ ] Testar uso móvel em velocidade com Professor real e perfil sintético completo: não aumentar camada por fallback; testar alteração de filamento/AUX aparecendo no relatório; não rotular variantes idênticas como ganho medido.
-- [ ] Rodar `python -m unittest discover -s tests -p test_optimization.py` e os testes de revisão; confirmar falhas novas.
-- [ ] Remover caminho que força camada fora da política, centralizar geração e corrigir recomendação/relatório. Identificar tempos e gramas como estimativas do fatiador, não medição de impressão.
-- [ ] Rodar testes até passar, revisar diff e registrar commit específico.
+- [x] Testar sucesso de fatiamento com geometria alterada: não elegível; todas falham: retorno None e mensagem “Nenhuma alternativa validada”; métricas ausentes/NaN não entram em comparação; alternativa válida continua disponível quando outra falha.
+- [x] Testar uso móvel em velocidade com Professor real e perfil sintético completo: não aumentar camada por fallback; testar alteração de filamento/AUX aparecendo no relatório; não rotular variantes idênticas como ganho medido.
+- [x] Rodar `python -m unittest discover -s tests -p test_optimization.py` e os testes de revisão; confirmar falhas novas.
+- [x] Remover caminho que força camada fora da política, centralizar geração e corrigir recomendação/relatório. Identificar tempos e gramas como estimativas do fatiador, não medição de impressão.
+- [x] Rodar testes até passar, revisar diff e registrar commit específico.
 
 ## Task 4 — Jornada progressiva e evidência compreensível (P1)
 
