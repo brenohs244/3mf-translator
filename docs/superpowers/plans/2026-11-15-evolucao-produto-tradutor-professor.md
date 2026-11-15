@@ -47,11 +47,11 @@
 
 **Interfaces:** `PolicyResult(accepted: tuple[Advice, ...], rejected: tuple[Advice, ...], reasons: tuple[str, ...])`; `enforce_advice_policy(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal, proposals: tuple[Advice, ...]) -> PolicyResult`. Manter tipos existentes de Advice/PrintGoal; evitar import circular com imports de tipos. Classificar explicitamente quais regras de uso/material restringem alternativas e quais são opcionais.
 
-- [ ] Testar conselho local de 4 paredes versus IA de 1: rejeição explicada do rebaixamento; valor IA fora de faixa rejeitado; conselho adicional compatível aceito; ABS móvel não recebe brim automático por sugestão IA; alteração de velocidade não invalida proteção de folgas.
-- [ ] Rodar `python -m unittest discover -s tests -p test_advice_policy.py` e confirmar falhas.
-- [ ] Implementar política aplicada após combinar sugestões e novamente sobre alterações aprovadas. Conflito não deve desaparecer silenciosamente; preservar revisão pelo usuário.
-- [ ] Rodar testes da política, Professor e IA; verificar precedência material/uso/prioridade e valores efetivos resultantes.
-- [ ] Revisar diff e registrar commit específico.
+- [x] Testar conselho local de 4 paredes versus IA de 1: rejeição explicada do rebaixamento; valor IA fora de faixa rejeitado; conselho adicional compatível aceito; ABS móvel não recebe brim automático por sugestão IA; alteração de velocidade não invalida proteção de folgas.
+- [x] Rodar `python -m unittest discover -s tests -p test_advice_policy.py` e confirmar falhas.
+- [x] Implementar política aplicada após combinar sugestões e novamente sobre alterações aprovadas. Conflito não deve desaparecer silenciosamente; preservar revisão pelo usuário.
+- [x] Rodar testes da política, Professor e IA; verificar precedência material/uso/prioridade e valores efetivos resultantes.
+- [x] Revisar diff e registrar commit específico.
 
 ## Task 3 — Alternativas coerentes e elegibilidade integral (P0/P1)
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from zipfile import ZipFile
 
+from .advice_policy import HARD_POLICY_RULES, build_policy_conflict_alert, enforce_advice_policy
 from .ai import (AIError, Suggestion, apply_suggestions, build_manual_prompt,
                  parse_manual_response, suggest_equivalences)
 from .ai_client import GeminiClient, GeminiClientError, advise_gemini
@@ -1906,7 +1907,13 @@ class MakerElegooApp(tk.Tk):
             try:
                 client = GeminiClient(api_key=key, model=model_name)
                 ai_advices = advise_gemini(client, project, plan, goal)
-                merged_ai = merge_with_offline_alerts(ai_advices, advise_offline(project, plan, goal))
+                merged_ai = merge_with_offline_alerts(
+                    ai_advices,
+                    advise_offline(project, plan, goal),
+                    project=project,
+                    plan=plan,
+                    goal=goal,
+                )
                 self.professor_queue.put((project, plan, goal, destination, model_name, merged_ai, None))
             except Exception as exc:
                 self.professor_queue.put((project, plan, goal, destination, model_name, None, exc))
@@ -1926,6 +1933,10 @@ class MakerElegooApp(tk.Tk):
         active_goal = goal or self._current_goal()
         if self.save_history_var.get() and self.project is not None:
             merged = adjust_advices_from_history(merged, self.project, plan, active_goal, load_feedback_history())
+        policy = enforce_advice_policy(self.project, plan, active_goal, merged)
+        merged = list(policy.accepted)
+        if policy.reasons:
+            merged.append(build_policy_conflict_alert(policy.reasons, source_label="Professor/Histórico"))
         needs_decision, _ = needs_user_intervention(
             self.project,
             plan,
@@ -1934,7 +1945,7 @@ class MakerElegooApp(tk.Tk):
             physical_confirmed=self.physical_filament_confirmed_var.get(),
         )
         if merged and (needs_decision or any(a.scope != "alert" for a in merged)):
-            self._show_professor_dialog(plan, destination, merged)
+            self._show_professor_dialog(plan, destination, merged, goal=active_goal)
         else:
             self._execute_conversion(plan, destination, professor_advices=merged)
 
@@ -1965,16 +1976,23 @@ class MakerElegooApp(tk.Tk):
                     parent=self,
                 ):
                     offline_advices = advise_offline(project, plan, goal)
-                    self._finish_professor_lookup(plan, destination, offline_advices)
+                    self._finish_professor_lookup(plan, destination, offline_advices, goal=goal)
                 else:
                     self.status_var.set("Falha ao consultar IA" if not isinstance(error, GeminiClientError) else "Conversão cancelada pelo usuário")
                     if not isinstance(error, GeminiClientError):
                         messagebox.showerror("Professor IA", str(error), parent=self)
             else:
-                self._finish_professor_lookup(plan, destination, advices or [])
+                self._finish_professor_lookup(plan, destination, advices or [], goal=goal)
         self._professor_after = self.after(150, self._poll_professor)
 
-    def _show_professor_dialog(self, plan: ConversionPlan, destination: str, advices: list[Advice]):
+    def _show_professor_dialog(
+        self,
+        plan: ConversionPlan,
+        destination: str,
+        advices: list[Advice],
+        *,
+        goal: PrintGoal | None = None,
+    ):
         dialog = tk.Toplevel(self)
         dialog.title("Professor de Impressão · Recomendações e Ajustes")
         dialog.geometry("780x560")
@@ -2090,9 +2108,15 @@ class MakerElegooApp(tk.Tk):
 
         def proceed():
             approved = [adv for adv, var in check_vars if var.get()]
+            active_goal = goal or self._current_goal()
+            policy = enforce_advice_policy(self.project, plan, active_goal, approved)
+            final_approved = list(policy.accepted)
+            final_alerts = list(alerts)
+            if policy.reasons:
+                final_alerts.append(build_policy_conflict_alert(policy.reasons, source_label="Aprovação"))
             dialog.destroy()
-            final_plan = apply_advice(plan, approved)
-            self._execute_conversion(final_plan, destination, professor_advices=[*approved, *alerts])
+            final_plan = apply_advice(plan, final_approved)
+            self._execute_conversion(final_plan, destination, professor_advices=[*final_approved, *final_alerts])
 
         def skip():
             dialog.destroy()
@@ -2425,7 +2449,12 @@ class MakerElegooApp(tk.Tk):
         project = self.project
         install = self.install
         approved = tuple(self.ai_approved)
-        prof_tuple = tuple(professor_advices)
+        prof_list = list(professor_advices)
+        active_goal = self._current_goal()
+        if approved:
+            approved, sug_alerts = self._filter_suggestions_with_policy(project, plan, active_goal, approved)
+            prof_list.extend(sug_alerts)
+        prof_tuple = tuple(prof_list)
         scale_percent, target_height_mm = self._parse_scale_request()
         purpose = purpose_code(self.purpose_var.get())
 
@@ -2794,6 +2823,37 @@ class MakerElegooApp(tk.Tk):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def _filter_suggestions_with_policy(
+        self,
+        project: ProjectInfo | None,
+        plan: ConversionPlan | None,
+        goal: PrintGoal | None,
+        suggestions: tuple[Suggestion, ...] | list[Suggestion],
+    ) -> tuple[tuple[Suggestion, ...], list[Advice]]:
+        if plan is None or not suggestions:
+            return tuple(suggestions), []
+        kept: list[Suggestion] = []
+        rejected_reasons: list[str] = []
+        for item in suggestions:
+            if item.target_key in HARD_POLICY_RULES:
+                synthetic = Advice(
+                    scope="process",
+                    slot=None,
+                    key=item.target_key,
+                    current=str(plan.process_settings.get(item.target_key, "")),
+                    proposed=str(item.value),
+                    title=f"Sugestão IA: {item.target_key}",
+                    why=item.reason,
+                    default_on=True,
+                )
+                policy = enforce_advice_policy(project, plan, goal, (synthetic,))
+                if policy.rejected:
+                    rejected_reasons.extend(policy.reasons)
+                    continue
+            kept.append(item)
+        alerts = [build_policy_conflict_alert(rejected_reasons, source_label="Sugestão IA")] if rejected_reasons else []
+        return tuple(kept), alerts
+
     def _review_suggestions(self, suggestions: list[Suggestion], *, single: bool = False):
         context = (self.project, self.last_plan, self.orientation_analysis)
         dialog = tk.Toplevel(self)
@@ -2820,6 +2880,17 @@ class MakerElegooApp(tk.Tk):
             if reconvert and not chosen:
                 messagebox.showinfo("Nenhuma sugestão selecionada", "Selecione ao menos uma sugestão na lista.", parent=dialog)
                 return
+            if self.last_plan is not None and chosen:
+                kept, conflict_alerts = self._filter_suggestions_with_policy(
+                    self.project, self.last_plan, self._current_goal(), chosen
+                )
+                if conflict_alerts:
+                    messagebox.showwarning(
+                        "Sugestões bloqueadas pela política local",
+                        conflict_alerts[0].why,
+                        parent=dialog,
+                    )
+                chosen = list(kept)
             self.ai_approved = chosen
             self.status_var.set(f"{len(self.ai_approved)} sugestões aprovadas; converta novamente para aplicá-las")
             dialog.destroy()

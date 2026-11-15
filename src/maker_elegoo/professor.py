@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any
 
+from .advice_policy import HARD_POLICY_RULES, build_policy_conflict_alert, enforce_advice_policy
 from .labels import (
     confidence_label,
     criticality_label,
@@ -2334,13 +2335,55 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
     return _consolidate_advices(advices)
 
 
-def merge_with_offline_alerts(ai_advices: list[Advice], offline_advices: list[Advice]) -> list[Advice]:
-    """Combina sugestões da IA com ajustes não cobertos e alertas locais, consolidando conflitos."""
-    merged = list(ai_advices)
+_POLICY_FLOOR_KEYS = frozenset({
+    "wall_loops",
+    "top_shell_layers",
+    "bottom_shell_layers",
+    "sparse_infill_density",
+    "close_fan_the_first_x_layers",
+    "slow_down_layer_time",
+})
+
+_POLICY_CEILING_KEYS = frozenset({
+    "fan_max_speed",
+    "fan_min_speed",
+    "overhang_fan_speed",
+    "additional_cooling_fan_speed",
+    "outer_wall_speed",
+})
+
+
+def _relaxes_baseline(candidate: Advice, baseline: Advice) -> bool:
+    """Detecta se proposta externa enfraquece piso/teto recomendado localmente."""
+    key = candidate.key
+    if key in _POLICY_FLOOR_KEYS:
+        return _as_float(candidate.proposed, 0.0) < _as_float(baseline.proposed, 0.0) - 1e-6
+    if key in _POLICY_CEILING_KEYS:
+        return _as_float(candidate.proposed, 0.0) > _as_float(baseline.proposed, 0.0) + 1e-6
+    return False
+
+
+def merge_with_offline_alerts(
+    ai_advices: list[Advice],
+    offline_advices: list[Advice],
+    *,
+    project: ProjectInfo | None = None,
+    plan: ConversionPlan | None = None,
+    goal: PrintGoal | None = None,
+) -> list[Advice]:
+    """Combina sugestões da IA com ajustes locais, aplicando política conservadora única."""
+    conflict_reasons: list[str] = []
+    filtered_ai = list(ai_advices)
+    if plan is not None:
+        policy_res = enforce_advice_policy(project, plan, goal, filtered_ai)
+        filtered_ai = list(policy_res.accepted)
+        conflict_reasons.extend(policy_res.reasons)
+
+    merged: list[Advice] = list(filtered_ai)
     seen_titles = {adv.title.strip().lower() for adv in merged if adv.scope == "alert"}
-    seen_keys = {
-        (adv.scope, adv.slot, adv.key)
-        for adv in merged
+    key_index = {
+        (adv.scope, adv.slot, adv.key): idx
+        for idx, adv in enumerate(merged)
         if adv.scope != "alert" and adv.key
     }
     for adv in offline_advices:
@@ -2351,9 +2394,23 @@ def merge_with_offline_alerts(ai_advices: list[Advice], offline_advices: list[Ad
                 merged.append(adv)
             continue
         identity = (adv.scope, adv.slot, adv.key)
-        if identity not in seen_keys:
-            seen_keys.add(identity)
+        if identity not in key_index:
+            key_index[identity] = len(merged)
             merged.append(adv)
+        elif plan is not None and adv.key in HARD_POLICY_RULES:
+            existing_idx = key_index[identity]
+            existing = merged[existing_idx]
+            if _relaxes_baseline(existing, adv):
+                conflict_reasons.append(
+                    f"Proposta externa para {adv.key} ({existing.proposed}) foi substituída "
+                    f"pelo valor conservador local ({adv.proposed})."
+                )
+                merged[existing_idx] = adv
+
+    if conflict_reasons:
+        conflict_alert = build_policy_conflict_alert(conflict_reasons, source_label="IA")
+        if conflict_alert.title.strip().lower() not in seen_titles:
+            merged.append(conflict_alert)
     return _consolidate_advices(merged)
 
 

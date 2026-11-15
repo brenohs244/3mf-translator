@@ -15,7 +15,7 @@ from maker_elegoo.ai_client import GeminiClient, advise_gemini
 from maker_elegoo.converter import ConversionResult
 from maker_elegoo.mapping import ConversionPlan
 from maker_elegoo.optimization import compare_objectives, format_objective_comparison
-from maker_elegoo.professor import Advice, PrintGoal, merge_with_offline_alerts
+from maker_elegoo.professor import Advice, PrintGoal, advise_offline, merge_with_offline_alerts
 from maker_elegoo.profiles import Profile
 from maker_elegoo.project import FilamentInfo, PlateInfo, ProjectInfo
 from maker_elegoo.slicer import ExportResult, SlicerCLI, ValidationResult
@@ -209,6 +209,21 @@ class RevisaoAIAndOptimizationTests(unittest.TestCase):
         # ui._compare_objectives também deve repassar goal=self._current_goal()
         src_compare = inspect.getsource(MakerElegooApp._compare_objectives)
         self.assertIn("_current_goal", src_compare)
+
+    def test_merge_with_offline_alerts_with_context_blocks_incompatible_ai_and_warns(self):
+        proj = self._proj(("PLA",), used=("1",))
+        plan = self._plan()
+        goal = PrintGoal("esforco", "equilibrio", load_type="flexao_lateral", physical_material="ABS")
+        bad_fan = Advice("filament", 1, "fan_max_speed", "35", "95", "IA: Vento 95%", "Secar rápido", True)
+        good_seam = Advice("process", None, "seam_position", "aligned", "back", "IA: Costura traseira", "Visual", True)
+        offline = advise_offline(proj, plan, goal)
+        merged = merge_with_offline_alerts([bad_fan, good_seam], offline, project=proj, plan=plan, goal=goal)
+
+        fan_props = [a for a in merged if a.scope == "filament" and a.key == "fan_max_speed"]
+        self.assertEqual(len(fan_props), 1)
+        self.assertLessEqual(int(fan_props[0].proposed), 35)
+        self.assertTrue(any(a.scope == "process" and a.key == "seam_position" and a.proposed == "back" for a in merged))
+        self.assertTrue(any(a.scope == "alert" and "conflito" in a.title.lower() for a in merged))
 
 
 if __name__ == "__main__":
