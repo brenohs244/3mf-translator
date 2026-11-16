@@ -9,6 +9,7 @@ from typing import Any
 
 from .advice_policy import HARD_POLICY_RULES, build_policy_conflict_alert, enforce_advice_policy
 from .labels import (
+    completeness_label,
     confidence_label,
     criticality_label,
     evidence_label,
@@ -224,8 +225,8 @@ def source_material_summary(project: ProjectInfo) -> dict[str, Any]:
     }
 
 
-def goal_confidence(goal: PrintGoal) -> tuple[str, list[str]]:
-    """Calcula nível de confiança da recomendação e lista lacunas ('Não sei')."""
+def goal_context_completeness(goal: PrintGoal) -> tuple[str, list[str]]:
+    """Avalia apenas quão completo está o contexto informado pelo usuário, sem medir confiança física."""
     reasons: list[str] = []
     if goal.purpose == "nao_sei":
         reasons.append("Uso principal da peça não foi informado ('Não sei').")
@@ -246,10 +247,17 @@ def goal_confidence(goal: PrintGoal) -> tuple[str, list[str]]:
             reasons.append("Exposição a calor/sol/umidade está em 'Não sei'.")
 
     if goal.purpose == "nao_sei" or len(reasons) >= 2:
-        return "baixa", reasons
+        return "incompleto", reasons
     if len(reasons) == 1:
-        return "media", reasons
-    return "alta", reasons
+        return "parcial", reasons
+    return "completo", reasons
+
+
+def goal_confidence(goal: PrintGoal) -> tuple[str, list[str]]:
+    """Wrapper de compatibilidade interna; não confunde preenchimento do formulário com prova física."""
+    completeness, reasons = goal_context_completeness(goal)
+    legacy_map = {"completo": "alta", "parcial": "media", "incompleto": "baixa"}
+    return legacy_map.get(completeness, "baixa"), reasons
 
 
 def validate_change(scope: str, key: str, value: str, plan: ConversionPlan, slot: int | None = None) -> bool:
@@ -877,7 +885,9 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
     advices: list[Advice] = []
     proc = plan.process_settings
     effective_support, obj_only_support, effective_support_type = _effective_object_support(project, proc)
-    conf, conf_reasons = goal_confidence(goal)
+    comp, conf_reasons = goal_context_completeness(goal)
+    # Completude do formulário nunca eleva evidência física acima de estimativa conservadora ('media').
+    conf = "baixa" if comp == "incompleto" else "media"
 
     src_info = source_material_summary(project)
     used_slots_set = {
@@ -899,16 +909,16 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
     has_heavy_overhang = bool(geom is not None and getattr(geom, "overhang_mm2", 0.0) >= 250.0)
     is_articulated = goal.purpose in {"moveis", "chaveiro_articulado"} or goal.fit_clearance == "partes_moveis"
 
-    # 0. Alerta de confiança quando houver itens em 'Não sei'
+    # 0. Alerta de contexto incompleto quando houver itens em 'Não sei'
     if conf_reasons:
         advices.append(Advice(
             scope="alert", slot=None, key="", current="", proposed="",
-            title=f"Confiança da recomendação: {confidence_label(conf).split(' (')[0]}",
+            title=f"Contexto informado: {completeness_label(comp).split(' (')[0]}",
             why=" ".join(conf_reasons),
-            expected_effect="Informar que faltam dados do uso real; ajustes críticos permanecem dependentes de conferência.",
+            expected_effect="Informar lacunas no uso real; ajustes críticos permanecem conservadores e dependentes de conferência.",
             what_to_check="Preencha carga, criticidade, encaixes, calor e filamento físico ou valide em peça de teste.",
             evidence_class="estimado_regra_ia",
-            requires_physical_test=(conf == "baixa"),
+            requires_physical_test=(comp == "incompleto"),
             confidence=conf,
             default_on=False,
         ))
@@ -1558,7 +1568,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 what_to_check="Avalie na prévia do ELEGOO Slicer se há 'degraus' visíveis no topo.",
                 evidence_class="estimado_regra_ia",
                 requires_physical_test=False,
-                confidence="alta",
+                confidence=conf,
                 default_on=False,
             ))
 
@@ -1685,7 +1695,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 what_to_check="Identifique na barra vertical da prévia a altura Z onde começa o texto em relevo.",
                 evidence_class="estimado_regra_ia",
                 requires_physical_test=False,
-                confidence="alta",
+                confidence=conf,
                 default_on=False,
             ))
 
@@ -2309,7 +2319,7 @@ def advise_offline(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal) 
                 what_to_check="Confirme aderência visual nos cantos da 1ª camada.",
                 evidence_class="verificado_3mf",
                 requires_physical_test=False,
-                confidence="alta",
+                confidence=conf,
                 default_on=False,
             ))
 
@@ -2473,8 +2483,8 @@ def needs_user_intervention(
         else:
             reasons.append("Filamento físico carregado na impressora ainda não foi confirmado.")
 
-    conf, conf_reasons = goal_confidence(goal)
-    if conf == "baixa":
+    comp, conf_reasons = goal_context_completeness(goal)
+    if comp == "incompleto":
         reasons.extend(conf_reasons)
 
     if any(adv.scope != "alert" for adv in advices):
@@ -2536,7 +2546,7 @@ def build_preconversion_card(
     )
     color_mode = "troca automática/pausa na placa" if single_plate_multi else ("troca entre placas" if plate_count > 1 and slot_count > 1 else "cor única")
 
-    conf, _ = goal_confidence(goal)
+    comp, _ = goal_context_completeness(goal)
     needs_decision, decision_reasons = needs_user_intervention(
         project, plan, goal, advices, physical_confirmed=physical_confirmed
     )
@@ -2551,10 +2561,10 @@ def build_preconversion_card(
 
     lines = [
         "CARTÃO PRÉ-CONVERSÃO",
+        f"• Informações fornecidas (contexto): {completeness_label(comp).split(' (')[0]} · Filamento: {phys_status}",
         f"• {evidence_label('verificado_3mf')}: Origem {src_info['label']} · {plate_count} placa(s), {slot_count} filamento(s) usado(s) ({color_mode})",
-        f"• Filamento físico na impressora: {phys_status}",
         f"• Perfis ELEGOO sugeridos: {plan.machine.name} · {plan.process.name} · {', '.join(dict.fromkeys(p.name for p in plan.filaments))}",
-        f"• {evidence_label('estimado_regra_ia')} (Confiança {confidence_label(conf).split(' (')[0]}): " + " · ".join(changes),
+        f"• {evidence_label('estimado_regra_ia')}: " + " · ".join(changes) + " (regras estimadas, não comprovam resistência física)",
         f"• Riscos / decisões exigidas: {risks_txt}" + (" [Requer confirmação]" if needs_decision else ""),
         f"• {evidence_label('verificado_fatiamento')}: será executado ao clicar em 'Traduzir para minha ELEGOO'.",
         f"• {evidence_label('depende_teste_fisico')}: Fatiar não prova acabamento, estabilidade dimensional nem resistência mecânica.",
@@ -2588,7 +2598,7 @@ def build_print_summary(
     src_summary = src_info["label"]
     dst_summary = "/".join(dict.fromkeys(dst_mats))
     is_abs_asa = any(_is_abs_asa_material(m) for m in dst_mats)
-    conf, _ = goal_confidence(goal)
+    comp, _ = goal_context_completeness(goal)
 
     if is_abs_asa:
         fans = [
@@ -2646,10 +2656,10 @@ def build_print_summary(
     )
     lines = [
         f"• Material: {src_summary} → {dst_summary}{mode_note}",
-        f"• Uso, contexto e prioridade: {purpose_label(goal.purpose)} · {priority_label(goal.priority)} · Carga: {load_type_label(goal.load_type)}",
+        f"• Informações fornecidas (contexto {completeness_label(comp).split(' (')[0]}): {purpose_label(goal.purpose)} · {priority_label(goal.priority)} · Carga: {load_type_label(goal.load_type)}",
         f"• {evidence_label('verificado_3mf')}: {len(project.plates)} placa(s) · {len(project.objects)} objeto(s) · camada original {project.source_settings.get('layer_height', '?')} mm.",
         f"• {evidence_label('verificado_fatiamento')}: {slicing_line}",
-        f"• {evidence_label('estimado_regra_ia')} (Confiança {confidence_label(conf).split(' (')[0]}): {cooling_line} Ponto de partida estrutural: {walls} paredes · topo {top_layers} camadas · preenchimento {infill} ({pattern}) · camada {layer_h} mm.",
+        f"• {evidence_label('estimado_regra_ia')} (não comprova resultado físico): {cooling_line} Ponto de partida estrutural: {walls} paredes · topo {top_layers} camadas · preenchimento {infill} ({pattern}) · camada {layer_h} mm.",
         sup_line,
     ]
     if is_abs_asa:

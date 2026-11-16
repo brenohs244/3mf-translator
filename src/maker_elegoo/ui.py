@@ -44,6 +44,7 @@ from .labels import (
     LOAD_TYPE_LABELS,
     PRIORITY_LABELS,
     PURPOSE_LABELS,
+    completeness_label,
     confidence_label,
     criticality_code,
     criticality_label,
@@ -82,6 +83,7 @@ from .professor import (
     build_preconversion_card,
     build_print_summary,
     goal_confidence,
+    goal_context_completeness,
     merge_with_offline_alerts,
     needs_user_intervention,
 )
@@ -374,8 +376,12 @@ class MakerElegooApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Maker → ELEGOO")
-        self.geometry("980x760")
-        self.minsize(740, 600)
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        win_w = min(960, max(640, sw - 40)) if sw > 0 else 960
+        win_h = min(700, max(480, sh - 70)) if sh > 0 else 700
+        self.geometry(f"{win_w}x{win_h}")
+        self.minsize(min(700, win_w), min(500, win_h))
         self.preferences = load_settings()
         self.project: ProjectInfo | None = None
         self.install: SlicerInstall | None = None
@@ -427,7 +433,8 @@ class MakerElegooApp(tk.Tk):
         self.heat_exposure_var = tk.StringVar(value=heat_exposure_label(self.preferences.get("heat_exposure", "nao_sei")))
         self.save_history_var = tk.BooleanVar(value=self.preferences.get("save_print_history", "0") == "1")
         self.advanced_visible = tk.BooleanVar(value=False)
-        self.confidence_var = tk.StringVar(value="Confiança: Baixa")
+        self.journey_step_var = tk.StringVar(value="Etapa 1/3: Escolha o arquivo 3MF de origem")
+        self.confidence_var = tk.StringVar(value="Contexto informado: Incompleto | Teste físico: pendente")
         self.preconversion_var = tk.StringVar(
             value="Escolha um projeto 3MF e confirme o filamento físico carregado na ELEGOO."
         )
@@ -492,19 +499,68 @@ class MakerElegooApp(tk.Tk):
         tools_menu.add_command(label="Registrar resultado da impressão (histórico local)", command=self._open_feedback_dialog)
         menu.add_cascade(label="Ferramentas", menu=tools_menu)
         self.configure(menu=menu)
-        outer = ttk.Frame(self, padding=14)
-        outer.pack(fill="both", expand=True)
+        scroll_host = ttk.Frame(self)
+        scroll_host.pack(fill="both", expand=True)
+        self.main_canvas = tk.Canvas(scroll_host, borderwidth=0, highlightthickness=0, takefocus=0)
+        main_scroll = ttk.Scrollbar(scroll_host, orient="vertical", command=self.main_canvas.yview)
+        self.main_canvas.configure(yscrollcommand=main_scroll.set)
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        main_scroll.pack(side="right", fill="y")
+        outer = ttk.Frame(self.main_canvas, padding=14)
         self._outer_frame = outer
+        canvas_window = self.main_canvas.create_window((0, 0), window=outer, anchor="nw")
+
+        def _sync_scrollregion(_event=None):
+            try:
+                if self.main_canvas.winfo_exists():
+                    self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+            except tk.TclError:
+                pass
+
+        def _sync_width(event):
+            try:
+                if self.main_canvas.winfo_exists():
+                    self.main_canvas.itemconfigure(canvas_window, width=event.width)
+                    wrap_w = max(360, event.width - 72)
+                    for lbl_attr in ("confidence_label", "preconversion_label", "result_banner_label"):
+                        lbl = getattr(self, lbl_attr, None)
+                        if lbl is not None and lbl.winfo_exists():
+                            lbl.configure(wraplength=wrap_w)
+            except tk.TclError:
+                pass
+
+        def _on_mousewheel(event):
+            try:
+                if self.main_canvas.winfo_exists():
+                    self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except tk.TclError:
+                pass
+
+        outer.bind("<Configure>", _sync_scrollregion)
+        self.main_canvas.bind("<Configure>", _sync_width)
+        self.bind("<MouseWheel>", _on_mousewheel)
+        self.bind("<F5>", lambda _e: self._convert())
+
         ttk.Label(outer, text="Maker → ELEGOO", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
             text="Traduza projetos MakerWorld para sua Centauri Carbon 2 com validação real e orientações honestas.",
-        ).pack(anchor="w", pady=(2, 10))
+            wraplength=860,
+        ).pack(anchor="w", pady=(2, 4))
+        ttk.Label(
+            outer,
+            textvariable=self.journey_step_var,
+            font=("Segoe UI", 9, "bold"),
+            foreground="#1F3A52",
+            wraplength=860,
+        ).pack(anchor="w", pady=(0, 8))
 
         source = ttk.LabelFrame(outer, text="1  Projeto 3MF de origem", padding=10)
         source.pack(fill="x", pady=(0, 8))
         source.columnconfigure(0, weight=1)
-        ttk.Entry(source, textvariable=self.file_var).grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        file_entry = ttk.Entry(source, textvariable=self.file_var)
+        file_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        file_entry.bind("<Return>", lambda _e: self._inspect_file())
         ttk.Button(source, text="Escolher 3MF", command=self._choose_file).grid(row=0, column=1)
         ttk.Button(source, text="Analisar", command=self._inspect_file).grid(row=0, column=2, padx=(8, 0))
 
@@ -582,34 +638,39 @@ class MakerElegooApp(tk.Tk):
                                            values=tuple(PRIORITY_LABELS.values()))
         self.priority_combo.grid(row=0, column=3, sticky="ew")
 
-        ttk.Label(consultant, text="Carga principal:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
-        self.load_type_combo = ttk.Combobox(consultant, textvariable=self.load_type_var, state="readonly",
+        self.mechanics_frame = ttk.Frame(consultant)
+        self.mechanics_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
+        self.mechanics_frame.columnconfigure(1, weight=1)
+        self.mechanics_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(self.mechanics_frame, text="Carga principal:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.load_type_combo = ttk.Combobox(self.mechanics_frame, textvariable=self.load_type_var, state="readonly",
                                             values=tuple(LOAD_TYPE_LABELS.values()))
-        self.load_type_combo.grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(0, 10))
-        ttk.Label(consultant, text="Criticidade:").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
-        self.criticality_combo = ttk.Combobox(consultant, textvariable=self.criticality_var, state="readonly",
+        self.load_type_combo.grid(row=0, column=1, sticky="ew", padx=(0, 10))
+        ttk.Label(self.mechanics_frame, text="Criticidade:").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.criticality_combo = ttk.Combobox(self.mechanics_frame, textvariable=self.criticality_var, state="readonly",
                                               values=tuple(CRITICALITY_LABELS.values()))
-        self.criticality_combo.grid(row=1, column=3, sticky="ew", pady=(6, 0))
+        self.criticality_combo.grid(row=0, column=3, sticky="ew")
 
-        ttk.Label(consultant, text="Encaixes / Folgas:").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
-        self.fit_clearance_combo = ttk.Combobox(consultant, textvariable=self.fit_clearance_var, state="readonly",
+        ttk.Label(self.mechanics_frame, text="Encaixes / Folgas:").grid(row=1, column=0, sticky="w", padx=(0, 6), pady=(6, 0))
+        self.fit_clearance_combo = ttk.Combobox(self.mechanics_frame, textvariable=self.fit_clearance_var, state="readonly",
                                                 values=tuple(FIT_LABELS.values()))
-        self.fit_clearance_combo.grid(row=2, column=1, sticky="ew", pady=(6, 0), padx=(0, 10))
-        ttk.Label(consultant, text="Calor / Sol / Água:").grid(row=2, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
-        self.heat_exposure_combo = ttk.Combobox(consultant, textvariable=self.heat_exposure_var, state="readonly",
+        self.fit_clearance_combo.grid(row=1, column=1, sticky="ew", pady=(6, 0), padx=(0, 10))
+        ttk.Label(self.mechanics_frame, text="Calor / Sol / Água:").grid(row=1, column=2, sticky="w", padx=(0, 6), pady=(6, 0))
+        self.heat_exposure_combo = ttk.Combobox(self.mechanics_frame, textvariable=self.heat_exposure_var, state="readonly",
                                                 values=tuple(HEAT_EXPOSURE_LABELS.values()))
-        self.heat_exposure_combo.grid(row=2, column=3, sticky="ew", pady=(6, 0))
+        self.heat_exposure_combo.grid(row=1, column=3, sticky="ew", pady=(6, 0))
 
-        self.confidence_label = ttk.Label(consultant, textvariable=self.confidence_var, foreground="#333333")
-        self.confidence_label.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 2))
+        self.confidence_label = ttk.Label(consultant, textvariable=self.confidence_var, foreground="#333333", wraplength=860)
+        self.confidence_label.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 2))
         self.preconversion_label = ttk.Label(
             consultant,
             textvariable=self.preconversion_var,
-            wraplength=900,
+            wraplength=860,
             justify="left",
             foreground="#1F3A52",
         )
-        self.preconversion_label.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(2, 0))
+        self.preconversion_label.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(2, 0))
 
         actions = ttk.Frame(outer)
         actions.pack(fill="x", pady=(0, 8))
@@ -691,11 +752,29 @@ class MakerElegooApp(tk.Tk):
             self.report_frame,
             textvariable=self.result_banner_var,
             foreground="#146C2E",
-            wraplength=920,
+            wraplength=860,
             justify="left",
         )
         self.result_banner_label.pack(anchor="w", pady=(0, 4))
-        self.report = scrolledtext.ScrolledText(self.report_frame, wrap="word", font=("Consolas", 10), state="disabled")
+        self.quick_compare_frame = ttk.Frame(self.report_frame)
+        self.quick_compare_frame.pack(fill="x", pady=(0, 6))
+        ttk.Label(self.quick_compare_frame, text="Testar prioridade no resultado:", foreground="#333333").pack(side="left", padx=(0, 8))
+        self.quick_qualidade_btn = ttk.Button(
+            self.quick_compare_frame, text="Qualidade", command=lambda: self._quick_convert_objective("qualidade")
+        )
+        self.quick_qualidade_btn.pack(side="left", padx=(0, 6))
+        self.quick_equilibrio_btn = ttk.Button(
+            self.quick_compare_frame, text="Equilíbrio", command=lambda: self._quick_convert_objective("equilibrio")
+        )
+        self.quick_equilibrio_btn.pack(side="left", padx=(0, 6))
+        self.quick_velocidade_btn = ttk.Button(
+            self.quick_compare_frame, text="Velocidade", command=lambda: self._quick_convert_objective("velocidade")
+        )
+        self.quick_velocidade_btn.pack(side="left", padx=(0, 8))
+        ttk.Button(
+            self.quick_compare_frame, text="Comparar todas (5)", command=self._compare_objectives
+        ).pack(side="left")
+        self.report = scrolledtext.ScrolledText(self.report_frame, wrap="word", font=("Consolas", 10), height=11, state="disabled")
         self.report.pack(fill="both", expand=True)
         self._set_report("O arquivo original permanece intacto. O G-code de validação é temporário e nunca é enviado à impressora.")
 
@@ -1072,6 +1151,15 @@ class MakerElegooApp(tk.Tk):
         self._save_preferences()
         self._update_context_preview()
 
+    def _quick_convert_objective(self, objective: str):
+        self.priority_var.set(priority_label(objective))
+        if self.project is not None:
+            self._convert()
+        else:
+            self.status_var.set(
+                f"Prioridade ajustada para {priority_label(objective).split(' (')[0]} — escolha um 3MF para traduzir."
+            )
+
     def _on_physical_filament_changed(self):
         raw_mat = self.physical_material_var.get().strip()
         if raw_mat in {"", "Não sei informar"}:
@@ -1148,21 +1236,42 @@ class MakerElegooApp(tk.Tk):
 
     def _update_context_preview(self):
         goal = self._current_goal()
-        conf, reasons = goal_confidence(goal)
-        conf_txt = confidence_label(conf)
-        if conf == "baixa" and reasons:
-            self.confidence_var.set(f"Confiança da recomendação: {conf_txt} — faltam respostas ({len(reasons)} item(ns))")
+        if hasattr(self, "mechanics_frame"):
+            if goal.purpose == "decorativa":
+                self.mechanics_frame.grid_remove()
+            else:
+                self.mechanics_frame.grid()
+
+        comp, reasons = goal_context_completeness(goal)
+        comp_short = completeness_label(comp).split(" (")[0]
+        sliced_txt = "validado no G-code" if (self.result and getattr(self.result, "success", False)) else "pendente"
+        if reasons:
+            self.confidence_var.set(
+                f"Contexto informado: {comp_short} ({len(reasons)} item(ns) em 'Não sei') | "
+                f"Regras: estimativa | Fatiamento: {sliced_txt} | Teste físico: pendente"
+            )
         else:
-            self.confidence_var.set(f"Confiança da recomendação: {conf_txt}")
+            self.confidence_var.set(
+                f"Contexto informado: {comp_short} (não comprova resistência) | "
+                f"Regras: estimativa | Fatiamento: {sliced_txt} | Teste físico: pendente"
+            )
 
         if not self.project:
+            self.journey_step_var.set("Etapa 1/3: Escolha o arquivo 3MF de origem e clique em Analisar.")
             self.preconversion_var.set("Escolha um projeto 3MF e confirme o filamento físico carregado na ELEGOO.")
             return
         if not self.install:
+            self.journey_step_var.set("Bloqueio: Localize o ELEGOO Slicer para validar e carregar perfis.")
             self.preconversion_var.set("Localize o ELEGOO Slicer para carregar perfis e montar o cartão pré-conversão.")
             return
         targets = self._collect_slot_targets()
         mat_ok, mat_errors = validate_slot_material_plan(self.project, targets, self.install)
+        if not mat_ok:
+            self.journey_step_var.set("Etapa 2/3: Confirme o material físico em cada slot usado (há pendências abaixo).")
+        elif self.result and getattr(self.result, "success", False):
+            self.journey_step_var.set("Concluído (Etapa 4/4): Revise estimativas, alterne Qualidade/Equilíbrio/Velocidade ou abra no ELEGOO Slicer.")
+        else:
+            self.journey_step_var.set("Etapa 3/3: Confira uso/prioridade no cartão e clique em Traduzir para minha ELEGOO.")
         active = active_filament_slots(self.project)
         missing_prof = any(
             t.slot in active and t.profile is None
@@ -2034,54 +2143,114 @@ class MakerElegooApp(tk.Tk):
         check_vars: list[tuple[Advice, tk.BooleanVar]] = []
         adjustments = [adv for adv in advices if adv.scope != "alert"]
         alerts = [adv for adv in advices if adv.scope == "alert"]
+        policy_conflicts = [adv for adv in alerts if "conflito" in adv.title.lower()]
+        general_alerts = [adv for adv in alerts if "conflito" not in adv.title.lower()]
 
         if self.project is not None:
-            goal = self._current_goal()
+            active_goal = goal or self._current_goal()
             summary_box = ttk.LabelFrame(scrollable_frame, text="Resumo para impressão", padding=8)
             summary_box.pack(fill="x", expand=True, pady=(0, 8), padx=4)
             ttk.Label(
                 summary_box,
-                text=build_print_summary(self.project, plan, goal, advices),
+                text=build_print_summary(self.project, plan, active_goal, advices),
                 wraplength=700,
                 justify="left",
             ).pack(anchor="w")
 
+        group_overview = ttk.LabelFrame(scrollable_frame, text="Visão agrupada antes de aplicar", padding=8)
+        group_overview.pack(fill="x", expand=True, pady=(0, 8), padx=4)
+        ttk.Label(
+            group_overview,
+            text=(
+                f"{min(3, len(adjustments))} decisão(ões) em destaque · {max(0, len(adjustments) - 3)} ajuste(s) adicional(is) · "
+                f"{len(general_alerts)} alerta(s) técnico(s) · {len(policy_conflicts)} conflito(s) bloqueado(s) pela política."
+            ),
+            wraplength=700,
+            justify="left",
+            foreground="#1F3A52",
+        ).pack(anchor="w")
+
+        def _render_adjustment_card(parent: ttk.Widget, adv: Advice) -> None:
+            adv_box = ttk.LabelFrame(parent, text=adv.title, padding=8)
+            adv_box.pack(fill="x", expand=True, pady=4, padx=4)
+            var = tk.BooleanVar(value=adv.default_on)
+            chk = ttk.Checkbutton(
+                adv_box,
+                text=f"Aplicar: {adv.current} → {adv.proposed} ({evidence_label(adv.evidence_class)})",
+                variable=var,
+            )
+            chk.pack(anchor="w")
+            ttk.Label(adv_box, text=f"Motivo: {adv.why}", wraplength=680, foreground="#333333").pack(
+                anchor="w", pady=(4, 0)
+            )
+            if getattr(adv, "expected_effect", ""):
+                ttk.Label(
+                    adv_box,
+                    text=f"Efeito esperado: {adv.expected_effect}",
+                    wraplength=680,
+                    foreground="#1F3A52",
+                ).pack(anchor="w", pady=(2, 0))
+            if getattr(adv, "what_to_check", ""):
+                ttk.Label(
+                    adv_box,
+                    text=f"O que conferir: {adv.what_to_check}",
+                    wraplength=680,
+                    foreground="#444444",
+                ).pack(anchor="w", pady=(2, 0))
+            check_vars.append((adv, var))
+
+        if policy_conflicts:
+            conflict_section = ttk.LabelFrame(scrollable_frame, text="Conflitos bloqueados pela política conservadora", padding=8)
+            conflict_section.pack(fill="x", expand=True, pady=(0, 8), padx=4)
+            for adv in policy_conflicts:
+                adv_box = ttk.LabelFrame(conflict_section, text=adv.title, padding=8)
+                adv_box.pack(fill="x", expand=True, pady=4, padx=4)
+                ttk.Label(adv_box, text=adv.why, foreground="#B3261E", wraplength=680).pack(anchor="w")
+                if getattr(adv, "what_to_check", ""):
+                    ttk.Label(adv_box, text=f"O que conferir: {adv.what_to_check}", wraplength=680, foreground="#444444").pack(anchor="w", pady=(2, 0))
+
+        extra_adjustments_frame = ttk.Frame(scrollable_frame)
+        dialog._extra_adjustments_frame = extra_adjustments_frame
+        extra_visible = tk.BooleanVar(value=False)
+
         if adjustments:
+            top_adjustments = adjustments[:3]
+            extra_adjustments = adjustments[3:]
             adj_section = ttk.LabelFrame(scrollable_frame, text="Ajustes recomendados", padding=8)
             adj_section.pack(fill="x", expand=True, pady=(0, 8), padx=4)
-            for adv in adjustments:
-                adv_box = ttk.LabelFrame(adj_section, text=adv.title, padding=8)
-                adv_box.pack(fill="x", expand=True, pady=4, padx=4)
-                var = tk.BooleanVar(value=adv.default_on)
-                chk = ttk.Checkbutton(
-                    adv_box,
-                    text=f"Aplicar: {adv.current} → {adv.proposed} ({evidence_label(adv.evidence_class)})",
-                    variable=var,
-                )
-                chk.pack(anchor="w")
-                ttk.Label(adv_box, text=f"Motivo: {adv.why}", wraplength=680, foreground="#333333").pack(
-                    anchor="w", pady=(4, 0)
-                )
-                if getattr(adv, "expected_effect", ""):
-                    ttk.Label(
-                        adv_box,
-                        text=f"Efeito esperado: {adv.expected_effect}",
-                        wraplength=680,
-                        foreground="#1F3A52",
-                    ).pack(anchor="w", pady=(2, 0))
-                if getattr(adv, "what_to_check", ""):
-                    ttk.Label(
-                        adv_box,
-                        text=f"O que conferir: {adv.what_to_check}",
-                        wraplength=680,
-                        foreground="#444444",
-                    ).pack(anchor="w", pady=(2, 0))
-                check_vars.append((adv, var))
+            ttk.Label(
+                adj_section,
+                text="Principais decisões em destaque (até 3):",
+                foreground="#1F3A52",
+            ).pack(anchor="w", padx=4, pady=(0, 2))
+            for adv in top_adjustments:
+                _render_adjustment_card(adj_section, adv)
 
-        if alerts:
+            if extra_adjustments:
+                def _toggle_extra_adjustments():
+                    new_state = not extra_visible.get()
+                    extra_visible.set(new_state)
+                    if new_state:
+                        extra_adjustments_frame.pack(fill="x", expand=True, pady=(4, 0), in_=adj_section)
+                        extra_toggle_btn.configure(text=f"Ocultar {len(extra_adjustments)} ajuste(s) adicional(is) ▴")
+                    else:
+                        extra_adjustments_frame.pack_forget()
+                        extra_toggle_btn.configure(text=f"Ver mais {len(extra_adjustments)} ajuste(s) adicional(is) ▸")
+
+                dialog._toggle_extra_adjustments = _toggle_extra_adjustments
+                extra_toggle_btn = ttk.Button(
+                    adj_section,
+                    text=f"Ver mais {len(extra_adjustments)} ajuste(s) adicional(is) ▸",
+                    command=_toggle_extra_adjustments,
+                )
+                extra_toggle_btn.pack(anchor="w", pady=(4, 0), padx=4)
+                for adv in extra_adjustments:
+                    _render_adjustment_card(extra_adjustments_frame, adv)
+
+        if general_alerts:
             alert_section = ttk.LabelFrame(scrollable_frame, text="Avisos e dicas", padding=8)
             alert_section.pack(fill="x", expand=True, pady=(0, 8), padx=4)
-            for adv in alerts:
+            for adv in general_alerts:
                 adv_box = ttk.LabelFrame(alert_section, text=adv.title, padding=8)
                 adv_box.pack(fill="x", expand=True, pady=4, padx=4)
                 phys_prefix = (
@@ -2514,6 +2683,7 @@ class MakerElegooApp(tk.Tk):
                 self._set_report(report)
                 self.status_var.set("Concluído" if result.success else "Falha; confira o relatório")
                 self._apply_result_actions(result)
+                self._update_context_preview()
                 if result.output_project:
                     self.ai_button.configure(state="normal")
         self._worker_after = self.after(150, self._poll_worker)

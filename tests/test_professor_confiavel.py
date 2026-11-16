@@ -355,6 +355,40 @@ class ProfessorConfiavelTests(unittest.TestCase):
         sum_ok = build_print_summary(self._proj(("PLA",)), plan_aux_ok, PrintGoal("esforco", "equilibrio", physical_material="ABS"), [])
         self.assertIn("desligada", sum_ok.lower())
 
+    def test_task4_goal_context_completeness_never_elevates_physical_confidence_and_keeps_nao_sei(self):
+        from maker_elegoo.professor import (
+            PrintGoal,
+            advise_offline,
+            build_preconversion_card,
+            build_print_summary,
+            goal_context_completeness,
+        )
+
+        proj = self._proj(("PLA",))
+        plan_pla = self._plan(self.fil_pla, self.pla_settings)
+        goal_dec = PrintGoal(
+            purpose="decorativa",
+            priority="equilibrio",
+            load_type="nao_sei",
+            criticality="nao_sei",
+            fit_clearance="nao_sei",
+            heat_exposure="nao_sei",
+            physical_material="PLA",
+        )
+        comp, reasons = goal_context_completeness(goal_dec)
+        self.assertEqual(comp, "completo")
+        self.assertEqual(reasons, [])
+        self.assertEqual(goal_dec.load_type, "nao_sei")
+
+        advices = advise_offline(proj, plan_pla, goal_dec)
+        self.assertTrue(all(a.confidence != "alta" for a in advices))
+        card = build_preconversion_card(proj, plan_pla, goal_dec, physical_confirmed=True, advices=advices)
+        summary = build_print_summary(proj, plan_pla, goal_dec, advices)
+        for txt in (card.lower(), summary.lower()):
+            self.assertIn("contexto", txt)
+            self.assertNotIn("resistência validada", txt)
+            self.assertIn("teste físico", txt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import time
+import tkinter as tk
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -241,7 +242,7 @@ class UIBeginnerFlowTests(unittest.TestCase):
                         from maker_elegoo.labels import purpose_label
 
                         app.purpose_var.set(purpose_label("esforco"))
-                        self.assertIn("baixa", app.confidence_var.get().lower())
+                        self.assertIn("incompleto", app.confidence_var.get().lower())
                         app.purpose_var.set(purpose_label("decorativa"))
 
                         # Sem ambiguidade/risco quando advices=() e confirmado -> não interrompe usuário
@@ -325,7 +326,7 @@ class UIBeginnerFlowTests(unittest.TestCase):
                     app.physical_filament_confirmed_var.set(True)
                     app._on_physical_filament_changed()
 
-                    self.assertIn("alta", app.confidence_var.get().lower())
+                    self.assertIn("completo", app.confidence_var.get().lower())
 
                     goal = app._current_goal()
                     self.assertEqual(goal.load_type, "tracao_eixo_z")
@@ -599,5 +600,105 @@ class UIBeginnerFlowTests(unittest.TestCase):
                     self.assertIn("NÃO afirmado como carregado", card)
                 finally:
                     app2.destroy()
+
+    def test_task4_progressive_flow_conditional_mechanics_quick_results_grouped_dialog_and_viewport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = _setup_fake_slicer_env(root)
+            proj = ProjectInfo(
+                root / "modelo.3mf",
+                {"printer_model": "Bambu Lab A1", "layer_height": "0.20"},
+                (FilamentInfo(1, "PLA", "#FFFFFF", "Bambu PLA"),),
+                (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+                ("Peca",),
+                (),
+                (),
+                used_filament_slots=("1",),
+            )
+            with patch.dict(os.environ, env):
+                app = MakerElegooApp()
+                try:
+                    # 1. Decorativa oculta perguntas mecânicas condicionais e mantém 'Não sei informar'
+                    from maker_elegoo.labels import load_type_label, purpose_label
+                    app.purpose_var.set(purpose_label("decorativa"))
+                    app.load_type_var.set(load_type_label("nao_sei"))
+                    app.update_idletasks()
+                    self.assertEqual(app.mechanics_frame.winfo_manager(), "")
+
+                    # 2. Troca para 'esforco' revela perguntas mecânicas sem inventar respostas
+                    app.purpose_var.set(purpose_label("esforco"))
+                    app.update_idletasks()
+                    self.assertNotEqual(app.mechanics_frame.winfo_manager(), "")
+                    self.assertEqual(app.load_type_var.get(), load_type_label("nao_sei"))
+                    self.assertIn("incompleto", app.confidence_var.get().lower())
+
+                    # 3. No resultado, acesso rápido a Qualidade/Equilíbrio/Velocidade sem abrir Avançado
+                    self.assertEqual(app.advanced_frame.winfo_manager(), "")
+                    self.assertTrue(hasattr(app, "quick_compare_frame"))
+                    self.assertNotEqual(app.quick_compare_frame.winfo_manager(), "")
+                    self.assertEqual(app.quick_qualidade_btn.cget("text"), "Qualidade")
+                    self.assertEqual(app.quick_equilibrio_btn.cget("text"), "Equilíbrio")
+                    self.assertEqual(app.quick_velocidade_btn.cget("text"), "Velocidade")
+
+                    # 4. Janela 1366x768 @ 100% e 150% DPI com scroll, quebra de texto extenso e foco por teclado
+                    app.preconversion_var.set("Texto extenso de teste " * 12)
+                    app.geometry("1366x768")
+                    for scale in (1.0, 1.5):
+                        app.tk.call("tk", "scaling", scale)
+                        app.update()
+                        self.assertLessEqual(app.winfo_reqwidth(), 1366)
+                        self.assertTrue(hasattr(app, "main_canvas"))
+                        self.assertGreater(int(app.preconversion_label.cget("wraplength")), 300)
+                        first_focus = app.purpose_combo
+                        first_focus.focus_set()
+                        nxt = first_focus.tk_focusNext()
+                        self.assertNotEqual(nxt, first_focus)
+
+                    # 5. Aprovação agrupada mostra no máx 3 destaques inicialmente e conflitos visíveis
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj):
+                        app.file_var.set(str(proj.path))
+                        app._inspect_file()
+                    plan = app._build_current_plan(*app._selected_profiles())
+                    advices = [
+                        Advice("process", None, "wall_loops", "2", "4", "Ajuste 1", "Motivo 1", True),
+                        Advice("process", None, "top_shell_layers", "3", "5", "Ajuste 2", "Motivo 2", True),
+                        Advice("process", None, "sparse_infill_density", "15%", "30%", "Ajuste 3", "Motivo 3", True),
+                        Advice("process", None, "seam_position", "aligned", "back", "Ajuste 4 extra", "Motivo 4", True),
+                        Advice("process", None, "outer_wall_speed", "160", "80", "Ajuste 5 extra", "Motivo 5", False),
+                        Advice(
+                            "alert", None, "", "", "",
+                            "Conflito com política conservadora (IA)",
+                            "IA propôs 1 parede; mantido piso de 4 paredes.",
+                            False,
+                        ),
+                    ]
+                    dlg = app._show_professor_dialog(plan, str(root / "out.3mf"), advices)
+                    try:
+                        dlg.update_idletasks()
+                        texts = []
+
+                        def _walk(w):
+                            try:
+                                t = str(w.cget("text"))
+                                if t:
+                                    texts.append(t)
+                            except tk.TclError:
+                                pass
+                            for c in w.winfo_children():
+                                _walk(c)
+
+                        _walk(dlg)
+                        joined = " | ".join(texts).lower()
+                        self.assertIn("conflito", joined)
+                        self.assertIn("mais 2", joined)
+                        self.assertTrue(hasattr(dlg, "_extra_adjustments_frame"))
+                        self.assertEqual(dlg._extra_adjustments_frame.winfo_manager(), "")
+                        dlg._toggle_extra_adjustments()
+                        dlg.update_idletasks()
+                        self.assertNotEqual(dlg._extra_adjustments_frame.winfo_manager(), "")
+                    finally:
+                        dlg.destroy()
+                finally:
+                    app.destroy()
 
 

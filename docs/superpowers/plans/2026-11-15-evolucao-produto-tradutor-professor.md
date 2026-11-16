@@ -71,11 +71,11 @@
 
 **Interfaces:** `goal_context_completeness(goal: PrintGoal) -> tuple[str, list[str]]` substitui significado público de `goal_confidence`; manter wrapper interno durante migração. Não usar completude para elevar confiança física de Advice. Estados visíveis: informações fornecidas, regras/estimativas, fatiamento e teste físico.
 
-- [ ] Testar decorativa+PLA: pode ter contexto completo, mas nunca evidência de resistência validada; “Não sei” preservado; perguntas mecânicas condicionais ao uso; troca de objetivo revela perguntas e não inventa respostas.
-- [ ] Testar acesso a qualidade/equilíbrio/velocidade no resultado sem abrir avançado; detalhes técnicos continuam disponíveis; aprovação agrupada exibe mudanças e conflitos da política antes de aplicar.
-- [ ] Rodar testes direcionados e confirmar falhas.
-- [ ] Implementar apresentação progressiva arquivo → material → uso/prioridade → resumo → resultado. Exibir em destaque no máximo três decisões, com acesso ao restante; não esconder bloqueios.
-- [ ] Verificar testes e janela a 1366×768 com escala de 100% e 150%, navegação por teclado e textos extensos; registrar evidências. Revisar e registrar commit.
+- [x] Testar decorativa+PLA: pode ter contexto completo, mas nunca evidência de resistência validada; “Não sei” preservado; perguntas mecânicas condicionais ao uso; troca de objetivo revela perguntas e não inventa respostas.
+- [x] Testar acesso a qualidade/equilíbrio/velocidade no resultado sem abrir avançado; detalhes técnicos continuam disponíveis; aprovação agrupada exibe mudanças e conflitos da política antes de aplicar.
+- [x] Rodar testes direcionados e confirmar falhas.
+- [x] Implementar apresentação progressiva arquivo → material → uso/prioridade → resumo → resultado. Exibir em destaque no máximo três decisões, com acesso ao restante; não esconder bloqueios.
+- [x] Verificar testes e janela a 1366×768 com escala de 100% e 150%, navegação por teclado e textos extensos; registrar evidências. Revisar e registrar commit.
 
 ## Task 5 — Professor orientado à aplicação e aprendizado (P2)
 

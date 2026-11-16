@@ -110,6 +110,12 @@ CONFIDENCE_LABELS: dict[str, str] = {
     "baixa": "Baixa (há itens em 'Não sei' ou sem confirmação física)",
 }
 
+CONTEXT_COMPLETENESS_LABELS: dict[str, str] = {
+    "completo": "Completo (informações fornecidas; não comprova resistência física)",
+    "parcial": "Parcial (há item em 'Não sei' — ponto de partida mais conservador)",
+    "incompleto": "Incompleto (itens em 'Não sei' ou filamento pendente)",
+}
+
 _PURPOSE_BY_LABEL = {label: code for code, label in PURPOSE_LABELS.items()}
 _PRIORITY_BY_LABEL = {label: code for code, label in PRIORITY_LABELS.items()}
 _LOAD_BY_LABEL = {label: code for code, label in LOAD_TYPE_LABELS.items()}
@@ -172,6 +178,10 @@ def evidence_label(code: str) -> str:
 
 def confidence_label(code: str) -> str:
     return CONFIDENCE_LABELS.get(code, code)
+
+
+def completeness_label(code: str) -> str:
+    return CONTEXT_COMPLETENESS_LABELS.get(code, code)
 
 
 def describe_change(key: str, before: str, after: str) -> str:
