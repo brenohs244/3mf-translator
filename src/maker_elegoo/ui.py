@@ -92,6 +92,7 @@ from .project import ProjectInfo, inspect_project
 from .scale import RescaleResult, ScaleError, analyze_scale_risk, rescale_3mf
 from .settings import load_settings, save_settings
 from .slicer import SlicerCLI, next_available_destination
+from .teaching import build_lessons, format_lessons
 
 
 def format_plate_color_guide(plates: tuple | list, filaments: tuple | list) -> list[str]:
@@ -307,6 +308,11 @@ def format_conversion_report(result: ConversionResult, plan: ConversionPlan,
         f"  • {evidence_label('estimado_regra_ia')}: {len(applied)} ajuste(s) sugerido(s) aplicados; {len(plan.material_findings)} troca(s) de material.",
         f"  • {evidence_label('depende_teste_fisico')}: {len(alerts)} aviso(s)/checagem(ns). Fatiar não prova acabamento, estabilidade dimensional nem resistência mecânica.",
     ])
+    if goal is not None and (result.output_project is not None or professor_advices):
+        lesson_project = result.output_project or ProjectInfo(result.destination, {}, (), (), (), (), ())
+        lessons = build_lessons(lesson_project, plan, goal, tuple(professor_advices))
+        if lessons:
+            lines.extend(["", format_lessons(lessons)])
     lines.extend(["", "Confira a posição das peças, cores, suportes e prévia no ELEGOO Slicer antes de imprimir."])
     return "\n".join(lines)
 
@@ -2156,6 +2162,34 @@ class MakerElegooApp(tk.Tk):
                 wraplength=700,
                 justify="left",
             ).pack(anchor="w")
+            lessons = build_lessons(self.project, plan, active_goal, tuple(advices))
+            if lessons:
+                lessons_frame = ttk.LabelFrame(scrollable_frame, text="Guia prático: por que isso importa e como conferir", padding=8)
+                ttk.Label(
+                    lessons_frame,
+                    text=format_lessons(lessons[:4]),
+                    wraplength=690,
+                    justify="left",
+                    foreground="#2A3B4C",
+                ).pack(anchor="w")
+                lessons_visible = tk.BooleanVar(value=False)
+
+                def _toggle_lessons():
+                    show = not lessons_visible.get()
+                    lessons_visible.set(show)
+                    if show:
+                        lessons_frame.pack(fill="x", expand=True, pady=(0, 8), padx=4, after=summary_box)
+                        lessons_btn.configure(text="Ocultar guia prático ▴")
+                    else:
+                        lessons_frame.pack_forget()
+                        lessons_btn.configure(text="Ver guia prático (o que observei / como conferir) ▸")
+
+                lessons_btn = ttk.Button(
+                    summary_box,
+                    text="Ver guia prático (o que observei / como conferir) ▸",
+                    command=_toggle_lessons,
+                )
+                lessons_btn.pack(anchor="w", pady=(6, 0))
 
         group_overview = ttk.LabelFrame(scrollable_frame, text="Visão agrupada antes de aplicar", padding=8)
         group_overview.pack(fill="x", expand=True, pady=(0, 8), padx=4)

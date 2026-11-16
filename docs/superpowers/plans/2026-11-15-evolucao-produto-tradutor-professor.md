@@ -83,11 +83,11 @@
 
 **Interfaces:** `Lesson(observed: str, reason: str, proposal: str, tradeoff: str, verification: str, evidence_class: str)`; `build_lessons(project: ProjectInfo, plan: ConversionPlan, goal: PrintGoal, advices: tuple[Advice, ...]) -> tuple[Lesson, ...]`. Reutilizar Advice.why/expected_effect/what_to_check; não criar segundo motor de recomendação.
 
-- [ ] Testar cenários decorativa PLA, funcional PLA→ABS, articulada ABS e carga em Z: cinco campos legíveis preenchidos, ausência de garantia mecânica, teste sugerido coerente com uso.
-- [ ] Testar explicação ABS distinguindo resfriamento da peça, AUX e câmara; nenhuma regra de percentual universal ou afirmação de câmara quente baseada só em tempo de pré-aquecimento.
-- [ ] Rodar `python -m unittest discover -s tests -p test_teaching.py` e confirmar falhas.
-- [ ] Implementar lições com fonte, condição de aplicação e limites; usar perfis reais como valores, referências técnicas como explicação. Identificar projetos com usos mistos como limitação do objetivo global, sem inferir função pela aparência.
-- [ ] Rodar testes, revisar textos com cenários da spec e registrar commit específico.
+- [x] Testar cenários decorativa PLA, funcional PLA→ABS, articulada ABS e carga em Z: cinco campos legíveis preenchidos, ausência de garantia mecânica, teste sugerido coerente com uso.
+- [x] Testar explicação ABS distinguindo resfriamento da peça, AUX e câmara; nenhuma regra de percentual universal ou afirmação de câmara quente baseada só em tempo de pré-aquecimento.
+- [x] Rodar `python -m unittest discover -s tests -p test_teaching.py` e confirmar falhas.
+- [x] Implementar lições com fonte, condição de aplicação e limites; usar perfis reais como valores, referências técnicas como explicação. Identificar projetos com usos mistos como limitação do objetivo global, sem inferir função pela aparência.
+- [x] Rodar testes, revisar textos com cenários da spec e registrar commit específico.
 
 ## Task 6 — Aceitação técnica e com iniciantes
 
