@@ -413,6 +413,9 @@ class MakerElegooApp(tk.Tk):
         self.orientation_generation = 0
         self._inspect_generation = 0
         self._pending_scale_advices: list[Advice] = []
+        self._closing = False
+        for _poll_attr in self._POLL_HANDLE_ATTRS:
+            setattr(self, _poll_attr, None)
 
         self.file_var = tk.StringVar()
         self.nozzle_var = tk.StringVar(value=self.preferences["nozzle"])
@@ -469,24 +472,60 @@ class MakerElegooApp(tk.Tk):
         self.scale_mode_var.trace_add("write", lambda *_: self._on_scale_mode_changed())
         self._refresh_profiles()
         self._update_context_preview()
-        self._worker_after = self.after(150, self._poll_worker)
-        self._ai_after = self.after(150, self._poll_ai)
-        self._professor_after = self.after(150, self._poll_professor)
-        self._orientation_after = self.after(150, self._poll_orientation)
-        self._comparison_after = self.after(150, self._poll_comparison)
-        self._inspect_after = self.after(150, self._poll_inspect)
-        self._preview_after = self.after(100, self._poll_preview)
-        self._calib_after = self.after(150, self._poll_calib)
+        self._schedule_poll("_worker_after", 150, self._poll_worker)
+        self._schedule_poll("_ai_after", 150, self._poll_ai)
+        self._schedule_poll("_professor_after", 150, self._poll_professor)
+        self._schedule_poll("_orientation_after", 150, self._poll_orientation)
+        self._schedule_poll("_comparison_after", 150, self._poll_comparison)
+        self._schedule_poll("_inspect_after", 150, self._poll_inspect)
+        self._schedule_poll("_preview_after", 100, self._poll_preview)
+        self._schedule_poll("_calib_after", 150, self._poll_calib)
+
+    _POLL_HANDLE_ATTRS = (
+        "_worker_after",
+        "_ai_after",
+        "_professor_after",
+        "_orientation_after",
+        "_comparison_after",
+        "_inspect_after",
+        "_preview_after",
+        "_calib_after",
+    )
+
+    def _should_stop_polling(self) -> bool:
+        if getattr(self, "_closing", False):
+            return True
+        try:
+            return not self.winfo_exists()
+        except tk.TclError:
+            return True
+
+    def _schedule_poll(self, attr_name: str, interval_ms: int, callback) -> None:
+        existing = getattr(self, attr_name, None)
+        setattr(self, attr_name, None)
+        if existing is not None:
+            try:
+                self.after_cancel(existing)
+            except tk.TclError:
+                pass
+        if self._should_stop_polling():
+            return
+        try:
+            setattr(self, attr_name, self.after(interval_ms, callback))
+        except tk.TclError:
+            setattr(self, attr_name, None)
 
     def destroy(self):
+        self._closing = True
         self.orientation_cancel.set()
-        for name in (
-            "_worker_after", "_ai_after", "_professor_after", "_orientation_after",
-            "_comparison_after", "_inspect_after", "_preview_after", "_calib_after",
-        ):
+        for name in self._POLL_HANDLE_ATTRS:
             callback = getattr(self, name, None)
+            setattr(self, name, None)
             if callback is not None:
-                self.after_cancel(callback)
+                try:
+                    self.after_cancel(callback)
+                except tk.TclError:
+                    pass
         super().destroy()
 
     def _build_layout(self):
@@ -891,24 +930,31 @@ class MakerElegooApp(tk.Tk):
         ttk.Label(window, text="IDs podem mudar na exportação. Confira posição, pintura, cores e suportes no ELEGOO Slicer.").pack(padx=12, pady=(0, 12))
 
     def _poll_comparison(self):
+        if self._should_stop_polling():
+            self._comparison_after = None
+            return
         try:
-            variants, error = self.comparison_queue.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            if error:
-                self.status_var.set("Falha na comparação")
-                self._set_report(str(error))
+            try:
+                variants, error = self.comparison_queue.get_nowait()
+            except queue.Empty:
+                pass
             else:
-                history_records = load_feedback_history() if self.save_history_var.get() else ()
-                report_text = format_objective_comparison(
-                    variants,
-                    goal=self._current_goal(),
-                    history_records=history_records,
-                )
-                self._set_report(report_text)
-                self.status_var.set("Comparação concluída")
-        self._comparison_after = self.after(150, self._poll_comparison)
+                if error:
+                    self.status_var.set("Falha na comparação")
+                    self._set_report(str(error))
+                else:
+                    history_records = load_feedback_history() if self.save_history_var.get() else ()
+                    report_text = format_objective_comparison(
+                        variants,
+                        goal=self._current_goal(),
+                        history_records=history_records,
+                    )
+                    self._set_report(report_text)
+                    self.status_var.set("Comparação concluída")
+        except tk.TclError:
+            self._comparison_after = None
+            return
+        self._schedule_poll("_comparison_after", 150, self._poll_comparison)
 
     def _current_goal(self) -> PrintGoal:
         raw_phys = self.physical_material_var.get().strip()
@@ -1468,20 +1514,27 @@ class MakerElegooApp(tk.Tk):
             messagebox.showerror("Não foi possível analisar", str(exc))
 
     def _poll_inspect(self):
+        if self._should_stop_polling():
+            self._inspect_after = None
+            return
         try:
-            gen, src_path, geom = self.inspect_queue.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            if (gen == self._inspect_generation and self.project is not None
-                    and self.project.path == src_path and geom is not None):
-                self.project = replace(self.project, geometry_summary=geom)
-                if self.result is None:
-                    self._set_report(format_project_summary(self.project))
-                self._update_context_preview()
-                if "lendo geometria 3D" in self.status_var.get():
-                    self.status_var.set("Projeto analisado — confirme o filamento físico")
-        self._inspect_after = self.after(150, self._poll_inspect)
+            try:
+                gen, src_path, geom = self.inspect_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if (gen == self._inspect_generation and self.project is not None
+                        and self.project.path == src_path and geom is not None):
+                    self.project = replace(self.project, geometry_summary=geom)
+                    if self.result is None:
+                        self._set_report(format_project_summary(self.project))
+                    self._update_context_preview()
+                    if "lendo geometria 3D" in self.status_var.get():
+                        self.status_var.set("Projeto analisado — confirme o filamento físico")
+        except tk.TclError:
+            self._inspect_after = None
+            return
+        self._schedule_poll("_inspect_after", 150, self._poll_inspect)
 
     def _render_filaments(self):
         for child in self.filament_frame.winfo_children():
@@ -1693,65 +1746,72 @@ class MakerElegooApp(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _poll_orientation(self):
+        if self._should_stop_polling():
+            self._orientation_after = None
+            return
         try:
-            while True:
-                generation, kind, payload = self.orientation_queue.get_nowait()
-                dialog = self.orientation_dialog
-                if (generation != self.orientation_generation or not dialog or
-                        not dialog.winfo_exists() or self.orientation_cancel.is_set()):
-                    continue
-                if kind == "previews":
-                    for direction in FRONTS:
-                        photo = tk.PhotoImage(data=payload[direction], format="PPM")
-                        self.orientation_images.append(photo)
-                        box = ttk.Frame(self.orientation_preview_frame)
-                        box.pack(side="left", padx=5)
-                        ttk.Label(box, image=photo).pack()
-                        ttk.Radiobutton(box, text=direction, variable=self.orientation_front,
-                                        value=direction).pack()
-                    self.orientation_message.set("Selecione a frente e compare as posições.")
-                    self.orientation_analyze_button.configure(state="normal")
-                elif kind == "progress":
-                    self.orientation_message.set(payload)
-                elif kind == "analysis":
-                    self.orientation_busy = False
-                    if payload.front != self.orientation_front.get():
-                        self.orientation_message.set("A frente mudou durante a análise. Compare novamente.")
-                        self.orientation_analyze_button.configure(state="normal")
+            try:
+                while True:
+                    generation, kind, payload = self.orientation_queue.get_nowait()
+                    dialog = self.orientation_dialog
+                    if (generation != self.orientation_generation or not dialog or
+                            not dialog.winfo_exists() or self.orientation_cancel.is_set()):
                         continue
-                    self.orientation_analysis = payload
-                    self.orientation_report.configure(state="normal")
-                    self.orientation_report.delete("1.0", "end")
-                    self.orientation_report.insert("1.0", format_orientation_analysis(payload))
-                    self.orientation_report.configure(state="disabled")
-                    self.orientation_message.set(payload.reason)
-                    self.orientation_analyze_button.configure(state="normal")
-                    if not payload.recommended.is_current and payload.recommended.valid:
-                        self.orientation_apply_button.configure(state="normal")
-                elif kind == "applied":
-                    self.orientation_busy = False
-                    self.orientation_applying = False
-                    self.result = payload
-                    self.last_plan = self.orientation_plan
-                    report = format_conversion_report(payload, self.orientation_plan)
-                    self._set_report(report)
-                    self.orientation_report.configure(state="normal")
-                    self.orientation_report.delete("1.0", "end")
-                    self.orientation_report.insert("1.0", report)
-                    self.orientation_report.configure(state="disabled")
-                    self.orientation_message.set("Cópia validada" if payload.success else "Falha; confira o relatório")
-                    self.status_var.set(self.orientation_message.get())
-                    self._apply_result_actions(payload)
-                    self.orientation_analyze_button.configure(state="normal")
-                elif kind == "error":
-                    self.orientation_busy = False
-                    self.orientation_applying = False
-                    self.orientation_analyze_button.configure(state="normal")
-                    self.orientation_message.set(str(payload))
-                    messagebox.showerror("Orientação de figura", str(payload), parent=dialog)
-        except queue.Empty:
-            pass
-        self._orientation_after = self.after(150, self._poll_orientation)
+                    if kind == "previews":
+                        for direction in FRONTS:
+                            photo = tk.PhotoImage(data=payload[direction], format="PPM")
+                            self.orientation_images.append(photo)
+                            box = ttk.Frame(self.orientation_preview_frame)
+                            box.pack(side="left", padx=5)
+                            ttk.Label(box, image=photo).pack()
+                            ttk.Radiobutton(box, text=direction, variable=self.orientation_front,
+                                            value=direction).pack()
+                        self.orientation_message.set("Selecione a frente e compare as posições.")
+                        self.orientation_analyze_button.configure(state="normal")
+                    elif kind == "progress":
+                        self.orientation_message.set(payload)
+                    elif kind == "analysis":
+                        self.orientation_busy = False
+                        if payload.front != self.orientation_front.get():
+                            self.orientation_message.set("A frente mudou durante a análise. Compare novamente.")
+                            self.orientation_analyze_button.configure(state="normal")
+                            continue
+                        self.orientation_analysis = payload
+                        self.orientation_report.configure(state="normal")
+                        self.orientation_report.delete("1.0", "end")
+                        self.orientation_report.insert("1.0", format_orientation_analysis(payload))
+                        self.orientation_report.configure(state="disabled")
+                        self.orientation_message.set(payload.reason)
+                        self.orientation_analyze_button.configure(state="normal")
+                        if not payload.recommended.is_current and payload.recommended.valid:
+                            self.orientation_apply_button.configure(state="normal")
+                    elif kind == "applied":
+                        self.orientation_busy = False
+                        self.orientation_applying = False
+                        self.result = payload
+                        self.last_plan = self.orientation_plan
+                        report = format_conversion_report(payload, self.orientation_plan)
+                        self._set_report(report)
+                        self.orientation_report.configure(state="normal")
+                        self.orientation_report.delete("1.0", "end")
+                        self.orientation_report.insert("1.0", report)
+                        self.orientation_report.configure(state="disabled")
+                        self.orientation_message.set("Cópia validada" if payload.success else "Falha; confira o relatório")
+                        self.status_var.set(self.orientation_message.get())
+                        self._apply_result_actions(payload)
+                        self.orientation_analyze_button.configure(state="normal")
+                    elif kind == "error":
+                        self.orientation_busy = False
+                        self.orientation_applying = False
+                        self.orientation_analyze_button.configure(state="normal")
+                        self.orientation_message.set(str(payload))
+                        messagebox.showerror("Orientação de figura", str(payload), parent=dialog)
+            except queue.Empty:
+                pass
+        except tk.TclError:
+            self._orientation_after = None
+            return
+        self._schedule_poll("_orientation_after", 150, self._poll_orientation)
 
     def _configure_gemini_key(self, *, on_saved=None):
         dialog = tk.Toplevel(self)
@@ -1811,15 +1871,25 @@ class MakerElegooApp(tk.Tk):
                     res = (True, "Conexão validada com sucesso!")
                 except GeminiClientError as exc:
                     res = (False, str(exc))
-                if dialog.winfo_exists():
-                    dialog.after(0, lambda: done_test(res))
+                if self._should_stop_polling():
+                    return
+                try:
+                    if dialog.winfo_exists():
+                        dialog.after(0, lambda: done_test(res))
+                except (tk.TclError, RuntimeError):
+                    pass
 
             def done_test(res):
-                if not dialog.winfo_exists():
+                if self._should_stop_polling():
                     return
-                test_btn.configure(state="normal")
-                ok, msg = res
-                status_lbl.configure(text=f"Status: {msg}", foreground="green" if ok else "#B00020")
+                try:
+                    if not dialog.winfo_exists():
+                        return
+                    test_btn.configure(state="normal")
+                    ok, msg = res
+                    status_lbl.configure(text=f"Status: {msg}", foreground="green" if ok else "#B00020")
+                except tk.TclError:
+                    pass
 
             threading.Thread(target=work, daemon=True).start()
 
@@ -2065,40 +2135,52 @@ class MakerElegooApp(tk.Tk):
             self._execute_conversion(plan, destination, professor_advices=merged)
 
     def _poll_professor(self):
+        if self._should_stop_polling():
+            self._professor_after = None
+            return
         try:
-            project, plan, goal, destination, model_name, advices, error = self.professor_queue.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            self.convert_button.configure(state="normal")
-            if error:
-                if (isinstance(error, GeminiClientError)
-                        and error.status_code == 429
-                        and model_name != "gemini-3.5-flash-lite"
-                        and (key := get_gemini_key())):
-                    if messagebox.askyesno(
-                        "Cota do Gemini excedida",
-                        f"O modelo {model_name} atingiu o limite de cota (HTTP 429).\n\n"
-                        "Deseja tentar automaticamente com o modelo mais leve (gemini-3.5-flash-lite)?",
+            try:
+                project, plan, goal, destination, model_name, advices, error = self.professor_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                self.convert_button.configure(state="normal")
+                if error:
+                    if (isinstance(error, GeminiClientError)
+                            and error.status_code == 429
+                            and model_name != "gemini-3.5-flash-lite"
+                            and (key := get_gemini_key())):
+                        if messagebox.askyesno(
+                            "Cota do Gemini excedida",
+                            f"O modelo {model_name} atingiu o limite de cota (HTTP 429).\n\n"
+                            "Deseja tentar automaticamente com o modelo mais leve (gemini-3.5-flash-lite)?",
+                            parent=self,
+                        ):
+                            if not self._should_stop_polling():
+                                self._start_gemini_professor(project, plan, goal, destination, key, "gemini-3.5-flash-lite")
+                            return
+                    if isinstance(error, GeminiClientError) and messagebox.askyesno(
+                        "IA Indisponível",
+                        f"{error}\n\nDeseja utilizar o Professor Offline (regras locais) nesta conversão?",
                         parent=self,
                     ):
-                        self._start_gemini_professor(project, plan, goal, destination, key, "gemini-3.5-flash-lite")
-                        self._professor_after = self.after(150, self._poll_professor)
-                        return
-                if isinstance(error, GeminiClientError) and messagebox.askyesno(
-                    "IA Indisponível",
-                    f"{error}\n\nDeseja utilizar o Professor Offline (regras locais) nesta conversão?",
-                    parent=self,
-                ):
-                    offline_advices = advise_offline(project, plan, goal)
-                    self._finish_professor_lookup(plan, destination, offline_advices, goal=goal)
+                        if not self._should_stop_polling():
+                            offline_advices = advise_offline(project, plan, goal)
+                            self._finish_professor_lookup(plan, destination, offline_advices, goal=goal)
+                    else:
+                        self.status_var.set("Falha ao consultar IA" if not isinstance(error, GeminiClientError) else "Conversão cancelada pelo usuário")
+                        if not isinstance(error, GeminiClientError):
+                            messagebox.showerror("Professor IA", str(error), parent=self)
                 else:
-                    self.status_var.set("Falha ao consultar IA" if not isinstance(error, GeminiClientError) else "Conversão cancelada pelo usuário")
-                    if not isinstance(error, GeminiClientError):
-                        messagebox.showerror("Professor IA", str(error), parent=self)
+                    self._finish_professor_lookup(plan, destination, advices or [], goal=goal)
+        except tk.TclError:
+            self._professor_after = None
+            return
+        finally:
+            if not self._should_stop_polling():
+                self._schedule_poll("_professor_after", 150, self._poll_professor)
             else:
-                self._finish_professor_lookup(plan, destination, advices or [], goal=goal)
-        self._professor_after = self.after(150, self._poll_professor)
+                self._professor_after = None
 
     def _show_professor_dialog(
         self,
@@ -2559,31 +2641,38 @@ class MakerElegooApp(tk.Tk):
         return dialog
 
     def _poll_preview(self):
+        if self._should_stop_polling():
+            self._preview_after = None
+            return
         try:
-            dialog, img_lbl, legend_lbl, stats_lbl, audit_plate, neck_z, preview, error = self.preview_queue.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            if dialog.winfo_exists():
-                if error:
-                    img_lbl.configure(text="Falha ao renderizar prévia visual.")
-                    stats_lbl.configure(text=str(error))
-                    messagebox.showerror("Prévia visual", str(error), parent=dialog)
-                elif preview is not None:
-                    img = tk.PhotoImage(data=preview.ppm_bytes)
-                    img_lbl.configure(image=img, text="")
-                    img_lbl.image = img
-                    legend_lbl.configure(text=preview.legend)
-                    stats_txt = (
-                        f"Apoio estimado na mesa: {preview.contact_area_mm2:.0f} mm² · "
-                        f"Saliências >45°: {preview.overhang_area_mm2:.0f} mm²"
-                    )
-                    if audit_plate is not None:
-                        stats_txt += f" · Ilhas na 1ª camada: {audit_plate.layer1_island_count}"
-                    if neck_z is not None:
-                        stats_txt += f" · Pescoço detectado em Z≈{neck_z:.1f} mm"
-                    stats_lbl.configure(text=stats_txt)
-        self._preview_after = self.after(100, self._poll_preview)
+            try:
+                dialog, img_lbl, legend_lbl, stats_lbl, audit_plate, neck_z, preview, error = self.preview_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if dialog.winfo_exists():
+                    if error:
+                        img_lbl.configure(text="Falha ao renderizar prévia visual.")
+                        stats_lbl.configure(text=str(error))
+                        messagebox.showerror("Prévia visual", str(error), parent=dialog)
+                    elif preview is not None:
+                        img = tk.PhotoImage(data=preview.ppm_bytes)
+                        img_lbl.configure(image=img, text="")
+                        img_lbl.image = img
+                        legend_lbl.configure(text=preview.legend)
+                        stats_txt = (
+                            f"Apoio estimado na mesa: {preview.contact_area_mm2:.0f} mm² · "
+                            f"Saliências >45°: {preview.overhang_area_mm2:.0f} mm²"
+                        )
+                        if audit_plate is not None:
+                            stats_txt += f" · Ilhas na 1ª camada: {audit_plate.layer1_island_count}"
+                        if neck_z is not None:
+                            stats_txt += f" · Pescoço detectado em Z≈{neck_z:.1f} mm"
+                        stats_lbl.configure(text=stats_txt)
+        except tk.TclError:
+            self._preview_after = None
+            return
+        self._schedule_poll("_preview_after", 100, self._poll_preview)
 
     def _generate_calibration_dialog(self):
         if not self.install:
@@ -2619,30 +2708,37 @@ class MakerElegooApp(tk.Tk):
         threading.Thread(target=run_calib, daemon=True).start()
 
     def _poll_calib(self):
+        if self._should_stop_polling():
+            self._calib_after = None
+            return
         try:
-            dest_path, res, error = self.calib_queue.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            if error:
-                self.status_var.set("Falha ao gerar calibração")
-                messagebox.showerror("Calibração", str(error), parent=self)
-            elif res is not None:
-                self.status_var.set("Calibração pronta" if res.success else "Falha ao fatiar calibração")
-                if res.success:
-                    time_txt = format_duration(res.validation.estimated_seconds) if res.validation else "n/d"
-                    grams_txt = f"{res.validation.filament_grams:.2f} g" if (res.validation and res.validation.filament_grams is not None) else "n/d"
-                    messagebox.showinfo(
-                        "Peça de calibração pronta",
-                        f"Salva e fatiada em:\n{dest_path}\n\n"
-                        f"Estimativa real: {time_txt} · {grams_txt}\n\n"
-                        "Após imprimir, meça a barra de 50,00 mm com paquímetro e teste o pino 6 mm nas fendas (+0,15 / +0,20 / +0,30 mm), "
-                        "depois registre em 'Registrar resultado da impressão'.",
-                        parent=self,
-                    )
-                else:
-                    messagebox.showerror("Calibração", res.message, parent=self)
-        self._calib_after = self.after(150, self._poll_calib)
+            try:
+                dest_path, res, error = self.calib_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                if error:
+                    self.status_var.set("Falha ao gerar calibração")
+                    messagebox.showerror("Calibração", str(error), parent=self)
+                elif res is not None:
+                    self.status_var.set("Calibração pronta" if res.success else "Falha ao fatiar calibração")
+                    if res.success:
+                        time_txt = format_duration(res.validation.estimated_seconds) if res.validation else "n/d"
+                        grams_txt = f"{res.validation.filament_grams:.2f} g" if (res.validation and res.validation.filament_grams is not None) else "n/d"
+                        messagebox.showinfo(
+                            "Peça de calibração pronta",
+                            f"Salva e fatiada em:\n{dest_path}\n\n"
+                            f"Estimativa real: {time_txt} · {grams_txt}\n\n"
+                            "Após imprimir, meça a barra de 50,00 mm com paquímetro e teste o pino 6 mm nas fendas (+0,15 / +0,20 / +0,30 mm), "
+                            "depois registre em 'Registrar resultado da impressão'.",
+                            parent=self,
+                        )
+                    else:
+                        messagebox.showerror("Calibração", res.message, parent=self)
+        except tk.TclError:
+            self._calib_after = None
+            return
+        self._schedule_poll("_calib_after", 150, self._poll_calib)
 
     def _execute_conversion(self, plan: ConversionPlan, destination: str,
                             *, professor_advices: list[Advice] | tuple[Advice, ...] = ()):
@@ -2690,37 +2786,44 @@ class MakerElegooApp(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _poll_worker(self):
+        if self._should_stop_polling():
+            self._worker_after = None
+            return
         try:
-            result, plan, approved, prof_tuple, rescale_info, error = self.worker_queue.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            self.convert_button.configure(state="normal")
-            if error:
-                self.status_var.set("Falha na conversão")
-                self._set_report(str(error))
-                self.open_button.configure(state="disabled")
-                self.open_folder_button.configure(state="disabled")
-                self.result_banner_label.configure(foreground="#B3261E")
-                self.result_banner_var.set(
-                    "Erro durante a conversão: NÃO imprima. Confira os detalhes no relatório abaixo."
-                )
+            try:
+                result, plan, approved, prof_tuple, rescale_info, error = self.worker_queue.get_nowait()
+            except queue.Empty:
+                pass
             else:
-                self.result = result
-                self.last_plan = plan
-                report = format_conversion_report(
-                    result, plan, professor_advices=prof_tuple, rescale_info=rescale_info, goal=self._current_goal()
-                )
-                if approved:
-                    report += "\n\nSugestões IA aprovadas e aplicadas:\n" + "\n".join(
-                        f"  • {item.target_key} = {item.value}: {item.reason}" for item in approved)
-                self._set_report(report)
-                self.status_var.set("Concluído" if result.success else "Falha; confira o relatório")
-                self._apply_result_actions(result)
-                self._update_context_preview()
-                if result.output_project:
-                    self.ai_button.configure(state="normal")
-        self._worker_after = self.after(150, self._poll_worker)
+                self.convert_button.configure(state="normal")
+                if error:
+                    self.status_var.set("Falha na conversão")
+                    self._set_report(str(error))
+                    self.open_button.configure(state="disabled")
+                    self.open_folder_button.configure(state="disabled")
+                    self.result_banner_label.configure(foreground="#B3261E")
+                    self.result_banner_var.set(
+                        "Erro durante a conversão: NÃO imprima. Confira os detalhes no relatório abaixo."
+                    )
+                else:
+                    self.result = result
+                    self.last_plan = plan
+                    report = format_conversion_report(
+                        result, plan, professor_advices=prof_tuple, rescale_info=rescale_info, goal=self._current_goal()
+                    )
+                    if approved:
+                        report += "\n\nSugestões IA aprovadas e aplicadas:\n" + "\n".join(
+                            f"  • {item.target_key} = {item.value}: {item.reason}" for item in approved)
+                    self._set_report(report)
+                    self.status_var.set("Concluído" if result.success else "Falha; confira o relatório")
+                    self._apply_result_actions(result)
+                    self._update_context_preview()
+                    if result.output_project:
+                        self.ai_button.configure(state="normal")
+        except tk.TclError:
+            self._worker_after = None
+            return
+        self._schedule_poll("_worker_after", 150, self._poll_worker)
 
     def _clear_ai_approval(self):
         self.ai_approved = []
@@ -2915,48 +3018,56 @@ class MakerElegooApp(tk.Tk):
         ttk.Button(buttons, text="Cancelar", command=dialog.destroy).pack(side="right")
 
     def _poll_ai(self):
+        if self._should_stop_polling():
+            self._ai_after = None
+            return
         try:
-            item = self.ai_queue.get_nowait()
-        except queue.Empty:
-            pass
-        else:
-            self.ai_button.configure(state="normal")
-            if item[0] == "codex_apply":
-                _, result, plan, error = item
-                if error:
-                    self.status_var.set("Falha ao aplicar orientação")
-                    messagebox.showerror("Orientação Codex", str(error))
-                else:
-                    self.result = result
-                    self.last_plan = plan
-                    self._set_report(format_conversion_report(result, plan))
-                    self.status_var.set("Cópia orientada validada" if result.success else "Falha; confira relatório")
-                    self._apply_result_actions(result)
-                self._ai_after = self.after(150, self._poll_ai)
-                return
-            if len(item) == 6 and item[0] == "codex":
-                _, suggestions, candidate, observations, error, context = item
-                if (self.project, self.last_plan, self.orientation_analysis) != context:
-                    self.status_var.set("Projeto ou perfis mudaram; repita a análise com Codex")
-                    self._ai_after = self.after(150, self._poll_ai)
-                    return
-                if error:
-                    self.status_var.set("Codex indisponível")
-                    messagebox.showerror("Codex", str(error))
-                else:
-                    self._review_codex(suggestions, candidate, observations)
-                self._ai_after = self.after(150, self._poll_ai)
-                return
-            suggestions, error = item
-            if error:
-                self.status_var.set("IA indisponível")
-                messagebox.showerror("Gemini", str(error))
-            elif not suggestions:
-                self.status_var.set("Nenhuma equivalência segura encontrada")
-                messagebox.showinfo("Gemini", "Nenhuma sugestão passou pela validação de segurança e compatibilidade.")
+            try:
+                item = self.ai_queue.get_nowait()
+            except queue.Empty:
+                pass
             else:
-                self._review_suggestions(suggestions)
-        self._ai_after = self.after(150, self._poll_ai)
+                self.ai_button.configure(state="normal")
+                if item[0] == "codex_apply":
+                    _, result, plan, error = item
+                    if error:
+                        self.status_var.set("Falha ao aplicar orientação")
+                        messagebox.showerror("Orientação Codex", str(error))
+                    else:
+                        self.result = result
+                        self.last_plan = plan
+                        self._set_report(format_conversion_report(result, plan))
+                        self.status_var.set("Cópia orientada validada" if result.success else "Falha; confira relatório")
+                        self._apply_result_actions(result)
+                    return
+                if len(item) == 6 and item[0] == "codex":
+                    _, suggestions, candidate, observations, error, context = item
+                    if (self.project, self.last_plan, self.orientation_analysis) != context:
+                        self.status_var.set("Projeto ou perfis mudaram; repita a análise com Codex")
+                        return
+                    if error:
+                        self.status_var.set("Codex indisponível")
+                        messagebox.showerror("Codex", str(error))
+                    else:
+                        self._review_codex(suggestions, candidate, observations)
+                    return
+                suggestions, error = item
+                if error:
+                    self.status_var.set("IA indisponível")
+                    messagebox.showerror("Gemini", str(error))
+                elif not suggestions:
+                    self.status_var.set("Nenhuma equivalência segura encontrada")
+                    messagebox.showinfo("Gemini", "Nenhuma sugestão passou pela validação de segurança e compatibilidade.")
+                else:
+                    self._review_suggestions(suggestions)
+        except tk.TclError:
+            self._ai_after = None
+            return
+        finally:
+            if not self._should_stop_polling():
+                self._schedule_poll("_ai_after", 150, self._poll_ai)
+            else:
+                self._ai_after = None
 
     def _review_codex(self, suggestions, candidate, observations):
         project, plan, orientation = self.project, self.last_plan, self.orientation_analysis

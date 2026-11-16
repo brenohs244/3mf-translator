@@ -701,4 +701,105 @@ class UIBeginnerFlowTests(unittest.TestCase):
                 finally:
                     app.destroy()
 
+    def test_task6_close_teardown_cancels_all_pollers_without_invalid_command_or_worker_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = _setup_fake_slicer_env(root)
+            proj = ProjectInfo(
+                root / "modelo.3mf",
+                {"printer_model": "Bambu Lab A1", "layer_height": "0.20"},
+                (FilamentInfo(1, "PLA", "#FFFFFF", "Bambu PLA"),),
+                (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+                ("Peca",),
+                (),
+                (),
+                used_filament_slots=("1",),
+            )
+            after_attrs = (
+                "_worker_after",
+                "_ai_after",
+                "_professor_after",
+                "_orientation_after",
+                "_comparison_after",
+                "_inspect_after",
+                "_preview_after",
+                "_calib_after",
+            )
+            with patch.dict(os.environ, env), tempfile.TemporaryFile() as stderr_cap:
+                old_fd = os.dup(2)
+                try:
+                    sys.stderr.flush()
+                    os.dup2(stderr_cap.fileno(), 2)
+                    app = MakerElegooApp()
+                    try:
+                        # Simular re-disparo manual/repetido de todos os pollers antes de fechar
+                        for _ in range(2):
+                            app._poll_worker()
+                            app._poll_ai()
+                            app._poll_professor()
+                            app._poll_orientation()
+                            app._poll_comparison()
+                            app._poll_inspect()
+                            app._poll_preview()
+                            app._poll_calib()
+                        # Não pode acumular múltiplos callbacks para os mesmos pollers
+                        self.assertLessEqual(len(app.tk.call("after", "info")), len(after_attrs))
+                    finally:
+                        app.destroy()
+
+                    self.assertTrue(getattr(app, "_closing", False))
+                    for attr in after_attrs:
+                        self.assertIsNone(getattr(app, attr, None))
+
+                    # Nova janela rodando event loop após ~180ms não pode disparar "invalid command name"
+                    app2 = MakerElegooApp()
+                    try:
+                        time.sleep(0.18)
+                        app2.update()
+                    finally:
+                        app2.destroy()
+
+                    # Pollers recebendo resultados atrasados após destroy() não podem falhar nem reagendar
+                    app3 = MakerElegooApp()
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj):
+                        app3.file_var.set(str(proj.path))
+                        app3._inspect_file()
+                    plan_obj = app3._build_current_plan(*app3._selected_profiles())
+                    good_res = ConversionResult(
+                        True,
+                        root / "out.3mf",
+                        "OK",
+                        ExportResult(True, root / "out.3mf", "ok"),
+                        ValidationResult(True, 1, "OK", (), 300, 8.0),
+                        None,
+                        proj,
+                        {},
+                        proj.plates,
+                    )
+                    app3.worker_queue.put((good_res, plan_obj, (), (), None, None))
+                    app3.professor_queue.put((proj, plan_obj, PrintGoal("decorativa", "equilibrio"), str(root / "out.3mf"), "gemini-3.8-flash", [], None))
+                    app3.ai_queue.put(([], None))
+                    app3.comparison_queue.put(((), None))
+                    app3.inspect_queue.put((app3._inspect_generation, proj.path, None))
+                    app3.calib_queue.put((root / "cal.3mf", good_res, None))
+                    app3.destroy()
+
+                    app3._poll_worker()
+                    app3._poll_professor()
+                    app3._poll_ai()
+                    app3._poll_comparison()
+                    app3._poll_inspect()
+                    app3._poll_preview()
+                    app3._poll_calib()
+                    app3._poll_orientation()
+                    for attr in after_attrs:
+                        self.assertIsNone(getattr(app3, attr, None))
+                finally:
+                    sys.stderr.flush()
+                    os.dup2(old_fd, 2)
+                    os.close(old_fd)
+                stderr_cap.seek(0)
+                err_text = stderr_cap.read().decode("utf-8", errors="replace")
+                self.assertNotIn("invalid command name", err_text)
+
 

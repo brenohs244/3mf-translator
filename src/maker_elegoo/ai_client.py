@@ -47,9 +47,11 @@ class GeminiClient:
                 raise GeminiClientError("Resposta inesperada ao testar conexão com o Gemini.")
             return True
         except error.HTTPError as exc:
-            if exc.code in (400, 401, 403):
-                raise GeminiClientError(f"Chave de API rejeitada pelo Google (HTTP {exc.code}).", status_code=exc.code) from exc
-            raise GeminiClientError(f"Google Gemini retornou HTTP {exc.code}", status_code=exc.code) from exc
+            code = exc.code
+            exc.close()
+            if code in (400, 401, 403):
+                raise GeminiClientError(f"Chave de API rejeitada pelo Google (HTTP {code}).", status_code=code) from exc
+            raise GeminiClientError(f"Google Gemini retornou HTTP {code}", status_code=code) from exc
         except (OSError, TimeoutError) as exc:
             raise GeminiClientError(f"Falha de rede ao conectar ao Gemini: {exc}") from exc
         except (ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -87,9 +89,11 @@ class GeminiClient:
             text = data["candidates"][0]["content"]["parts"][0]["text"]
             return json.loads(text)
         except error.HTTPError as exc:
-            if exc.code == 429:
+            code = exc.code
+            exc.close()
+            if code == 429:
                 raise GeminiClientError("Limite de cota excedido (HTTP 429). Tente novamente em instantes.", status_code=429) from exc
-            raise GeminiClientError(f"Google Gemini recusou a solicitação (HTTP {exc.code})", status_code=exc.code) from exc
+            raise GeminiClientError(f"Google Gemini recusou a solicitação (HTTP {code})", status_code=code) from exc
         except (OSError, TimeoutError) as exc:
             raise GeminiClientError(f"Falha de conexão com a API do Gemini: {exc}") from exc
         except (KeyError, IndexError, ValueError, TypeError, json.JSONDecodeError) as exc:

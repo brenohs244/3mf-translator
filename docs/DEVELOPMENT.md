@@ -34,6 +34,9 @@ O pacote também não contém perfis personalizados: cada computador mostra os p
 - Understand Anything: execute a habilidade `/understand --language pt-BR` depois de mudanças relevantes. Seu grafo local fica em `.ua/knowledge-graph.json` e pode ser aberto com `/understand-dashboard`. Artefatos gerados não entram no Git.
 - Find Skills: avaliar novas habilidades pela fonte, manutenção e relevância antes de instalar. A primeira busca encontrou o Graphify oficial; não adotamos habilidades genéricas de CAD para substituir a validação no fatiador.
 
+- Mantenha sempre os utilitários de ciclo de vida da UI (`_POLL_HANDLE_ATTRS`, `_schedule_poll`, `_should_stop_polling` e `destroy()` com `_closing = True` em `ui.py`) ao adicionar novas filas/pollers, e feche explicitamente exceções `urllib.error.HTTPError` (`exc.close()`) em `ai.py` e `ai_client.py` para evitar `ResourceWarning` e callbacks Tcl inválidos após fechamento da janela.
+- Registro de aceitação técnica e pendências humanas/físicas do marco Tradutor + Professor: `docs/validation/tradutor-professor-acceptance.md`.
+
 ## Limites técnicos
 
 ## Regressão local e variantes

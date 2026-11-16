@@ -93,13 +93,13 @@
 
 **Files:** modificar `tests/test_ui_beginner_flow.py`, `ui.py` apenas se necessário para encerramento; atualizar `docs/DEVELOPMENT.md`; criar `docs/validation/tradutor-professor-acceptance.md`.
 
-- [ ] Reproduzir aviso de `_poll_worker` após fechar janela, escrever regressão e ajustar cancelamento de callbacks se confirmado. Rodar suíte sem callbacks Tcl inválidos; investigar ResourceWarning separadamente.
-- [ ] Executar `python -m unittest discover -s tests -v`; registrar contagem, falhas, skips e avisos, sem equiparar testes simulados a compatibilidade.
-- [ ] Usar amostras locais, sem upload, para decorativa PLA, funcional PLA→ABS, móvel ABS, multisslot e multiplacas. Registrar versão do Slicer, perfis, parâmetros finais, integridade da geometria, resultado por placa, tempo e material estimados. Exportações em temporário fora do Git.
+- [x] Reproduzir aviso de `_poll_worker` após fechar janela, escrever regressão e ajustar cancelamento de callbacks se confirmado. Rodar suíte sem callbacks Tcl inválidos; investigar ResourceWarning separadamente.
+- [x] Executar `python -m unittest discover -s tests -v`; registrar contagem, falhas, skips e avisos, sem equiparar testes simulados a compatibilidade.
+- [x] Usar amostras locais, sem upload, para decorativa PLA, funcional PLA→ABS, móvel ABS, multisslot e multiplacas. Registrar versão do Slicer, perfis, parâmetros finais, integridade da geometria, resultado por placa, tempo e material estimados. Exportações em temporário fora do Git.
 - [ ] Abrir resultados no ELEGOO Slicer e conferir suportes, cores, folgas e avisos. Só então declarar compatibilidade desses casos específicos. Resistência/união/folgas exigem impressão e teste; manter pendente se não realizados.
 - [ ] Observar três iniciantes: preparar caso simples sem ajuda sobre nomes de perfil; identificar material destino, mudanças e pendências; encontrar comparação sem instrução. Meta proposta: os três completam e distinguem “fatiou” de “resistência testada”; registrar desistências e dúvidas sem maquiar resultado.
 - [ ] Reconstruir executável com `scripts/build.ps1`, executar `scripts/smoke_exe.py`; atualizar Graphify com `graphify update .` e Understand Anything conforme DEVELOPMENT após mudanças de código.
-- [ ] Revisar cobertura dos requisitos e diff; conferir ausência de 3MF/G-code rastreados; registrar resultados e commit final.
+- [x] Revisar cobertura dos requisitos e diff; conferir ausência de 3MF/G-code rastreados; registrar resultados e commit final.
 
 ## Fora do próximo marco
 

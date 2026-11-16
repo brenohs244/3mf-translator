@@ -1,6 +1,8 @@
+import gc
 import json
 import sys
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -99,9 +101,15 @@ class AIClientTest(unittest.TestCase):
             raise error.HTTPError(req.full_url, 429, "Quota", {}, None)
 
         client_429 = GeminiClient(api_key="KEY", transport=mock_gen)
-        with self.assertRaises(GeminiClientError) as ctx:
-            advise_gemini(client_429, self.project, self.plan, PrintGoal("esforco", "qualidade"))
-        self.assertEqual(ctx.exception.status_code, 429)
+        with warnings.catch_warnings(record=True) as caught_warnings:
+            warnings.simplefilter("always", ResourceWarning)
+            with self.assertRaises(GeminiClientError) as ctx:
+                advise_gemini(client_429, self.project, self.plan, PrintGoal("esforco", "qualidade"))
+            self.assertEqual(ctx.exception.status_code, 429)
+            del ctx
+            gc.collect()
+        resource_warnings = [w for w in caught_warnings if issubclass(w.category, ResourceWarning)]
+        self.assertEqual(resource_warnings, [])
         prompt_text = captured["body"]["contents"][0]["parts"][0]["text"]
         self.assertIn("min_layer_height_mm", prompt_text)
         self.assertIn("max_layer_height_mm", prompt_text)

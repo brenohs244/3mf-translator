@@ -151,9 +151,11 @@ def suggest_equivalences(unmapped: dict, elegoo_keys: dict, context: dict, api_k
         if not isinstance(raw_suggestions, list):
             raise ValueError("suggestions não é uma lista")
     except error.HTTPError as exc:
-        if exc.code == 429:
+        code = exc.code
+        exc.close()
+        if code == 429:
             raise AIError("Cota do Gemini excedida; tente mais tarde ou use outro modelo") from exc
-        raise AIError(f"Gemini recusou a solicitação (HTTP {exc.code})") from exc
+        raise AIError(f"Gemini recusou a solicitação (HTTP {code})") from exc
     except (OSError, TimeoutError) as exc:
         raise AIError(f"Falha de rede ao consultar o Gemini: {exc}") from exc
     except (KeyError, IndexError, ValueError, TypeError, json.JSONDecodeError) as exc:
