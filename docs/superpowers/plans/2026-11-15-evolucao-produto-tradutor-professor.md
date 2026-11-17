@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-11-15-avaliacao-produto-tradutor-professor.md`.
 
-**Status:** plano proposto, não executado. Complementa a revisão de 15/11 (Tasks 27–31), sem reabrir automaticamente suas tarefas concluídas. Primeiro marco: Tasks 1–3. Segundo: Tasks 4–5. Aceitação: Task 6.
+**Status em 2026-11-15:** Tasks 1–5 implementadas; Task 6 parcialmente concluída. Evidências detalhadas em `docs/validation/tradutor-professor-acceptance.md`. Complementa a revisão de 15/11 (Tasks 27–31). Pendem inspeção visual das exportações na GUI do ELEGOO Slicer, impressão e ensaio físico, teste observado com três iniciantes e atualização do grafo Understand Anything. O fatiamento CLI de cinco cenários, o build e o smoke do executável estão registrados no documento de aceitação.
 
 ## Global Constraints
 

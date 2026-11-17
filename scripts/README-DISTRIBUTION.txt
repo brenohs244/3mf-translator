@@ -1,20 +1,16 @@
 Maker → ELEGOO para Windows
 
 1. Instale e abra o ELEGOO Slicer uma vez, configurando sua Centauri Carbon 2.
-2. Para usar sem instalar, execute MakerElegoo.exe.
-3. Para instalar no menu Iniciar do usuário atual, abra PowerShell nesta pasta e execute:
+2. Recomendado: execute o instalador MakerElegoo-Setup-vX.Y.Z.exe (instala sem pedir
+   administrador em %LOCALAPPDATA%\Programs\MakerElegoo com atalhos e desinstalador).
+3. Para uso portátil sem instalador: mantenha a pasta inteira MakerElegoo\ junta
+   (não separe MakerElegoo.exe da subpasta _internal\) e execute MakerElegoo.exe.
+4. Para instalar manualmente a pasta portátil no Menu Iniciar:
    powershell -ExecutionPolicy Bypass -File .\install.ps1
-4. O aplicativo lê automaticamente os perfis do ELEGOO Slicer deste computador.
-   Selecione um projeto 3MF, bico, impressora, processo e filamentos. Clique em Converter.
-5. Confira o projeto convertido no ELEGOO Slicer antes de imprimir.
-6. Para figuras, use "Orientação de figura": escolha a vista do rosto, compare as
-   posições e leia o resultado do fatiamento. Uma mudança só é aplicada em uma
-   nova cópia após sua confirmação. A análise inicial aceita uma placa e uma figura.
+5. Atualizações via GitHub: use o menu Ferramentas -> Verificar atualizações...
+   (ou Configure um repositório público de Releases / token GitHub em Configurar atualizações).
+   O aplicativo valida o SHA-256 do instalador antes de atualizar.
+6. Confira o projeto convertido no ELEGOO Slicer antes de imprimir.
 
-O aplicativo não requer Bambu Studio. A IA Gemini é opcional e requer uma chave própria.
-Codex é outra opção de IA: instale e autentique o Codex CLI neste computador.
-O resumo textual é mostrado antes do envio; confirme para consultar o modelo.
-Recomendações de suporte e orientação dependem de fatiamento local e sua aprovação.
-O G-code de validação é temporário; o aplicativo não envia arquivos à impressora.
-O pacote não inclui perfis de outro computador. Para vê-los aqui, eles precisam existir
-no ELEGOO Slicer instalado neste computador.
+O aplicativo não requer Bambu Studio. A IA Gemini e a atualização via GitHub são opcionais.
+O pacote não inclui perfis de outro computador: ele lê os perfis do ELEGOO Slicer do PC atual.

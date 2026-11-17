@@ -12,9 +12,14 @@ from pathlib import Path
 
 
 def main() -> int:
-    exe = Path(__file__).resolve().parents[1] / "dist" / "MakerElegoo.exe"
-    if not exe.is_file():
-        raise FileNotFoundError(exe)
+    dist_dir = Path(__file__).resolve().parents[1] / "dist"
+    candidates = [
+        dist_dir / "MakerElegoo" / "MakerElegoo.exe",
+        dist_dir / "MakerElegoo.exe",
+    ]
+    exe = next((p for p in candidates if p.is_file()), None)
+    if exe is None:
+        raise FileNotFoundError(candidates[0])
 
     user32 = ctypes.windll.user32
     titles: list[tuple[int, str]] = []
@@ -33,6 +38,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="maker-elegoo-smoke-") as config_dir:
         env = os.environ.copy()
         env["MAKER_ELEGOO_CONFIG_DIR"] = config_dir
+        t0 = time.monotonic()
         process = subprocess.Popen([str(exe)], env=env)
         window = None
         try:
@@ -44,9 +50,10 @@ def main() -> int:
                 user32.EnumWindows(callback, 0)
                 window = next((hwnd for hwnd, title in titles if title == "Maker → ELEGOO"), None)
                 if window is not None:
-                    print("Janela principal abriu com sucesso.")
+                    elapsed = time.monotonic() - t0
+                    print(f"Janela principal abriu com sucesso ({exe.relative_to(dist_dir)}) em {elapsed:.2f}s.")
                     return 0
-                time.sleep(0.25)
+                time.sleep(0.1)
             raise TimeoutError("A janela principal não abriu em 25 segundos")
         finally:
             if window is not None:

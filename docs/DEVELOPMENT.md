@@ -19,12 +19,16 @@ Os perfis são descobertos automaticamente em `%APPDATA%\ElegooSlicer\system` e 
 ```powershell
 python -m venv .venv
 .venv\Scripts\python -m pip install pyinstaller
+winget install JRSoftware.InnoSetup
 .\scripts\build.ps1
 python .\scripts\smoke_exe.py
+powershell -ExecutionPolicy Bypass -File .\scripts\publish_release.ps1 -DryRun
 ```
 
-`dist/MakerElegoo.exe` é portátil. `dist/MakerElegoo-Windows.zip` inclui um instalador por usuário (`install.ps1`) e instruções. O executável procura o ELEGOO Slicer no computador de destino; o fatiador não é incluído no pacote.
-O pacote também não contém perfis personalizados: cada computador mostra os perfis que existem no seu próprio ELEGOO Slicer.
+- `dist/MakerElegoo-Setup-v<versao>.exe` (compilado com Inno Setup 6 via `scripts/installer.iss`) instala o pacote rápido `--onedir` em `%LOCALAPPDATA%\Programs\MakerElegoo` (sem exigir administrador, com desinstalador, atalhos e suporte a atualização silenciosa `/VERYSILENT`).
+- `dist/MakerElegoo-Windows-Portable.zip` contém a pasta portátil `--onedir` (`MakerElegoo\`), `install.ps1` e `LEIA-ME.txt`. Passe `-OneFile` ao `build.ps1` apenas se precisar gerar um `.exe` único avulso.
+- `dist/checksums-v<versao>.txt` registra os hashes SHA-256 validados pelo atualizador automático (`updater.py` + `Ferramentas → Verificar atualizações...`). Como `brenohs244/3mf-translator` é privado no GitHub, o atualizador aceita tanto Token GitHub read-only salvo com DPAPI quanto apontar `update_repo` (ou `MAKER_ELEGOO_UPDATE_REPO`) para um repositório público dedicado apenas às Releases.
+- O executável procura o ELEGOO Slicer no computador de destino; o fatiador e perfis personalizados não são incluídos no pacote.
 
 ## Superpowers, Graphify, Understand Anything e Find Skills
 
@@ -34,8 +38,10 @@ O pacote também não contém perfis personalizados: cada computador mostra os p
 - Understand Anything: execute a habilidade `/understand --language pt-BR` depois de mudanças relevantes. Seu grafo local fica em `.ua/knowledge-graph.json` e pode ser aberto com `/understand-dashboard`. Artefatos gerados não entram no Git.
 - Find Skills: avaliar novas habilidades pela fonte, manutenção e relevância antes de instalar. A primeira busca encontrou o Graphify oficial; não adotamos habilidades genéricas de CAD para substituir a validação no fatiador.
 
-- Mantenha sempre os utilitários de ciclo de vida da UI (`_POLL_HANDLE_ATTRS`, `_schedule_poll`, `_should_stop_polling` e `destroy()` com `_closing = True` em `ui.py`) ao adicionar novas filas/pollers, e feche explicitamente exceções `urllib.error.HTTPError` (`exc.close()`) em `ai.py` e `ai_client.py` para evitar `ResourceWarning` e callbacks Tcl inválidos após fechamento da janela.
+- Mantenha sempre os utilitários de ciclo de vida da UI (`_POLL_HANDLE_ATTRS`, `_schedule_poll`, `_begin_poll`, `_continue_poll_if_active`, `_should_stop_polling` e `destroy()` com `_closing = True` em `ui.py`) ao adicionar novas filas/pollers, e feche explicitamente exceções `urllib.error.HTTPError` (`exc.close()`) em `ai.py`, `ai_client.py` e `updater.py` para evitar `ResourceWarning` e callbacks Tcl inválidos após fechamento da janela.
+- Perfis em `profiles.py` usam cache em memória validado por assinatura `(mtime_ns, size)`; ao manipular JSONs diretamente em testes ou após alterações externas, use `clear_profile_cache()` quando necessário.
 - Registro de aceitação técnica e pendências humanas/físicas do marco Tradutor + Professor: `docs/validation/tradutor-professor-acceptance.md`.
+- Registro das otimizações de desempenho, instalador Inno Setup (`--onedir`) e auto-update: `docs/validation/performance-installer-updater.md`.
 
 ## Limites técnicos
 

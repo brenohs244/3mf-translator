@@ -1,7 +1,7 @@
 # Avaliação de produto: tradutor Bambu → ELEGOO e Professor
 
 Data: 2026-11-15. Base: `f09f8c3393bd3f20a1f08959bffd7f992e7f7158`.
-Status: diagnóstico e proposta para revisão; não é implementação nem certificação de impressão.
+Status: diagnóstico inicial. As Tasks 1–5 do plano derivado foram implementadas depois desta avaliação. Consulte `docs/validation/tradutor-professor-acceptance.md` para o estado verificado; os achados abaixo preservam a evidência que motivou as correções, não descrevem necessariamente defeitos ainda presentes.
 
 ## Veredito
 
