@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
@@ -150,14 +151,22 @@ def _scan_models_paint_and_supports(
         current_obj: str | None = next(iter(mapped_objs)) if len(mapped_objs) == 1 else None
         with archive.open(name) as stream:
             tail = b""
-            while chunk := stream.read(2 * 1024 * 1024):
+            while chunk := stream.read(524_288):
                 data = tail + chunk
                 if b"paint_supports=" in data:
                     has_paint_supports = True
-                if not mapped_objs:
-                    for match in obj_re.finditer(data):
-                        current_obj = match.group(1).decode("utf-8", errors="ignore")
-                if b"paint_color=" in data:
+                has_chunk_paint = b"paint_color=" in data
+                if not mapped_objs and b"<object" in data:
+                    if has_chunk_paint:
+                        for match in obj_re.finditer(data):
+                            current_obj = match.group(1).decode("utf-8", errors="ignore")
+                    else:
+                        last_idx = data.rfind(b"<object")
+                        if last_idx != -1:
+                            m = obj_re.search(data, last_idx)
+                            if m is not None:
+                                current_obj = m.group(1).decode("utf-8", errors="ignore")
+                if has_chunk_paint:
                     has_paint_color = True
                     target_objs = mapped_objs or ({current_obj} if current_obj else {"*"})
                     for match in paint_re.finditer(data):
@@ -169,6 +178,7 @@ def _scan_models_paint_and_supports(
                         for oid in target_objs:
                             paint_slots_by_obj.setdefault(oid, set()).update(slots)
                 tail = data[-128:]
+                time.sleep(0.001)
     return has_paint_color, has_paint_supports, paint_slots_by_obj, bool(path_to_objs)
 
 
@@ -245,6 +255,7 @@ def inspect_project(
     *,
     max_uncompressed_bytes: int = 2_000_000_000,
     include_geometry: bool = True,
+    include_model_scan: bool = True,
 ) -> ProjectInfo:
     path = Path(path)
     if not path.is_file():
@@ -289,9 +300,12 @@ def inspect_project(
                 for i in range(count)
             )
 
-            has_paint_color, has_paint_supports, paint_slots_by_obj, _ = _scan_models_paint_and_supports(
-                archive, names, len(filaments),
-            )
+            if include_model_scan:
+                has_paint_color, has_paint_supports, paint_slots_by_obj, _ = _scan_models_paint_and_supports(
+                    archive, names, len(filaments),
+                )
+            else:
+                has_paint_color, has_paint_supports, paint_slots_by_obj = False, False, {}
             object_names: list[str] = []
             object_overrides: list[ObjectOverride] = []
             plates: list[PlateInfo] = []

@@ -414,6 +414,9 @@ class MakerElegooApp(tk.Tk):
         self._inspect_generation = 0
         self._pending_scale_advices: list[Advice] = []
         self._closing = False
+        self._save_prefs_after: str | None = None
+        self._loaded_deps_key: tuple[str, str, str] | None = None
+        self._active_polls: dict[str, int] = {attr: 0 for attr in self._POLL_HANDLE_ATTRS}
         for _poll_attr in self._POLL_HANDLE_ATTRS:
             setattr(self, _poll_attr, None)
 
@@ -472,14 +475,6 @@ class MakerElegooApp(tk.Tk):
         self.scale_mode_var.trace_add("write", lambda *_: self._on_scale_mode_changed())
         self._refresh_profiles()
         self._update_context_preview()
-        self._schedule_poll("_worker_after", 150, self._poll_worker)
-        self._schedule_poll("_ai_after", 150, self._poll_ai)
-        self._schedule_poll("_professor_after", 150, self._poll_professor)
-        self._schedule_poll("_orientation_after", 150, self._poll_orientation)
-        self._schedule_poll("_comparison_after", 150, self._poll_comparison)
-        self._schedule_poll("_inspect_after", 150, self._poll_inspect)
-        self._schedule_poll("_preview_after", 100, self._poll_preview)
-        self._schedule_poll("_calib_after", 150, self._poll_calib)
 
     _POLL_HANDLE_ATTRS = (
         "_worker_after",
@@ -500,7 +495,7 @@ class MakerElegooApp(tk.Tk):
         except tk.TclError:
             return True
 
-    def _schedule_poll(self, attr_name: str, interval_ms: int, callback) -> None:
+    def _cancel_poll(self, attr_name: str) -> None:
         existing = getattr(self, attr_name, None)
         setattr(self, attr_name, None)
         if existing is not None:
@@ -508,6 +503,9 @@ class MakerElegooApp(tk.Tk):
                 self.after_cancel(existing)
             except tk.TclError:
                 pass
+
+    def _schedule_poll(self, attr_name: str, interval_ms: int, callback) -> None:
+        self._cancel_poll(attr_name)
         if self._should_stop_polling():
             return
         try:
@@ -515,17 +513,69 @@ class MakerElegooApp(tk.Tk):
         except tk.TclError:
             setattr(self, attr_name, None)
 
+    def _begin_poll(self, attr_name: str, interval_ms: int, callback) -> None:
+        self._active_polls[attr_name] = self._active_polls.get(attr_name, 0) + 1
+        self._schedule_poll(attr_name, interval_ms, callback)
+
+    def _finish_poll_item(self, attr_name: str) -> None:
+        current = self._active_polls.get(attr_name, 0)
+        self._active_polls[attr_name] = max(0, current - 1)
+
+    def _continue_poll_if_active(
+        self,
+        attr_name: str,
+        interval_ms: int,
+        callback,
+        queue_obj: queue.Queue | None = None,
+    ) -> None:
+        if self._should_stop_polling():
+            self._cancel_poll(attr_name)
+            return
+        pending = self._active_polls.get(attr_name, 0) > 0
+        if not pending and queue_obj is not None:
+            pending = not queue_obj.empty()
+        if pending:
+            self._schedule_poll(attr_name, interval_ms, callback)
+        else:
+            self._cancel_poll(attr_name)
+
+    def _schedule_save_preferences(self, delay_ms: int = 250) -> None:
+        pending = getattr(self, "_save_prefs_after", None)
+        if pending is not None:
+            try:
+                self.after_cancel(pending)
+            except tk.TclError:
+                pass
+            self._save_prefs_after = None
+        if self._should_stop_polling():
+            return
+        try:
+            self._save_prefs_after = self.after(delay_ms, self._flush_scheduled_preferences)
+        except tk.TclError:
+            self._save_prefs_after = None
+
+    def _flush_scheduled_preferences(self) -> None:
+        self._save_prefs_after = None
+        if not self._should_stop_polling():
+            self._save_preferences()
+
     def destroy(self):
         self._closing = True
         self.orientation_cancel.set()
+        pending_save = getattr(self, "_save_prefs_after", None)
+        self._save_prefs_after = None
+        if pending_save is not None:
+            try:
+                self.after_cancel(pending_save)
+            except tk.TclError:
+                pass
+            try:
+                self._save_preferences()
+            except Exception:
+                pass
         for name in self._POLL_HANDLE_ATTRS:
-            callback = getattr(self, name, None)
-            setattr(self, name, None)
-            if callback is not None:
-                try:
-                    self.after_cancel(callback)
-                except tk.TclError:
-                    pass
+            self._active_polls[name] = 0
+            self._cancel_poll(name)
         super().destroy()
 
     def _build_layout(self):
@@ -562,11 +612,18 @@ class MakerElegooApp(tk.Tk):
             except tk.TclError:
                 pass
 
+        last_canvas_w = {"width": 0, "wrap": 0}
+
         def _sync_width(event):
             try:
-                if self.main_canvas.winfo_exists():
+                if not self.main_canvas.winfo_exists():
+                    return
+                if event.width != last_canvas_w["width"]:
+                    last_canvas_w["width"] = event.width
                     self.main_canvas.itemconfigure(canvas_window, width=event.width)
-                    wrap_w = max(360, event.width - 72)
+                wrap_w = max(360, event.width - 72)
+                if abs(wrap_w - last_canvas_w["wrap"]) >= 8:
+                    last_canvas_w["wrap"] = wrap_w
                     for lbl_attr in ("confidence_label", "preconversion_label", "result_banner_label"):
                         lbl = getattr(self, lbl_attr, None)
                         if lbl is not None and lbl.winfo_exists():
@@ -887,6 +944,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.comparison_queue.put((None, exc))
 
+        self._begin_poll("_comparison_after", 150, self._poll_comparison)
         threading.Thread(target=work, daemon=True).start()
 
     def _show_plate_comparison(self):
@@ -939,6 +997,7 @@ class MakerElegooApp(tk.Tk):
             except queue.Empty:
                 pass
             else:
+                self._finish_poll_item("_comparison_after")
                 if error:
                     self.status_var.set("Falha na comparação")
                     self._set_report(str(error))
@@ -954,7 +1013,7 @@ class MakerElegooApp(tk.Tk):
         except tk.TclError:
             self._comparison_after = None
             return
-        self._schedule_poll("_comparison_after", 150, self._poll_comparison)
+        self._continue_poll_if_active("_comparison_after", 150, self._poll_comparison, self.comparison_queue)
 
     def _current_goal(self) -> PrintGoal:
         raw_phys = self.physical_material_var.get().strip()
@@ -1134,16 +1193,24 @@ class MakerElegooApp(tk.Tk):
         frame = getattr(self, "section2_slots_frame", None)
         if frame is None:
             return
-        for child in frame.winfo_children():
-            child.destroy()
         if not self.project or not self.install:
-            frame.grid_remove()
+            if frame.winfo_children():
+                for child in frame.winfo_children():
+                    child.destroy()
+            if frame.winfo_manager():
+                frame.grid_remove()
             return
         active = active_filament_slots(self.project)
         has_issues = any(bool(self.slot_issue_vars.get(s) and self.slot_issue_vars[s].get()) for s in active)
         if len(active) <= 1 and not has_issues:
-            frame.grid_remove()
+            if frame.winfo_children():
+                for child in frame.winfo_children():
+                    child.destroy()
+            if frame.winfo_manager():
+                frame.grid_remove()
             return
+        for child in frame.winfo_children():
+            child.destroy()
         frame.grid()
         options = [p.name for p in self.filament_profiles]
         mat_options = tuple(self.physical_material_combo["values"]) if hasattr(self, "physical_material_combo") else ()
@@ -1381,19 +1448,23 @@ class MakerElegooApp(tk.Tk):
             return
         self._refreshing_profiles = True
         self._profiles_changed()
+        self._loaded_deps_key = None
         try:
             custom = self.preferences.get("slicer_exe")
             self.install = discover_slicer(executable=Path(custom) if custom else None)
             available = list_profiles(self.install, "machine", None)
-            nozzles = sorted({str(resolve_profile(item, self.install)["nozzle_diameter"][0])
-                              for item in available}, key=float)
+            machines_by_nozzle: dict[str, list[Profile]] = {}
+            for item in available:
+                nd = str(resolve_profile(item, self.install)["nozzle_diameter"][0])
+                machines_by_nozzle.setdefault(nd, []).append(item)
+            nozzles = sorted(machines_by_nozzle.keys(), key=float)
             if not nozzles:
                 raise ProfileError("Nenhum perfil da Centauri Carbon 2 encontrado neste computador")
             self.nozzle_combo["values"] = nozzles
             if self.nozzle_var.get() not in nozzles:
                 self.nozzle_var.set(nozzles[0])
             nozzle = self.nozzle_var.get()
-            self.machine_profiles = list_profiles(self.install, "machine", nozzle)
+            self.machine_profiles = machines_by_nozzle.get(nozzle) or list_profiles(self.install, "machine", nozzle)
             options = [profile.name for profile in self.machine_profiles]
             self.machine_combo["values"] = options
             if self.machine_var.get() not in options:
@@ -1409,6 +1480,7 @@ class MakerElegooApp(tk.Tk):
             self.machine_profiles = []
             self.process_profiles = []
             self.filament_profiles = []
+            self._loaded_deps_key = None
             self.machine_combo["values"] = ()
             self.process_combo["values"] = ()
             if hasattr(self, "missing_slicer_banner"):
@@ -1423,10 +1495,14 @@ class MakerElegooApp(tk.Tk):
         if not self.install or machine is None:
             self.process_profiles = []
             self.filament_profiles = []
+            self._loaded_deps_key = None
         else:
             nozzle = self.nozzle_var.get()
-            self.process_profiles = list_profiles(self.install, "process", nozzle, machine=machine)
-            self.filament_profiles = list_profiles(self.install, "filament", nozzle, machine=machine)
+            deps_key = (str(self.install.data_dir), nozzle, machine.name)
+            if deps_key != getattr(self, "_loaded_deps_key", None) or not self.process_profiles:
+                self.process_profiles = list_profiles(self.install, "process", nozzle, machine=machine)
+                self.filament_profiles = list_profiles(self.install, "filament", nozzle, machine=machine)
+                self._loaded_deps_key = deps_key
         options = [profile.name for profile in self.process_profiles]
         self.process_combo["values"] = options
         suggested = suggest_process(self.project.source_settings, self.process_profiles) if self.project else None
@@ -1463,7 +1539,7 @@ class MakerElegooApp(tk.Tk):
             self._orientation_close()
         try:
             src_path = Path(self.file_var.get())
-            self.project = inspect_project(src_path, include_geometry=False)
+            self.project = inspect_project(src_path, include_geometry=False, include_model_scan=False)
             self.result = None
             self.last_plan = None
             self.orientation_analysis = None
@@ -1491,19 +1567,29 @@ class MakerElegooApp(tk.Tk):
                 self.status_var.set("Projeto analisado (lendo geometria 3D...) — confirme o filamento físico")
 
                 def work_geom():
+                    scanned = None
                     geom = None
                     try:
-                        parsed = analyze_project_geometry(src_path)
-                        if parsed.triangle_count > 0:
-                            geom = parsed
+                        scanned = inspect_project(src_path, include_geometry=True, include_model_scan=True)
+                        geom = getattr(scanned, "geometry_summary", None)
+                        if geom is None:
+                            parsed = analyze_project_geometry(src_path)
+                            if parsed.triangle_count > 0:
+                                geom = parsed
                     except Exception:
-                        geom = None
-                    self.inspect_queue.put((gen, src_path, geom))
+                        try:
+                            parsed = analyze_project_geometry(src_path)
+                            if parsed.triangle_count > 0:
+                                geom = parsed
+                        except Exception:
+                            geom = None
+                    self.inspect_queue.put((gen, src_path, scanned, geom))
 
+                self._begin_poll("_inspect_after", 150, self._poll_inspect)
                 threading.Thread(target=work_geom, daemon=True).start()
             else:
                 self.status_var.set("Projeto analisado — confirme o filamento físico")
-            self._save_preferences()
+            self._schedule_save_preferences()
         except Exception as exc:
             self.project = None
             self.result_banner_var.set("")
@@ -1519,13 +1605,32 @@ class MakerElegooApp(tk.Tk):
             return
         try:
             try:
-                gen, src_path, geom = self.inspect_queue.get_nowait()
+                payload = self.inspect_queue.get_nowait()
             except queue.Empty:
                 pass
             else:
-                if (gen == self._inspect_generation and self.project is not None
-                        and self.project.path == src_path and geom is not None):
-                    self.project = replace(self.project, geometry_summary=geom)
+                self._finish_poll_item("_inspect_after")
+                if len(payload) == 4:
+                    gen, src_path, scanned, geom = payload
+                else:
+                    gen, src_path, geom = payload
+                    scanned = None
+                if gen == self._inspect_generation and self.project is not None and self.project.path == src_path:
+                    updated = self.project
+                    slots_before = updated.used_filament_slots
+                    if scanned is not None:
+                        updated = replace(
+                            updated,
+                            plates=scanned.plates or updated.plates,
+                            used_filament_slots=scanned.used_filament_slots or updated.used_filament_slots,
+                            advanced_features=scanned.advanced_features or updated.advanced_features,
+                            geometry_summary=geom if geom is not None else scanned.geometry_summary,
+                        )
+                    elif geom is not None:
+                        updated = replace(updated, geometry_summary=geom)
+                    self.project = updated
+                    if updated.used_filament_slots != slots_before:
+                        self._render_section2_slots()
                     if self.result is None:
                         self._set_report(format_project_summary(self.project))
                     self._update_context_preview()
@@ -1534,7 +1639,7 @@ class MakerElegooApp(tk.Tk):
         except tk.TclError:
             self._inspect_after = None
             return
-        self._schedule_poll("_inspect_after", 150, self._poll_inspect)
+        self._continue_poll_if_active("_inspect_after", 150, self._poll_inspect, self.inspect_queue)
 
     def _render_filaments(self):
         for child in self.filament_frame.winfo_children():
@@ -1652,6 +1757,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.orientation_queue.put((generation, "error", exc))
 
+        self._begin_poll("_orientation_after", 150, self._poll_orientation)
         threading.Thread(target=work, daemon=True).start()
 
     def _orientation_close(self):
@@ -1659,6 +1765,7 @@ class MakerElegooApp(tk.Tk):
             self.orientation_message.set("Aguarde o fatiamento da cópia terminar.")
             return
         self.orientation_cancel.set()
+        self._active_polls["_orientation_after"] = 0
         if self.orientation_dialog and self.orientation_dialog.winfo_exists():
             self.orientation_dialog.destroy()
         self.orientation_dialog = None
@@ -1702,6 +1809,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.orientation_queue.put((generation, "error", exc))
 
+        self._begin_poll("_orientation_after", 150, self._poll_orientation)
         threading.Thread(target=work, daemon=True).start()
 
     def _orientation_apply(self):
@@ -1743,6 +1851,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.orientation_queue.put((generation, "error", exc))
 
+        self._begin_poll("_orientation_after", 150, self._poll_orientation)
         threading.Thread(target=work, daemon=True).start()
 
     def _poll_orientation(self):
@@ -1753,6 +1862,8 @@ class MakerElegooApp(tk.Tk):
             try:
                 while True:
                     generation, kind, payload = self.orientation_queue.get_nowait()
+                    if kind in {"previews", "analysis", "applied", "error"}:
+                        self._finish_poll_item("_orientation_after")
                     dialog = self.orientation_dialog
                     if (generation != self.orientation_generation or not dialog or
                             not dialog.winfo_exists() or self.orientation_cancel.is_set()):
@@ -1811,7 +1922,7 @@ class MakerElegooApp(tk.Tk):
         except tk.TclError:
             self._orientation_after = None
             return
-        self._schedule_poll("_orientation_after", 150, self._poll_orientation)
+        self._continue_poll_if_active("_orientation_after", 150, self._poll_orientation, self.orientation_queue)
 
     def _configure_gemini_key(self, *, on_saved=None):
         dialog = tk.Toplevel(self)
@@ -2103,6 +2214,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.professor_queue.put((project, plan, goal, destination, model_name, None, exc))
 
+        self._begin_poll("_professor_after", 150, self._poll_professor)
         threading.Thread(target=work_ai, daemon=True).start()
 
     def _finish_professor_lookup(
@@ -2144,6 +2256,7 @@ class MakerElegooApp(tk.Tk):
             except queue.Empty:
                 pass
             else:
+                self._finish_poll_item("_professor_after")
                 self.convert_button.configure(state="normal")
                 if error:
                     if (isinstance(error, GeminiClientError)
@@ -2177,10 +2290,7 @@ class MakerElegooApp(tk.Tk):
             self._professor_after = None
             return
         finally:
-            if not self._should_stop_polling():
-                self._schedule_poll("_professor_after", 150, self._poll_professor)
-            else:
-                self._professor_after = None
+            self._continue_poll_if_active("_professor_after", 150, self._poll_professor, self.professor_queue)
 
     def _show_professor_dialog(
         self,
@@ -2637,6 +2747,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.preview_queue.put((dialog, img_lbl, legend_lbl, stats_lbl, audit_plate, neck_z, None, exc))
 
+        self._begin_poll("_preview_after", 100, self._poll_preview)
         threading.Thread(target=work_preview, daemon=True).start()
         return dialog
 
@@ -2650,6 +2761,7 @@ class MakerElegooApp(tk.Tk):
             except queue.Empty:
                 pass
             else:
+                self._finish_poll_item("_preview_after")
                 if dialog.winfo_exists():
                     if error:
                         img_lbl.configure(text="Falha ao renderizar prévia visual.")
@@ -2672,7 +2784,7 @@ class MakerElegooApp(tk.Tk):
         except tk.TclError:
             self._preview_after = None
             return
-        self._schedule_poll("_preview_after", 100, self._poll_preview)
+        self._continue_poll_if_active("_preview_after", 100, self._poll_preview, self.preview_queue)
 
     def _generate_calibration_dialog(self):
         if not self.install:
@@ -2705,6 +2817,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.calib_queue.put((dest_path, None, exc))
 
+        self._begin_poll("_calib_after", 150, self._poll_calib)
         threading.Thread(target=run_calib, daemon=True).start()
 
     def _poll_calib(self):
@@ -2717,6 +2830,7 @@ class MakerElegooApp(tk.Tk):
             except queue.Empty:
                 pass
             else:
+                self._finish_poll_item("_calib_after")
                 if error:
                     self.status_var.set("Falha ao gerar calibração")
                     messagebox.showerror("Calibração", str(error), parent=self)
@@ -2738,7 +2852,7 @@ class MakerElegooApp(tk.Tk):
         except tk.TclError:
             self._calib_after = None
             return
-        self._schedule_poll("_calib_after", 150, self._poll_calib)
+        self._continue_poll_if_active("_calib_after", 150, self._poll_calib, self.calib_queue)
 
     def _execute_conversion(self, plan: ConversionPlan, destination: str,
                             *, professor_advices: list[Advice] | tuple[Advice, ...] = ()):
@@ -2783,6 +2897,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.worker_queue.put((None, None, approved, prof_tuple, rescale_info, exc))
 
+        self._begin_poll("_worker_after", 150, self._poll_worker)
         threading.Thread(target=work, daemon=True).start()
 
     def _poll_worker(self):
@@ -2795,6 +2910,7 @@ class MakerElegooApp(tk.Tk):
             except queue.Empty:
                 pass
             else:
+                self._finish_poll_item("_worker_after")
                 self.convert_button.configure(state="normal")
                 if error:
                     self.status_var.set("Falha na conversão")
@@ -2823,7 +2939,7 @@ class MakerElegooApp(tk.Tk):
         except tk.TclError:
             self._worker_after = None
             return
-        self._schedule_poll("_worker_after", 150, self._poll_worker)
+        self._continue_poll_if_active("_worker_after", 150, self._poll_worker, self.worker_queue)
 
     def _clear_ai_approval(self):
         self.ai_approved = []
@@ -2949,6 +3065,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.ai_queue.put((None, exc))
 
+        self._begin_poll("_ai_after", 150, self._poll_ai)
         threading.Thread(target=work, daemon=True).start()
 
     def _analyze_codex(self):
@@ -3012,6 +3129,7 @@ class MakerElegooApp(tk.Tk):
                 except Exception as exc:
                     self.ai_queue.put(("codex", (), None, (), exc, (project, plan, orientation)))
 
+            self._begin_poll("_ai_after", 150, self._poll_ai)
             threading.Thread(target=work, daemon=True).start()
 
         ttk.Button(buttons, text="Autorizar envio ao Codex", command=authorize).pack(side="left")
@@ -3027,6 +3145,7 @@ class MakerElegooApp(tk.Tk):
             except queue.Empty:
                 pass
             else:
+                self._finish_poll_item("_ai_after")
                 self.ai_button.configure(state="normal")
                 if item[0] == "codex_apply":
                     _, result, plan, error = item
@@ -3064,10 +3183,7 @@ class MakerElegooApp(tk.Tk):
             self._ai_after = None
             return
         finally:
-            if not self._should_stop_polling():
-                self._schedule_poll("_ai_after", 150, self._poll_ai)
-            else:
-                self._ai_after = None
+            self._continue_poll_if_active("_ai_after", 150, self._poll_ai, self.ai_queue)
 
     def _review_codex(self, suggestions, candidate, observations):
         project, plan, orientation = self.project, self.last_plan, self.orientation_analysis
@@ -3136,6 +3252,7 @@ class MakerElegooApp(tk.Tk):
             except Exception as exc:
                 self.ai_queue.put(("codex_apply", None, plan, exc))
 
+        self._begin_poll("_ai_after", 150, self._poll_ai)
         threading.Thread(target=work, daemon=True).start()
 
     def _filter_suggestions_with_policy(

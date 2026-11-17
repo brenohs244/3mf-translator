@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from array import array
 from dataclasses import dataclass
 from pathlib import Path
@@ -134,8 +135,9 @@ def _parse_model_stream(archive: ZipFile, member_name: str, *, include_items: bo
     parser.EndElementHandler = end
     parser.StartDoctypeDeclHandler = lambda *_: (_ for _ in ()).throw(ValueError("DTD não aceito"))
     with archive.open(member_name) as stream:
-        while chunk := stream.read(1024 * 1024):
+        while chunk := stream.read(262_144):
             parser.Parse(chunk, False)
+            time.sleep(0.001)
         parser.Parse(b"", True)
     return _ParsedModel(unit=unit, meshes=meshes, components=components, items=items)
 
