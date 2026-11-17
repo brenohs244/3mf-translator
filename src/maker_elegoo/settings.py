@@ -27,6 +27,7 @@ DEFAULTS = {
     "last_physical_material": "",
     "last_material_readiness": "carregado",
     "last_profile_by_material": "{}",
+    "quote_db_path": "",
 }
 
 _VALID_READINESS = {"carregado", "planejado"}

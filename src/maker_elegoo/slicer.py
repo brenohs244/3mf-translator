@@ -30,6 +30,7 @@ class PlateValidationMetric:
     plate: int
     estimated_seconds: int | None = None
     filament_grams: float | None = None
+    slot_filament_grams: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -42,11 +43,13 @@ class ValidationResult:
     filament_grams: float | None = None
     plate_metrics: tuple[PlateValidationMetric, ...] = ()
     gcode_audit: GcodeAuditSummary | None = None
+    slot_filament_grams: tuple[float, ...] = ()
 
 
-def _gcode_metrics(path: Path) -> tuple[int | None, float | None]:
+def _gcode_plate_metrics(path: Path) -> tuple[int | None, float | None, tuple[float, ...]]:
     seconds = None
     grams = None
+    slot_grams: tuple[float, ...] = ()
     with path.open("r", encoding="utf-8", errors="replace") as stream:
         for line in stream:
             if line.startswith("; estimated printing time (normal mode) ="):
@@ -59,6 +62,28 @@ def _gcode_metrics(path: Path) -> tuple[int | None, float | None]:
                     grams = float(line.partition("=")[2].strip())
                 except ValueError:
                     pass
+            elif line.startswith("; filament used [g] ="):
+                raw = line.partition("=")[2].strip()
+                parsed_slots: list[float] = []
+                valid = bool(raw)
+                for chunk in re.split(r"[,;]", raw):
+                    item = chunk.strip()
+                    if not item:
+                        continue
+                    try:
+                        parsed_slots.append(float(item))
+                    except ValueError:
+                        valid = False
+                        break
+                if valid and parsed_slots:
+                    slot_grams = tuple(parsed_slots)
+    if grams is None and slot_grams:
+        grams = round(sum(slot_grams), 4)
+    return seconds, grams, slot_grams
+
+
+def _gcode_metrics(path: Path) -> tuple[int | None, float | None]:
+    seconds, grams, _ = _gcode_plate_metrics(path)
     return seconds, grams
 
 
@@ -236,14 +261,22 @@ class SlicerCLI:
                                         f"G-code ausente ou vazio nas placas: {', '.join(missing)}")
             warnings = tuple(line for line in (result.stderr or "").splitlines()
                              if "warning" in line.lower() or "aviso" in line.lower())
-            metrics = [_gcode_metrics(path) for path in gcodes]
+            metrics = [_gcode_plate_metrics(path) for path in gcodes]
             audits = tuple(audit_gcode_file(path, plate=index) for index, path in enumerate(gcodes, 1))
             plate_metrics = tuple(
-                PlateValidationMetric(index, item[0], item[1])
+                PlateValidationMetric(index, item[0], item[1], item[2])
                 for index, item in enumerate(metrics, 1)
             )
             seconds = sum(item[0] for item in metrics) if all(item[0] is not None for item in metrics) else None
             grams = sum(item[1] for item in metrics) if all(item[1] is not None for item in metrics) else None
+            max_slots = max((len(item[2]) for item in metrics), default=0)
+            total_by_slot: tuple[float, ...] = ()
+            if max_slots > 0 and all(item[2] for item in metrics):
+                sums = [0.0] * max_slots
+                for item in metrics:
+                    for idx, val in enumerate(item[2]):
+                        sums[idx] += val
+                total_by_slot = tuple(round(v, 4) for v in sums)
             audit_summary = GcodeAuditSummary(plates=audits, findings=summarize_gcode_audit(audits))
             return ValidationResult(True, len(gcodes), "Todas as placas foram fatiadas",
-                                    warnings, seconds, grams, plate_metrics, audit_summary)
+                                    warnings, seconds, grams, plate_metrics, audit_summary, total_by_slot)

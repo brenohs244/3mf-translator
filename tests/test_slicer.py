@@ -166,5 +166,35 @@ class SlicerTests(unittest.TestCase):
         self.assertIn("Detalhes técnicos:", result.message)
         self.assertIn("Invalid filament configuration", result.message)
 
+    def test_validation_extracts_per_slot_filament_grams(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "multislot.3mf"
+            project.touch()
+
+            def runner(args, **kwargs):
+                output = Path(args[args.index("--outputdir") + 1])
+                (output / "plate_1.gcode").write_text(
+                    "; filament used [g] = 10.50, 4.25\n"
+                    "; total filament used [g] = 14.75\n"
+                    "; estimated printing time (normal mode) = 30m 0s\nG1 X1\n",
+                    encoding="utf-8",
+                )
+                (output / "plate_2.gcode").write_text(
+                    "; filament used [g] = 2.50, 3.75\n"
+                    "; total filament used [g] = 6.25\n"
+                    "; estimated printing time (normal mode) = 20m 0s\nG1 X2\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(args, 0, "", "")
+
+            result = SlicerCLI(Path("elegoo-slicer.exe"), runner=runner).validate(project, 2)
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.plate_metrics[0].slot_filament_grams, (10.50, 4.25))
+        self.assertEqual(result.plate_metrics[1].slot_filament_grams, (2.50, 3.75))
+        self.assertEqual(len(result.slot_filament_grams), 2)
+        self.assertAlmostEqual(result.slot_filament_grams[0], 13.00, places=2)
+        self.assertAlmostEqual(result.slot_filament_grams[1], 8.00, places=2)
+
 
 

@@ -96,3 +96,10 @@ class SettingsTests(unittest.TestCase):
             sanitized = load_settings(path)
             self.assertEqual(sanitized.get("last_material_readiness"), "carregado")
             self.assertEqual(load_material_memory(sanitized), {})
+
+    def test_persists_quote_db_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "prefs.json"
+            self.assertEqual(load_settings(path).get("quote_db_path"), "")
+            save_settings({"quote_db_path": "D:/Orcamentos/elegoo.db"}, path)
+            self.assertEqual(load_settings(path).get("quote_db_path"), "D:/Orcamentos/elegoo.db")
