@@ -24,7 +24,12 @@ DEFAULTS = {
     "ai_model": "gemini-3.8-flash",
     "update_repo": "brenohs244/3mf-translator",
     "auto_check_updates": "0",
+    "last_physical_material": "",
+    "last_material_readiness": "carregado",
+    "last_profile_by_material": "{}",
 }
+
+_VALID_READINESS = {"carregado", "planejado"}
 
 
 def _valid_nozzle(value: str) -> bool:
@@ -57,7 +62,42 @@ def load_settings(path: Path | None = None) -> dict:
             result[key] = raw[key]
     if not _valid_nozzle(result["nozzle"]):
         result["nozzle"] = "0.4"
+    if result["last_material_readiness"] not in _VALID_READINESS:
+        result["last_material_readiness"] = "carregado"
     return result
+
+
+def load_material_memory(settings: dict) -> dict[str, str]:
+    """Lê com segurança o mapa {material_label: perfil_preferido} das preferências."""
+    raw = settings.get("last_profile_by_material", "{}") if isinstance(settings, dict) else "{}"
+    if isinstance(raw, dict):
+        parsed = raw
+    elif isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+    else:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for k, v in parsed.items():
+        ks = str(k).strip()
+        vs = str(v).strip()
+        if ks and vs:
+            cleaned[ks] = vs
+    return cleaned
+
+
+def save_material_memory(mapping: dict[str, str]) -> str:
+    """Serializa o mapa {material_label: perfil_preferido} para gravação em settings.json."""
+    cleaned = {
+        str(k).strip(): str(v).strip()
+        for k, v in (mapping or {}).items()
+        if str(k).strip() and str(v).strip()
+    }
+    return json.dumps(cleaned, ensure_ascii=False, sort_keys=True)
 
 
 def save_settings(data: dict, path: Path | None = None) -> None:
@@ -66,6 +106,8 @@ def save_settings(data: dict, path: Path | None = None) -> None:
     clean = {key: str(data.get(key, default)) for key, default in DEFAULTS.items()}
     if not _valid_nozzle(clean["nozzle"]):
         clean["nozzle"] = "0.4"
+    if clean["last_material_readiness"] not in _VALID_READINESS:
+        clean["last_material_readiness"] = "carregado"
     temporary = target.with_suffix(".tmp")
     temporary.write_text(json.dumps(clean, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(target)

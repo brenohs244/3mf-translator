@@ -8,7 +8,13 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from maker_elegoo.settings import load_settings, save_settings, settings_path
+from maker_elegoo.settings import (
+    load_material_memory,
+    load_settings,
+    save_material_memory,
+    save_settings,
+    settings_path,
+)
 
 
 class SettingsTests(unittest.TestCase):
@@ -61,3 +67,32 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(updated.get("purpose"), "esforco")
             self.assertEqual(updated.get("priority"), "economia")
             self.assertEqual(updated.get("ai_model"), "gemini-3.5-flash-lite")
+
+    def test_section2_material_memory_defaults_roundtrip_and_resilience(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "prefs.json"
+            initial = load_settings(path)
+            self.assertEqual(initial.get("last_physical_material"), "")
+            self.assertEqual(initial.get("last_material_readiness"), "carregado")
+            self.assertEqual(load_material_memory(initial), {})
+
+            encoded = save_material_memory({"PLA": "ENDER PLA", "ABS": "Elegoo ABS @ECC2"})
+            save_settings({
+                "nozzle": "0.4",
+                "last_physical_material": "PLA",
+                "last_material_readiness": "planejado",
+                "last_profile_by_material": encoded,
+            }, path)
+            reloaded = load_settings(path)
+            self.assertEqual(reloaded.get("last_physical_material"), "PLA")
+            self.assertEqual(reloaded.get("last_material_readiness"), "planejado")
+            self.assertEqual(load_material_memory(reloaded), {"PLA": "ENDER PLA", "ABS": "Elegoo ABS @ECC2"})
+
+            # Valores inválidos caem nos defaults seguros
+            save_settings({
+                "last_material_readiness": "invalido",
+                "last_profile_by_material": "[1, 2, 3]",
+            }, path)
+            sanitized = load_settings(path)
+            self.assertEqual(sanitized.get("last_material_readiness"), "carregado")
+            self.assertEqual(load_material_memory(sanitized), {})

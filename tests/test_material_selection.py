@@ -191,6 +191,52 @@ class MaterialSelectionTests(unittest.TestCase):
             self.assertFalse(ok_unconf)
             self.assertTrue(any("Slot 2" in e for e in errors_unconf))
 
+    def test_preferred_profile_resolves_tie_but_never_overrides_metadata_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            install, fils = self._base_env(
+                root,
+                [
+                    ("system/Elegoo/filament/Generic/pla.json", {"name": "Elegoo PLA @ECC2", "filament_type": ["PLA"]}),
+                    ("user/u1/filament/ender.json", {"name": "ENDER PLA", "filament_type": ["PLA"]}),
+                    ("user/u1/filament/abs_cf.json", {"name": "Minha ABS-CF", "filament_type": ["ABS-CF"]}),
+                ],
+            )
+            # Sem preferência, haver perfil de usuário competindo exige escolha explícita
+            no_pref = select_material_profile(MaterialIdentity("PLA", ""), tuple(fils), install)
+            self.assertIsNone(no_pref.profile)
+            self.assertTrue(no_pref.requires_choice)
+
+            # Com preferred_profile_name="ENDER PLA" válido para PLA, pré-seleciona ENDER PLA
+            with_pref = select_material_profile(
+                MaterialIdentity("PLA", ""),
+                tuple(fils),
+                install,
+                preferred_profile_name="ENDER PLA",
+            )
+            self.assertIsNotNone(with_pref.profile)
+            self.assertEqual(with_pref.profile.name, "ENDER PLA")
+            self.assertFalse(with_pref.requires_choice)
+
+            # Nunca aceita perfil preferido de outro material ou variante (ABS-CF para ABS puro)
+            wrong_pref = select_material_profile(
+                MaterialIdentity("ABS", ""),
+                tuple(fils),
+                install,
+                preferred_profile_name="Minha ABS-CF",
+            )
+            self.assertIsNone(wrong_pref.profile)
+
+            # Perfil inexistente cai no comportamento padrão seguro
+            missing_pref = select_material_profile(
+                MaterialIdentity("PLA", ""),
+                tuple(fils),
+                install,
+                preferred_profile_name="Apagado PLA",
+            )
+            self.assertIsNone(missing_pref.profile)
+            self.assertTrue(missing_pref.requires_choice)
+
 
 if __name__ == "__main__":
     unittest.main()

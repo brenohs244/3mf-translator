@@ -216,6 +216,8 @@ def select_material_profile(
     identity: MaterialIdentity,
     profiles: Iterable[Profile],
     install: SlicerInstall,
+    *,
+    preferred_profile_name: str | None = None,
 ) -> MaterialSelection:
     """Seleciona perfil por metadados resolvidos, bloqueando variantes erradas e empates ambíguos."""
     poly = (identity.polymer or "").strip().upper()
@@ -230,6 +232,16 @@ def select_material_profile(
 
     exact = [p for p, p_ident in identities if p_ident.polymer == poly and p_ident.variant == var]
     same_poly = [(p, p_ident) for p, p_ident in identities if p_ident.polymer == poly]
+
+    if preferred_profile_name:
+        pref_clean = preferred_profile_name.strip()
+        pref_match = next((p for p in exact if p.name == pref_clean), None)
+        if pref_match is not None:
+            return MaterialSelection(
+                pref_match,
+                f"Último perfil utilizado para {norm_ident.label}: {pref_match.name}.",
+                requires_choice=False,
+            )
 
     if var and not is_known_variant(var) and not exact:
         return MaterialSelection(
