@@ -22,6 +22,8 @@ DEFAULTS = {
     "heat_exposure": "nao_sei",
     "save_print_history": "0",
     "ai_model": "gemini-3.8-flash",
+    "update_repo": "brenohs244/3mf-translator",
+    "auto_check_updates": "0",
 }
 
 

@@ -15,6 +15,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from zipfile import ZipFile
 
+from . import __version__
 from .advice_policy import HARD_POLICY_RULES, build_policy_conflict_alert, enforce_advice_policy
 from .ai import (AIError, Suggestion, apply_suggestions, build_manual_prompt,
                  parse_manual_response, suggest_equivalences)
@@ -24,7 +25,14 @@ from .converter import ConversionResult, convert_project
 from .codex_cli import run_codex
 from .codex_evidence import (build_codex_evidence,
                              validate_codex_recommendations, verify_process_recommendation)
-from .credentials import clear_gemini_key, get_gemini_key, save_gemini_key
+from .credentials import (
+    clear_gemini_key,
+    clear_github_token,
+    get_gemini_key,
+    get_github_token,
+    save_gemini_key,
+    save_github_token,
+)
 from .gcode_audit import summarize_gcode_audit
 from .geometry_check import analyze_project_geometry
 from .history import (
@@ -93,6 +101,14 @@ from .scale import RescaleResult, ScaleError, analyze_scale_risk, rescale_3mf
 from .settings import load_settings, save_settings
 from .slicer import SlicerCLI, next_available_destination
 from .teaching import build_lessons, format_lessons
+from .updater import (
+    DEFAULT_UPDATE_REPO,
+    UpdateError,
+    check_latest_release,
+    download_and_verify_installer,
+    launch_silent_installer,
+    normalize_repo,
+)
 
 
 def format_plate_color_guide(plates: tuple | list, filaments: tuple | list) -> list[str]:
@@ -406,6 +422,13 @@ class MakerElegooApp(tk.Tk):
         self.inspect_queue: queue.Queue = queue.Queue()
         self.preview_queue: queue.Queue = queue.Queue()
         self.calib_queue: queue.Queue = queue.Queue()
+        self.update_queue: queue.Queue = queue.Queue()
+        self.update_repo_var = tk.StringVar(
+            value=self.preferences.get("update_repo", DEFAULT_UPDATE_REPO) or DEFAULT_UPDATE_REPO
+        )
+        self.auto_check_updates_var = tk.BooleanVar(
+            value=self.preferences.get("auto_check_updates", "0") == "1"
+        )
         self.orientation_cancel = threading.Event()
         self.orientation_dialog: tk.Toplevel | None = None
         self.orientation_analysis: OrientationAnalysis | None = None
@@ -475,6 +498,17 @@ class MakerElegooApp(tk.Tk):
         self.scale_mode_var.trace_add("write", lambda *_: self._on_scale_mode_changed())
         self._refresh_profiles()
         self._update_context_preview()
+        self._auto_update_after: str | None = None
+        if self.auto_check_updates_var.get():
+            try:
+                self._auto_update_after = self.after(1500, self._run_auto_update_check)
+            except tk.TclError:
+                self._auto_update_after = None
+
+    def _run_auto_update_check(self):
+        self._auto_update_after = None
+        if not self._should_stop_polling():
+            self._check_updates_dialog(silent_if_current=True)
 
     _POLL_HANDLE_ATTRS = (
         "_worker_after",
@@ -485,6 +519,8 @@ class MakerElegooApp(tk.Tk):
         "_inspect_after",
         "_preview_after",
         "_calib_after",
+        "_update_after",
+        "_auto_update_after",
     )
 
     def _should_stop_polling(self) -> bool:
@@ -592,6 +628,9 @@ class MakerElegooApp(tk.Tk):
         tools_menu.add_command(label="Prévia visual: 1ª camada e overhangs", command=self._preview_layer1_dialog)
         tools_menu.add_command(label="Gerar 3MF de calibração (50 mm + folgas)", command=self._generate_calibration_dialog)
         tools_menu.add_command(label="Registrar resultado da impressão (histórico local)", command=self._open_feedback_dialog)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Verificar atualizações...", command=self._check_updates_dialog)
+        tools_menu.add_command(label="Configurar atualizações (GitHub)...", command=self._configure_updater_settings)
         menu.add_cascade(label="Ferramentas", menu=tools_menu)
         self.configure(menu=menu)
         scroll_host = ttk.Frame(self)
@@ -646,7 +685,7 @@ class MakerElegooApp(tk.Tk):
         ttk.Label(outer, text="Maker → ELEGOO", font=("Segoe UI", 18, "bold")).pack(anchor="w")
         ttk.Label(
             outer,
-            text="Traduza projetos MakerWorld para sua Centauri Carbon 2 com validação real e orientações honestas.",
+            text=f"Traduza projetos MakerWorld para sua Centauri Carbon 2 com validação real e orientações honestas (v{__version__}).",
             wraplength=860,
         ).pack(anchor="w", pady=(2, 4))
         ttk.Label(
@@ -1435,6 +1474,8 @@ class MakerElegooApp(tk.Tk):
             "heat_exposure": heat_exposure_code(self.heat_exposure_var.get()),
             "save_print_history": "1" if self.save_history_var.get() else "0",
             "ai_model": self.ai_model_var.get(),
+            "update_repo": self.update_repo_var.get().strip() or DEFAULT_UPDATE_REPO,
+            "auto_check_updates": "1" if self.auto_check_updates_var.get() else "0",
         })
 
     def _choose_slicer(self):
@@ -2009,6 +2050,153 @@ class MakerElegooApp(tk.Tk):
         test_btn.pack(side="left", padx=(0, 8))
         ttk.Button(btn_box, text="Remover Chave", command=clear).pack(side="left", padx=(0, 8))
         ttk.Button(btn_box, text="Fechar", command=dialog.destroy).pack(side="right")
+
+    def _configure_updater_settings(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Configurar Atualizações (GitHub Releases)")
+        dialog.geometry("560x320")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=f"Versão instalada: v{__version__}",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="Repositório GitHub (padrão ou repositório público dedicado a Releases):",
+        ).pack(anchor="w", pady=(10, 2))
+        repo_var = tk.StringVar(value=self.update_repo_var.get() or DEFAULT_UPDATE_REPO)
+        ttk.Entry(frame, textvariable=repo_var).pack(fill="x", pady=(0, 8))
+
+        current_tok = get_github_token()
+        tok_status = "Token GitHub salvo (DPAPI)." if current_tok else "Nenhum token salvo (use apenas se o repo de Releases for privado)."
+        tok_lbl = ttk.Label(frame, text=tok_status, foreground="green" if current_tok else "#555555", wraplength=510)
+        tok_lbl.pack(anchor="w", pady=(2, 4))
+        tok_var = tk.StringVar(value=current_tok or "")
+        ttk.Entry(frame, textvariable=tok_var, show="*").pack(fill="x", pady=(0, 8))
+
+        auto_var = tk.BooleanVar(value=self.auto_check_updates_var.get())
+        ttk.Checkbutton(
+            frame,
+            text="Verificar atualizações ao iniciar (consulta somente leitura no GitHub Releases)",
+            variable=auto_var,
+        ).pack(anchor="w", pady=(2, 12))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+
+        def save_upd():
+            try:
+                clean_repo = normalize_repo(repo_var.get())
+            except UpdateError as exc:
+                messagebox.showerror("Repositório inválido", str(exc), parent=dialog)
+                return
+            self.update_repo_var.set(clean_repo)
+            self.auto_check_updates_var.set(auto_var.get())
+            tok = tok_var.get().strip()
+            if tok:
+                save_github_token(tok)
+            self._save_preferences()
+            messagebox.showinfo("Atualizações", "Configurações salvas.", parent=dialog)
+            dialog.destroy()
+
+        def clear_tok():
+            clear_github_token()
+            tok_var.set("")
+            tok_lbl.configure(text="Token removido.", foreground="gray")
+
+        ttk.Button(btns, text="Salvar", command=save_upd).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Remover Token", command=clear_tok).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Verificar agora", command=lambda: (save_upd(), self._check_updates_dialog())).pack(side="left")
+        ttk.Button(btns, text="Fechar", command=dialog.destroy).pack(side="right")
+
+    def _check_updates_dialog(self, *, silent_if_current: bool = False):
+        repo = (self.update_repo_var.get() or DEFAULT_UPDATE_REPO).strip()
+        token = get_github_token(include_gh_cli=True)
+        if not silent_if_current:
+            self.status_var.set(f"Verificando atualizações em {repo}...")
+
+        def work_check():
+            try:
+                res = check_latest_release(repo, current_version=__version__, token=token)
+                self.update_queue.put(("check", silent_if_current, repo, token, res, None))
+            except Exception as exc:
+                self.update_queue.put(("check", silent_if_current, repo, token, None, exc))
+
+        self._begin_poll("_update_after", 150, self._poll_update)
+        threading.Thread(target=work_check, daemon=True).start()
+
+    def _start_update_download(self, release, token: str | None):
+        self.status_var.set(f"Baixando e validando SHA-256 de v{release.version}...")
+
+        def work_dl():
+            try:
+                dest_dir = Path(tempfile.gettempdir()) / "MakerElegooUpdate"
+                installer_path = download_and_verify_installer(release, dest_dir, token=token)
+                self.update_queue.put(("downloaded", False, release, token, installer_path, None))
+            except Exception as exc:
+                self.update_queue.put(("downloaded", False, release, token, None, exc))
+
+        self._begin_poll("_update_after", 150, self._poll_update)
+        threading.Thread(target=work_dl, daemon=True).start()
+
+    def _poll_update(self):
+        if self._should_stop_polling():
+            self._update_after = None
+            return
+        try:
+            try:
+                kind, silent_if_current, ctx_obj, token, payload, error = self.update_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                self._finish_poll_item("_update_after")
+                if kind == "check":
+                    if error:
+                        if not silent_if_current:
+                            self.status_var.set("Falha ao verificar atualizações")
+                            messagebox.showerror("Atualizações", str(error), parent=self)
+                    elif payload is not None and not payload.update_available:
+                        if not silent_if_current:
+                            self.status_var.set(f"Versão v{__version__} está atualizada")
+                            messagebox.showinfo(
+                                "Atualizações",
+                                f"Você já está na versão mais recente (v{payload.current_version}).",
+                                parent=self,
+                            )
+                    elif payload is not None and payload.latest is not None:
+                        rel = payload.latest
+                        self.status_var.set(f"Nova versão disponível: v{rel.version}")
+                        notes_preview = (rel.notes or "").strip()[:350]
+                        body = (
+                            f"Nova versão v{rel.version} encontrada no GitHub (instalada: v{payload.current_version}).\n\n"
+                            f"{notes_preview + chr(10) + chr(10) if notes_preview else ''}"
+                            "Deseja baixar o instalador e verificar o hash SHA-256 agora?"
+                        )
+                        if messagebox.askyesno("Atualização disponível", body, parent=self):
+                            self._start_update_download(rel, token)
+                elif kind == "downloaded":
+                    if error:
+                        self.status_var.set("Falha ao baixar ou validar atualização")
+                        messagebox.showerror("Atualização", str(error), parent=self)
+                    elif payload is not None:
+                        self.status_var.set(f"Instalador validado (SHA-256): {payload.name}")
+                        if messagebox.askyesno(
+                            "Pronto para atualizar",
+                            f"Instalador '{payload.name}' baixado e validado com SHA-256.\n\n"
+                            "Deseja fechar o aplicativo agora para instalar a atualização silenciosamente?",
+                            parent=self,
+                        ):
+                            launch_silent_installer(payload)
+                            self.destroy()
+                            return
+        except tk.TclError:
+            self._update_after = None
+            return
+        self._continue_poll_if_active("_update_after", 150, self._poll_update, self.update_queue)
 
     def _on_scale_mode_changed(self):
         if hasattr(self, "scale_value_entry"):
