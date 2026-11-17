@@ -97,6 +97,7 @@ from .professor import (
 )
 from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles, resolve_profile
 from .project import ProjectInfo, inspect_project
+from .quote_db import ensure_quote_db, quote_db_path, record_simulation
 from .scale import RescaleResult, ScaleError, analyze_scale_risk, rescale_3mf
 from .settings import load_material_memory, load_settings, save_material_memory, save_settings
 from .slicer import SlicerCLI, next_available_destination
@@ -422,7 +423,9 @@ class MakerElegooApp(tk.Tk):
         self.inspect_queue: queue.Queue = queue.Queue()
         self.preview_queue: queue.Queue = queue.Queue()
         self.calib_queue: queue.Queue = queue.Queue()
+        self.simulate_queue: queue.Queue = queue.Queue()
         self.update_queue: queue.Queue = queue.Queue()
+        self.quote_db_path_var = tk.StringVar(value=self.preferences.get("quote_db_path", ""))
         self.update_repo_var = tk.StringVar(
             value=self.preferences.get("update_repo", DEFAULT_UPDATE_REPO) or DEFAULT_UPDATE_REPO
         )
@@ -526,6 +529,7 @@ class MakerElegooApp(tk.Tk):
         "_inspect_after",
         "_preview_after",
         "_calib_after",
+        "_simulate_after",
         "_update_after",
         "_auto_update_after",
     )
@@ -634,6 +638,8 @@ class MakerElegooApp(tk.Tk):
         tools_menu.add_command(label="Comparar placas antes/depois", command=self._show_plate_comparison)
         tools_menu.add_command(label="Prévia visual: 1ª camada e overhangs", command=self._preview_layer1_dialog)
         tools_menu.add_command(label="Gerar 3MF de calibração (50 mm + folgas)", command=self._generate_calibration_dialog)
+        tools_menu.add_command(label="Simular fatiamento (registrar para orçamento)", command=self._simulate)
+        tools_menu.add_command(label="Configurar banco de orçamentos (SQLite)...", command=self._configure_quote_db_settings)
         tools_menu.add_command(label="Registrar resultado da impressão (histórico local)", command=self._open_feedback_dialog)
         tools_menu.add_separator()
         tools_menu.add_command(label="Verificar atualizações...", command=self._check_updates_dialog)
@@ -832,6 +838,8 @@ class MakerElegooApp(tk.Tk):
         actions.pack(fill="x", pady=(0, 8))
         self.convert_button = ttk.Button(actions, text="Traduzir para minha ELEGOO", command=self._convert)
         self.convert_button.pack(side="left")
+        self.simulate_button = ttk.Button(actions, text="Simular fatiamento", command=self._simulate)
+        self.simulate_button.pack(side="left", padx=(8, 0))
         self.open_button = ttk.Button(actions, text="Abrir no ELEGOO Slicer", command=self._open_result, state="disabled")
         self.open_button.pack(side="left", padx=(8, 0))
         self.open_folder_button = ttk.Button(actions, text="Abrir pasta", command=self._open_result_folder, state="disabled")
@@ -1728,6 +1736,7 @@ class MakerElegooApp(tk.Tk):
                 else "carregado"
             ),
             "last_profile_by_material": save_material_memory(self._last_profile_by_material),
+            "quote_db_path": self.quote_db_path_var.get().strip(),
         })
 
     def _choose_slicer(self):
@@ -2398,6 +2407,74 @@ class MakerElegooApp(tk.Tk):
         ttk.Button(btns, text="Verificar agora", command=lambda: (save_upd(), self._check_updates_dialog())).pack(side="left")
         ttk.Button(btns, text="Fechar", command=dialog.destroy).pack(side="right")
 
+    def _configure_quote_db_settings(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("Banco de Orçamentos (SQLite local)")
+        dialog.geometry("620x250")
+        dialog.transient(self)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text="Somente o botão 'Simular fatiamento' registra dados técnicos neste SQLite (modo WAL para leitura externa).",
+            wraplength=580,
+        ).pack(anchor="w")
+
+        resolved_default = str(quote_db_path(""))
+        path_var = tk.StringVar(value=self.quote_db_path_var.get().strip())
+        ttk.Label(frame, text=f"Caminho personalizado (deixe em branco para padrão: {resolved_default}):", wraplength=580).pack(
+            anchor="w", pady=(10, 2)
+        )
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(0, 10))
+        ttk.Entry(row, textvariable=path_var).pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        def pick_db():
+            chosen = filedialog.asksaveasfilename(
+                title="Selecionar arquivo SQLite de orçamentos",
+                defaultextension=".db",
+                initialfile="maker_elegoo_quotes.db",
+                filetypes=[("Banco SQLite", "*.db"), ("Todos os arquivos", "*.*")],
+                parent=dialog,
+            )
+            if chosen:
+                path_var.set(chosen)
+
+        ttk.Button(row, text="Escolher...", command=pick_db).pack(side="left")
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x", pady=(8, 0))
+
+        def save_and_init():
+            self.quote_db_path_var.set(path_var.get().strip())
+            try:
+                initialized = ensure_quote_db(self.quote_db_path_var.get().strip() or None)
+            except Exception as exc:
+                messagebox.showerror("Banco SQLite", f"Não foi possível inicializar o banco: {exc}", parent=dialog)
+                return
+            self._save_preferences()
+            messagebox.showinfo(
+                "Banco de Orçamentos",
+                f"Banco SQLite pronto em:\n{initialized}\n\n"
+                "Consulte docs/INTEGRATION_QUOTE_DB.md para ler via sistema externo.",
+                parent=dialog,
+            )
+            dialog.destroy()
+
+        def open_db_folder():
+            target_dir = quote_db_path(path_var.get().strip() or None).parent
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if hasattr(os, "startfile"):
+                os.startfile(str(target_dir))
+            else:
+                subprocess.Popen(["explorer", str(target_dir)])
+
+        ttk.Button(btns, text="Salvar e inicializar banco", command=save_and_init).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Usar padrão", command=lambda: path_var.set("")).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Abrir pasta", command=open_db_folder).pack(side="left")
+        ttk.Button(btns, text="Fechar", command=dialog.destroy).pack(side="right")
+
     def _check_updates_dialog(self, *, silent_if_current: bool = False):
         repo = (self.update_repo_var.get() or DEFAULT_UPDATE_REPO).strip()
         token = get_github_token(include_gh_cli=True)
@@ -2508,10 +2585,10 @@ class MakerElegooApp(tk.Tk):
             return num, None
         return None, num
 
-    def _convert(self):
+    def _validate_section2_and_scale(self, *, action_verb: str) -> tuple[float | None, float | None] | None:
         if not self.project:
             messagebox.showinfo("Dados incompletos", "Escolha e analise um projeto 3MF primeiro.", parent=self)
-            return
+            return None
         if not self.install:
             if messagebox.askyesno(
                 "ELEGOO Slicer não encontrado",
@@ -2519,7 +2596,7 @@ class MakerElegooApp(tk.Tk):
                 parent=self,
             ):
                 self._choose_slicer()
-            return
+            return None
         active = active_filament_slots(self.project)
         if len(active) <= 1:
             mat_label = self.physical_material_var.get().strip()
@@ -2531,8 +2608,8 @@ class MakerElegooApp(tk.Tk):
                     "Não é possível confirmar 'Não sei informar'.",
                     parent=self,
                 )
-                self.status_var.set("Selecione o filamento físico carregado antes de traduzir")
-                return
+                self.status_var.set(f"Selecione o filamento físico carregado antes de {action_verb}")
+                return None
             used_slot = active[0] if active else None
             if used_slot is not None:
                 self._refresh_slot_issue(used_slot)
@@ -2543,7 +2620,7 @@ class MakerElegooApp(tk.Tk):
                         self.slot_confirmed_vars[used_slot].set(False)
                     messagebox.showwarning("Material / Perfil Incompatível ou Ambíguo", issue, parent=self)
                     self.status_var.set(issue)
-                    return
+                    return None
             if not self.physical_filament_confirmed_var.get():
                 is_planned = self.material_readiness_var.get() == "planejado"
                 prompt_title = "Confirmar material planejado" if is_planned else "Confirmar filamento físico"
@@ -2556,8 +2633,8 @@ class MakerElegooApp(tk.Tk):
                     "Você confirma que o filamento físico carregado corresponde à seleção?"
                 )
                 if not messagebox.askyesno(prompt_title, prompt_body, parent=self):
-                    self.status_var.set("Confirme o filamento antes de traduzir")
-                    return
+                    self.status_var.set(f"Confirme o filamento antes de {action_verb}")
+                    return None
                 self.physical_filament_confirmed_var.set(True)
                 self._on_physical_filament_changed()
 
@@ -2571,28 +2648,24 @@ class MakerElegooApp(tk.Tk):
                 parent=self,
             )
             self.status_var.set(mat_errors[0])
-            return
+            return None
         self._record_section2_memory_from_active()
         try:
-            scale_percent, target_height_mm = self._parse_scale_request()
+            return self._parse_scale_request()
         except ScaleError as exc:
             messagebox.showerror("Escala inválida", str(exc))
-            return
-        destination = filedialog.asksaveasfilename(title="Salvar projeto ELEGOO", defaultextension=".3mf",
-                                                    initialfile=self.project.path.stem + "_ELEGOO.3mf",
-                                                    initialdir=str(self.project.path.parent),
-                                                    filetypes=[("Projeto 3MF", "*.3mf")])
-        if not destination:
-            return
-        resolved_dest = _resolve_existing_destination(Path(destination), parent=self)
-        if resolved_dest is None:
-            return
-        destination = str(resolved_dest)
+            return None
+
+    def _build_plan_with_scale_advices(
+        self,
+        scale_percent: float | None,
+        target_height_mm: float | None,
+    ) -> tuple[ConversionPlan, PrintGoal, list[Advice]] | None:
         try:
             machine, process, filaments = self._selected_profiles()
         except (IndexError, StopIteration):
             messagebox.showerror("Perfil ausente", "Escolha um processo e um perfil para cada filamento.")
-            return
+            return None
 
         plan = self._build_current_plan(machine, process, filaments)
         goal = self._current_goal()
@@ -2608,7 +2681,7 @@ class MakerElegooApp(tk.Tk):
                                               nozzle_mm=nozzle, purpose=goal.purpose)
                 except ScaleError as exc:
                     messagebox.showerror("Escala inválida", str(exc))
-                    return
+                    return None
                 for warn in risk.warnings:
                     scale_advices.append(Advice(
                         "alert", None, "", "", "", "Alerta de Redimensionamento", warn, False,
@@ -2631,7 +2704,27 @@ class MakerElegooApp(tk.Tk):
                             ))
                     except ValueError:
                         pass
+        return plan, goal, scale_advices
 
+    def _convert(self):
+        parsed_scale = self._validate_section2_and_scale(action_verb="traduzir")
+        if parsed_scale is None:
+            return
+        scale_percent, target_height_mm = parsed_scale
+        destination = filedialog.asksaveasfilename(title="Salvar projeto ELEGOO", defaultextension=".3mf",
+                                                    initialfile=self.project.path.stem + "_ELEGOO.3mf",
+                                                    initialdir=str(self.project.path.parent),
+                                                    filetypes=[("Projeto 3MF", "*.3mf")])
+        if not destination:
+            return
+        resolved_dest = _resolve_existing_destination(Path(destination), parent=self)
+        if resolved_dest is None:
+            return
+        destination = str(resolved_dest)
+        built = self._build_plan_with_scale_advices(scale_percent, target_height_mm)
+        if built is None:
+            return
+        plan, goal, scale_advices = built
         self._pending_scale_advices = scale_advices
 
         # Obter conselhos do Professor (Offline ou IA em thread separada)
@@ -3328,9 +3421,174 @@ class MakerElegooApp(tk.Tk):
             return
         self._continue_poll_if_active("_calib_after", 150, self._poll_calib, self.calib_queue)
 
+    def _slice_with_optional_scale(
+        self,
+        project: ProjectInfo,
+        install: SlicerInstall,
+        active_plan: ConversionPlan,
+        destination: Path,
+        *,
+        scale_percent: float | None,
+        target_height_mm: float | None,
+        purpose: str,
+    ) -> tuple[ConversionResult, RescaleResult | None]:
+        rescale_info = None
+        if scale_percent is not None or target_height_mm is not None:
+            with tempfile.TemporaryDirectory(prefix="maker-elegoo-scale-") as tmp_dir:
+                area = active_plan.machine_settings.get("printable_area", ["0x0", "256x0", "256x256", "0x256"])
+                height = float(str(active_plan.machine_settings.get("printable_height", "256")))
+                nozzle = float(str(active_plan.machine_settings.get("nozzle_diameter", ["0.4"])[0]))
+                scaled_path = Path(tmp_dir) / project.path.name
+                rescale_info = rescale_3mf(
+                    project.path, scaled_path,
+                    scale_percent=scale_percent, target_height_mm=target_height_mm,
+                    printable_area=area, printable_height=height,
+                    nozzle_mm=nozzle, purpose=purpose,
+                )
+                working_project = inspect_project(scaled_path, include_geometry=False)
+                result = convert_project(working_project, active_plan, destination, SlicerCLI(install.executable))
+        else:
+            result = convert_project(project, active_plan, destination, SlicerCLI(install.executable))
+        return result, rescale_info
+
+    def _simulate(self):
+        parsed_scale = self._validate_section2_and_scale(action_verb="simular")
+        if parsed_scale is None:
+            return
+        scale_percent, target_height_mm = parsed_scale
+        built = self._build_plan_with_scale_advices(scale_percent, target_height_mm)
+        if built is None:
+            return
+        plan, goal, scale_advices = built
+        advices = advise_offline(self.project, plan, goal)
+        merged = list(advices) + list(scale_advices)
+        policy = enforce_advice_policy(self.project, plan, goal, merged)
+        prof_tuple = tuple(policy.accepted)
+
+        self.simulate_button.configure(state="disabled")
+        self.convert_button.configure(state="disabled")
+        self.ai_button.configure(state="disabled")
+        self.status_var.set("Simulando fatiamento no ELEGOO Slicer (sem salvar .3mf)...")
+
+        project = self.project
+        install = self.install
+        approved = tuple(self.ai_approved)
+        slot_targets = tuple(self._collect_slot_targets())
+        readiness = self.material_readiness_var.get()
+        purpose = purpose_code(self.purpose_var.get())
+        priority = priority_code(self.priority_var.get())
+        db_override_raw = self.quote_db_path_var.get().strip()
+        db_override = Path(db_override_raw) if db_override_raw else None
+
+        def work():
+            rescale_info = None
+            sim_record = None
+            try:
+                active_plan = plan
+                if approved:
+                    approved_kept, _ = self._filter_suggestions_with_policy(project, active_plan, goal, approved)
+                    if approved_kept:
+                        active_plan = replace(
+                            active_plan,
+                            process_settings=apply_suggestions(active_plan.process_settings, list(approved_kept)),
+                        )
+                with tempfile.TemporaryDirectory(prefix="maker-elegoo-sim-") as sim_dir:
+                    temp_dest = Path(sim_dir) / f"{project.path.stem}_SIMULACAO.3mf"
+                    result, rescale_info = self._slice_with_optional_scale(
+                        project,
+                        install,
+                        active_plan,
+                        temp_dest,
+                        scale_percent=scale_percent,
+                        target_height_mm=target_height_mm,
+                        purpose=purpose,
+                    )
+                    if result.success and result.validation and result.validation.success:
+                        sim_record = record_simulation(
+                            project,
+                            active_plan,
+                            result.validation,
+                            slot_targets=slot_targets,
+                            readiness=readiness,
+                            purpose=purpose,
+                            priority=priority,
+                            scale_percent=scale_percent if scale_percent is not None else 100.0,
+                            rescale_info=rescale_info,
+                            db_path=db_override,
+                        )
+                self.simulate_queue.put((result, active_plan, goal, prof_tuple, rescale_info, sim_record, None))
+            except Exception as exc:
+                self.simulate_queue.put((None, None, goal, prof_tuple, rescale_info, None, exc))
+
+        self._begin_poll("_simulate_after", 150, self._poll_simulate)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _poll_simulate(self):
+        if self._should_stop_polling():
+            self._simulate_after = None
+            return
+        try:
+            try:
+                result, plan, goal, prof_tuple, rescale_info, sim_record, error = self.simulate_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                self._finish_poll_item("_simulate_after")
+                self.simulate_button.configure(state="normal")
+                self.convert_button.configure(state="normal")
+                self.open_button.configure(state="disabled")
+                self.open_folder_button.configure(state="disabled")
+                if error:
+                    self.status_var.set("Falha na simulação")
+                    self._set_report(str(error))
+                    self.result_banner_label.configure(foreground="#B3261E")
+                    self.result_banner_var.set(
+                        "Erro durante a simulação de fatiamento (nenhum dado gravado no banco)."
+                    )
+                elif result is None or not result.success or sim_record is None:
+                    self.status_var.set("Simulação falhou no fatiamento")
+                    if result is not None and plan is not None:
+                        self._set_report(format_conversion_report(
+                            result, plan, professor_advices=prof_tuple, rescale_info=rescale_info, goal=goal
+                        ))
+                    self.result_banner_label.configure(foreground="#B3261E")
+                    self.result_banner_var.set(
+                        "Simulação falhou no fatiamento do ELEGOO Slicer — não registrada no banco de orçamentos."
+                    )
+                else:
+                    self.result = None
+                    self.last_plan = plan
+                    header = [
+                        f"SIMULAÇÃO DE FATIAMENTO #{sim_record.simulation_id} (sem salvar .3mf)",
+                        f"Registrado no banco SQLite: {sim_record.db_path}",
+                        f"Tempo estimado total: {format_duration(sim_record.estimated_seconds)} ({sim_record.estimated_seconds} s)",
+                        f"Filamento estimado total: {sim_record.filament_grams:.2f} g",
+                        f"Placas: {sim_record.plate_count} · Slots ativos gravados: {sim_record.slot_count}",
+                        "",
+                    ]
+                    body = format_conversion_report(
+                        result, plan, professor_advices=prof_tuple, rescale_info=rescale_info, goal=goal
+                    )
+                    self._set_report("\n".join(header) + body)
+                    self.status_var.set(
+                        f"Simulação #{sim_record.simulation_id} salva: "
+                        f"{format_duration(sim_record.estimated_seconds)} · {sim_record.filament_grams:.2f} g"
+                    )
+                    self.result_banner_label.configure(foreground="#146C2E")
+                    self.result_banner_var.set(
+                        f"Simulação #{sim_record.simulation_id} registrada no banco de orçamentos: "
+                        f"{format_duration(sim_record.estimated_seconds)} · {sim_record.filament_grams:.2f} g."
+                    )
+                    self._update_context_preview()
+        except tk.TclError:
+            self._simulate_after = None
+            return
+        self._continue_poll_if_active("_simulate_after", 150, self._poll_simulate, self.simulate_queue)
+
     def _execute_conversion(self, plan: ConversionPlan, destination: str,
                             *, professor_advices: list[Advice] | tuple[Advice, ...] = ()):
         self.convert_button.configure(state="disabled")
+        self.simulate_button.configure(state="disabled")
         self.ai_button.configure(state="disabled")
         self.status_var.set("Convertendo e fatiando... pode levar alguns minutos")
         project = self.project
@@ -3351,22 +3609,15 @@ class MakerElegooApp(tk.Tk):
                 active_plan = plan
                 if approved:
                     active_plan = replace(active_plan, process_settings=apply_suggestions(active_plan.process_settings, list(approved)))
-                if scale_percent is not None or target_height_mm is not None:
-                    with tempfile.TemporaryDirectory(prefix="maker-elegoo-scale-") as tmp_dir:
-                        area = active_plan.machine_settings.get("printable_area", ["0x0", "256x0", "256x256", "0x256"])
-                        height = float(str(active_plan.machine_settings.get("printable_height", "256")))
-                        nozzle = float(str(active_plan.machine_settings.get("nozzle_diameter", ["0.4"])[0]))
-                        scaled_path = Path(tmp_dir) / project.path.name
-                        rescale_info = rescale_3mf(
-                            project.path, scaled_path,
-                            scale_percent=scale_percent, target_height_mm=target_height_mm,
-                            printable_area=area, printable_height=height,
-                            nozzle_mm=nozzle, purpose=purpose,
-                        )
-                        working_project = inspect_project(scaled_path, include_geometry=False)
-                        result = convert_project(working_project, active_plan, Path(destination), SlicerCLI(install.executable))
-                else:
-                    result = convert_project(project, active_plan, Path(destination), SlicerCLI(install.executable))
+                result, rescale_info = self._slice_with_optional_scale(
+                    project,
+                    install,
+                    active_plan,
+                    Path(destination),
+                    scale_percent=scale_percent,
+                    target_height_mm=target_height_mm,
+                    purpose=purpose,
+                )
                 self.worker_queue.put((result, active_plan, approved, prof_tuple, rescale_info, None))
             except Exception as exc:
                 self.worker_queue.put((None, None, approved, prof_tuple, rescale_info, exc))
@@ -3386,6 +3637,7 @@ class MakerElegooApp(tk.Tk):
             else:
                 self._finish_poll_item("_worker_after")
                 self.convert_button.configure(state="normal")
+                self.simulate_button.configure(state="normal")
                 if error:
                     self.status_var.set("Falha na conversão")
                     self._set_report(str(error))

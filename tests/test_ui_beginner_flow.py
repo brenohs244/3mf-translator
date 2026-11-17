@@ -943,5 +943,143 @@ class UIBeginnerFlowTests(unittest.TestCase):
                 finally:
                     app2.destroy()
 
+    def test_simulate_button_runs_headless_records_sqlite_and_convert_does_not(self):
+        import sqlite3
+        from contextlib import closing
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = _setup_fake_slicer_env(root)
+            db_file = root / "orcamentos" / "quotes.db"
+            env["MAKER_ELEGOO_QUOTE_DB"] = str(db_file)
+            src_file = root / "modelo.3mf"
+            src_file.write_bytes(b"3mf-content")
+
+            proj = ProjectInfo(
+                src_file,
+                {"printer_model": "Bambu Lab A1", "layer_height": "0.20"},
+                (FilamentInfo(1, "PLA", "#FFFFFF", "Bambu PLA"),),
+                (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+                ("Peca",),
+                (),
+                (),
+                used_filament_slots=("1",),
+            )
+
+            with patch.dict(os.environ, env):
+                app = MakerElegooApp()
+                try:
+                    self.assertTrue(hasattr(app, "simulate_button"))
+                    self.assertEqual(app.simulate_button.cget("text"), "Simular fatiamento")
+
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj):
+                        app.file_var.set(str(proj.path))
+                        app._inspect_file()
+
+                    app.physical_material_var.set("PLA")
+                    app._on_physical_filament_changed()
+                    app.confirm_all_btn.invoke()
+
+                    def _fake_convert_ok(_proj, _plan, dest, _slicer):
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(b"temp-sliced")
+                        return ConversionResult(
+                            True,
+                            dest,
+                            "Todas as placas foram fatiadas",
+                            ExportResult(True, dest, "ok"),
+                            ValidationResult(
+                                True,
+                                1,
+                                "Todas as placas foram fatiadas",
+                                (),
+                                4200,
+                                31.5,
+                                (PlateValidationMetric(1, 4200, 31.5, (31.5,)),),
+                                None,
+                                (31.5,),
+                            ),
+                            None,
+                            _proj,
+                            {},
+                            _proj.plates,
+                        )
+
+                    def _fake_convert_fail(_proj, _plan, dest, _slicer):
+                        return ConversionResult(
+                            False,
+                            dest,
+                            "Falha no fatiamento",
+                            ExportResult(True, dest, "ok"),
+                            ValidationResult(False, 0, "Falha no fatiamento"),
+                            None,
+                            _proj,
+                            {},
+                            _proj.plates,
+                        )
+
+                    # 1) Simulação bem-sucedida NÃO abre filedialog e grava 1 registro no SQLite
+                    with (
+                        patch("maker_elegoo.ui.filedialog.asksaveasfilename") as ask_save,
+                        patch("maker_elegoo.ui.convert_project", side_effect=_fake_convert_ok),
+                    ):
+                        app.simulate_button.invoke()
+                        deadline = time.monotonic() + 3.0
+                        while time.monotonic() < deadline and str(app.simulate_button.cget("state")) == "disabled":
+                            app._poll_simulate()
+                            app.update()
+                            time.sleep(0.02)
+                        ask_save.assert_not_called()
+
+                    self.assertTrue(db_file.is_file())
+                    with closing(sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True)) as conn:
+                        conn.row_factory = sqlite3.Row
+                        sims = conn.execute("SELECT * FROM v_simulations_summary").fetchall()
+                        slots = conn.execute("SELECT * FROM simulation_slots").fetchall()
+                    self.assertEqual(len(sims), 1)
+                    self.assertEqual(sims[0]["project_name"], "modelo.3mf")
+                    self.assertEqual(sims[0]["estimated_seconds"], 4200)
+                    self.assertAlmostEqual(sims[0]["filament_grams"], 31.5)
+                    self.assertEqual(sims[0]["materials_summary"], "PLA")
+                    self.assertEqual(slots[0]["profile_name"], "Elegoo PLA @ECC2")
+                    self.assertIn("Simulação", app.result_banner_var.get())
+
+                    # 2) Simulação com falha NÃO grava novo registro no SQLite
+                    with (
+                        patch("maker_elegoo.ui.convert_project", side_effect=_fake_convert_fail),
+                        patch("maker_elegoo.ui.messagebox.showwarning"),
+                    ):
+                        app.simulate_button.invoke()
+                        deadline = time.monotonic() + 3.0
+                        while time.monotonic() < deadline and str(app.simulate_button.cget("state")) == "disabled":
+                            app._poll_simulate()
+                            app.update()
+                            time.sleep(0.02)
+
+                    with closing(sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True)) as conn:
+                        count_after_fail = conn.execute("SELECT COUNT(*) FROM simulations").fetchone()[0]
+                    self.assertEqual(count_after_fail, 1)
+
+                    # 3) Conversão normal ('Traduzir para minha ELEGOO') NÃO grava no banco de simulações
+                    out_file = root / "modelo_ELEGOO.3mf"
+                    with (
+                        patch("maker_elegoo.ui.filedialog.asksaveasfilename", return_value=str(out_file)),
+                        patch("maker_elegoo.ui.convert_project", side_effect=_fake_convert_ok),
+                    ):
+                        app._convert()
+                        deadline = time.monotonic() + 3.0
+                        while time.monotonic() < deadline and str(app.convert_button.cget("state")) == "disabled":
+                            app._poll_worker()
+                            app.update()
+                            time.sleep(0.02)
+
+                    with closing(sqlite3.connect(f"file:{db_file.as_posix()}?mode=ro", uri=True)) as conn:
+                        count_after_convert = conn.execute("SELECT COUNT(*) FROM simulations").fetchone()[0]
+                    self.assertEqual(count_after_convert, 1)
+                finally:
+                    app.destroy()
+                self.assertIsNone(getattr(app, "_simulate_after", None))
+
+
 
 
