@@ -33,8 +33,14 @@ Medições executadas localmente sobre a instalação real do ELEGOO Slicer (`%A
   - Menus: `Ferramentas → Verificar atualizações...` e `Ferramentas → Configurar atualizações (GitHub)...`.
   - Aceita apenas HTTPS, valida manifesto SHA-256 antes de lançar `/VERYSILENT /NORESTART /CLOSEAPPLICATIONS`, fecha `HTTPError.close()` (0 `ResourceWarning`) e suporta Token GitHub salvo com Windows DPAPI ou repositório público dedicado a Releases.
 
-## 3. Pendências operacionais (dependem de ação do usuário no GitHub / outro PC)
+## 3. Publicação no GitHub e validação ao vivo (sem token)
 
-- [ ] Enviar commits (`git push`) e publicar a primeira Release com `.\scripts\publish_release.ps1` (atualmente `brenohs244/3mf-translator` é privado e não possui Releases publicadas).
-- [ ] Instalar `MakerElegoo-Setup-v0.2.0.exe` no PC Ryzen 5 2600X e validar fluidez de uso na máquina alvo.
-- [ ] Se optar por manter `brenohs244/3mf-translator` privado sem colocar token no outro PC, configurar um repositório público só de Releases (ou informar token read-only em `Ferramentas → Configurar atualizações (GitHub)...`).
+- [x] Tornar `brenohs244/3mf-translator` público (`isPrivate: false`), configurar `gh auth setup-git`, enviar commits (`git push` → `4f4b149`) e publicar a Release **`v0.2.0`** em `https://github.com/brenohs244/3mf-translator/releases/tag/v0.2.0`.
+- [x] Teste ao vivo do auto-updater sem token (`token=None`):
+  - `check_latest_release("brenohs244/3mf-translator", current_version="0.2.0")` → `update_available=False`;
+  - `check_latest_release("brenohs244/3mf-translator", current_version="0.1.0")` → `update_available=True` (`latest=0.2.0`);
+  - `download_and_verify_installer(...)` → baixou `MakerElegoo-Setup-v0.2.0.exe` (`13.354.347` bytes) do GitHub Releases com hash SHA-256 verificado (`4cab4aeb69e50b4eb718d6ad1d535ac2f7f6175c7be017e8267580121703251d`).
+
+## 4. Pendência operacional no segundo PC
+
+- [ ] Baixar/copiar e executar `MakerElegoo-Setup-v0.2.0.exe` no PC Ryzen 5 2600X e validar a fluidez interativa na máquina alvo (nas versões futuras, bastará clicar em `Ferramentas → Verificar atualizações...`).
