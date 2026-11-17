@@ -802,4 +802,146 @@ class UIBeginnerFlowTests(unittest.TestCase):
                 err_text = stderr_cap.read().decode("utf-8", errors="replace")
                 self.assertNotIn("invalid command name", err_text)
 
+    def test_section2_memory_restores_options_and_confirm_all_confirms_without_auto_confirm(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data_dir = root / "AppData" / "ElegooSlicer"
+            exe_dir = root / "ProgramFiles" / "ElegooSlicer"
+            exe_dir.mkdir(parents=True)
+            (exe_dir / "elegoo-slicer.exe").touch()
+            base = "Elegoo Centauri Carbon 2 0.4 nozzle"
+            for rel, payload in (
+                (
+                    "system/Elegoo/machine/ECC2/base.json",
+                    {"type": "machine", "name": base, "printer_model": "Elegoo Centauri Carbon 2", "nozzle_diameter": ["0.4"]},
+                ),
+                (
+                    "system/Elegoo/process/ECC2/std.json",
+                    {"type": "process", "name": "0.20mm Standard @Elegoo CC2 0.4 nozzle", "layer_height": "0.20", "compatible_printers": [base]},
+                ),
+                (
+                    "system/Elegoo/filament/ECC2/pla.json",
+                    {"type": "filament", "name": "Elegoo PLA @ECC2", "filament_type": ["PLA"], "filament_vendor": ["Elegoo"], "compatible_printers": [base]},
+                ),
+                (
+                    "user/default/filament/ender_pla.json",
+                    {"type": "filament", "name": "ENDER PLA", "filament_type": ["PLA"], "compatible_printers": [base]},
+                ),
+                (
+                    "system/Elegoo/filament/ECC2/abs.json",
+                    {"type": "filament", "name": "Elegoo ABS @ECC2", "filament_type": ["ABS"], "filament_vendor": ["Elegoo"], "compatible_printers": [base]},
+                ),
+            ):
+                p = data_dir / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps(payload), encoding="utf-8")
+
+            env = {
+                "APPDATA": str(root / "AppData"),
+                "ProgramFiles": str(root / "ProgramFiles"),
+                "MAKER_ELEGOO_CONFIG_DIR": str(root / "prefs"),
+            }
+            proj_single = ProjectInfo(
+                root / "single.3mf",
+                {"printer_model": "Bambu Lab A1", "layer_height": "0.20"},
+                (FilamentInfo(1, "PLA", "#FFFFFF", "Bambu PLA"),),
+                (PlateInfo(1, 1, ("1",), ("1",), ("1",)),),
+                ("Peca",),
+                (),
+                (),
+                used_filament_slots=("1",),
+            )
+            proj_multi = ProjectInfo(
+                root / "multi.3mf",
+                {"printer_model": "Bambu Lab A1", "layer_height": "0.20"},
+                (
+                    FilamentInfo(1, "PLA", "#FFFFFF", "Bambu PLA"),
+                    FilamentInfo(2, "ABS", "#000000", "Bambu ABS"),
+                ),
+                (PlateInfo(1, 2, ("1", "2"), ("1", "2"), ("1", "2")),),
+                ("Parte 1", "Parte 2"),
+                (),
+                (),
+                used_filament_slots=("1", "2"),
+            )
+
+            with patch.dict(os.environ, env):
+                # 1ª sessão: sem histórico, inicia em 'Não sei informar' e 'carregado'
+                app1 = MakerElegooApp()
+                try:
+                    self.assertEqual(app1.physical_material_var.get(), "Não sei informar")
+                    self.assertEqual(app1.material_readiness_var.get(), "carregado")
+                    self.assertTrue(hasattr(app1, "confirm_all_btn"))
+                    self.assertEqual(app1.confirm_all_btn.cget("text"), "Confirmar tudo")
+
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj_single):
+                        app1.file_var.set(str(proj_single.path))
+                        app1._inspect_file()
+
+                    # Seleciona PLA -> empate com ENDER PLA -> escolhe ENDER PLA e muda situação para planejado
+                    app1.material_readiness_var.set("planejado")
+                    app1.physical_material_var.set("PLA")
+                    app1._on_physical_filament_changed()
+                    app1.filament_vars[0].set("ENDER PLA")
+                    app1.confirm_all_btn.invoke()
+                    self.assertTrue(app1.physical_filament_confirmed_var.get())
+                    self.assertTrue(app1.slot_confirmed_vars[1].get())
+
+                    # Troca para ABS e volta para PLA: ENDER PLA deve voltar pré-selecionado automaticamente
+                    app1.physical_material_var.set("ABS")
+                    app1._on_physical_filament_changed()
+                    self.assertEqual(app1.filament_vars[0].get(), "Elegoo ABS @ECC2")
+                    app1.physical_material_var.set("PLA")
+                    app1._on_physical_filament_changed()
+                    self.assertEqual(app1.filament_vars[0].get(), "ENDER PLA")
+                    app1.confirm_all_btn.invoke()
+                finally:
+                    app1.destroy()
+
+                # 2ª sessão: reabre o app -> opções da Seção 2 já vêm pré-selecionadas, mas confirmação segue False
+                app2 = MakerElegooApp()
+                try:
+                    self.assertEqual(app2.physical_material_var.get(), "PLA")
+                    self.assertEqual(app2.material_readiness_var.get(), "planejado")
+                    self.assertFalse(app2.physical_filament_confirmed_var.get())
+
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj_single):
+                        app2.file_var.set(str(proj_single.path))
+                        app2._inspect_file()
+
+                    self.assertEqual(app2.physical_material_var.get(), "PLA")
+                    self.assertEqual(app2.material_readiness_var.get(), "planejado")
+                    self.assertEqual(app2.filament_vars[0].get(), "ENDER PLA")
+                    self.assertFalse(app2.physical_filament_confirmed_var.get())
+                    self.assertFalse(app2.slot_confirmed_vars[1].get())
+
+                    # Um clique em 'Confirmar tudo' confirma toda a Seção 2
+                    app2.confirm_all_btn.invoke()
+                    self.assertTrue(app2.physical_filament_confirmed_var.get())
+                    self.assertTrue(app2.slot_confirmed_vars[1].get())
+
+                    # Multisslot: restaura ENDER PLA no slot PLA, ABS no slot ABS, e Confirmar tudo marca todos os slots
+                    with patch("maker_elegoo.ui.inspect_project", return_value=proj_multi):
+                        app2.file_var.set(str(proj_multi.path))
+                        app2._inspect_file()
+                    self.assertEqual(app2.filament_vars[0].get(), "ENDER PLA")
+                    self.assertEqual(app2.filament_vars[1].get(), "Elegoo ABS @ECC2")
+                    self.assertFalse(app2.slot_confirmed_vars[1].get())
+                    self.assertFalse(app2.slot_confirmed_vars[2].get())
+                    app2.confirm_all_btn.invoke()
+                    self.assertTrue(app2.slot_confirmed_vars[1].get())
+                    self.assertTrue(app2.slot_confirmed_vars[2].get())
+                    self.assertTrue(app2.physical_filament_confirmed_var.get())
+
+                    # Se um slot estiver em 'Não sei informar', Confirmar tudo bloqueia sem confirmar inválido
+                    app2.slot_target_vars[2].set("Não sei informar")
+                    with patch("maker_elegoo.ui.messagebox.showwarning") as warn_spy:
+                        app2.confirm_all_btn.invoke()
+                        warn_spy.assert_called_once()
+                    self.assertFalse(app2.slot_confirmed_vars[2].get())
+                    self.assertFalse(app2.physical_filament_confirmed_var.get())
+                finally:
+                    app2.destroy()
+
+
 

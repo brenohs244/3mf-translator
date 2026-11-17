@@ -98,7 +98,7 @@ from .professor import (
 from .profiles import Profile, ProfileError, SlicerInstall, discover_slicer, list_profiles, resolve_profile
 from .project import ProjectInfo, inspect_project
 from .scale import RescaleResult, ScaleError, analyze_scale_risk, rescale_3mf
-from .settings import load_settings, save_settings
+from .settings import load_material_memory, load_settings, save_material_memory, save_settings
 from .slicer import SlicerCLI, next_available_destination
 from .teaching import build_lessons, format_lessons
 from .updater import (
@@ -444,15 +444,21 @@ class MakerElegooApp(tk.Tk):
             setattr(self, _poll_attr, None)
 
         self.file_var = tk.StringVar()
+        self._last_physical_material: str = (self.preferences.get("last_physical_material") or "").strip()
+        readiness_pref = (self.preferences.get("last_material_readiness") or "carregado").strip()
+        self._last_material_readiness: str = readiness_pref if readiness_pref in {"carregado", "planejado"} else "carregado"
+        self._last_profile_by_material: dict[str, str] = load_material_memory(self.preferences)
+        self._manual_slot_profiles: set[int] = set()
         self.nozzle_var = tk.StringVar(value=self.preferences["nozzle"])
         self.machine_var = tk.StringVar(value=self.preferences["machine"])
         self.process_var = tk.StringVar()
         self.physical_material_var = tk.StringVar(value="Não sei informar")
         self.physical_filament_confirmed_var = tk.BooleanVar(value=False)
-        self.material_readiness_var = tk.StringVar(value="carregado")
+        self.material_readiness_var = tk.StringVar(value=self._last_material_readiness)
         self.physical_confirm_text_var = tk.StringVar(
             value="Confirmo que este filamento físico está carregado (nunca presumir pelo 3MF)"
         )
+        self._sync_readiness_label()
         self.slot_target_vars: dict[int, tk.StringVar] = {}
         self.slot_confirmed_vars: dict[int, tk.BooleanVar] = {}
         self.slot_issue_vars: dict[int, tk.StringVar] = {}
@@ -497,6 +503,7 @@ class MakerElegooApp(tk.Tk):
             var.trace_add("write", lambda *_: self._on_goal_or_pref_changed())
         self.scale_mode_var.trace_add("write", lambda *_: self._on_scale_mode_changed())
         self._refresh_profiles()
+        self._restore_section2_defaults()
         self._update_context_preview()
         self._auto_update_after: str | None = None
         if self.auto_check_updates_var.get():
@@ -740,13 +747,21 @@ class MakerElegooApp(tk.Tk):
             variable=self.material_readiness_var,
             value="planejado",
         ).pack(side="left")
+        confirm_row = ttk.Frame(printer_simple)
+        confirm_row.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         self.physical_confirm_chk = ttk.Checkbutton(
-            printer_simple,
+            confirm_row,
             textvariable=self.physical_confirm_text_var,
             variable=self.physical_filament_confirmed_var,
             command=self._on_physical_filament_changed,
         )
-        self.physical_confirm_chk.grid(row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        self.physical_confirm_chk.pack(side="left")
+        self.confirm_all_btn = ttk.Button(
+            confirm_row,
+            text="Confirmar tudo",
+            command=self._confirm_all_section2,
+        )
+        self.confirm_all_btn.pack(side="left", padx=(12, 0))
         self.section2_slots_frame = ttk.Frame(printer_simple)
         self.section2_slots_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(6, 0))
         self.section2_slots_frame.columnconfigure(2, weight=1)
@@ -1111,16 +1126,8 @@ class MakerElegooApp(tk.Tk):
             )
         return targets
 
-    def _on_physical_material_var_written(self):
-        if self._programmatic_material_update:
-            return
-        self.physical_filament_confirmed_var.set(False)
-        for var in self.slot_confirmed_vars.values():
-            var.set(False)
-
-    def _on_material_readiness_changed(self):
-        mode = self.material_readiness_var.get()
-        if mode == "planejado":
+    def _sync_readiness_label(self) -> None:
+        if self.material_readiness_var.get() == "planejado":
             self.physical_confirm_text_var.set(
                 "Confirmo o material PLANEJADO acima para preparar o arquivo (ainda não carregado)"
             )
@@ -1128,10 +1135,116 @@ class MakerElegooApp(tk.Tk):
             self.physical_confirm_text_var.set(
                 "Confirmo que este filamento físico está carregado (nunca presumir pelo 3MF)"
             )
+
+    def _restore_section2_defaults(self) -> None:
+        self._programmatic_material_update = True
+        try:
+            self.material_readiness_var.set(self._last_material_readiness)
+            self._sync_readiness_label()
+            combo = getattr(self, "physical_material_combo", None)
+            valid_vals = tuple(combo["values"]) if combo is not None else ()
+            if self._last_physical_material and self._last_physical_material in valid_vals:
+                self.physical_material_var.set(self._last_physical_material)
+            else:
+                self.physical_material_var.set("Não sei informar")
+            self.physical_filament_confirmed_var.set(False)
+        finally:
+            self._programmatic_material_update = False
+
+    def _material_memory_key(self, raw_material: str) -> str:
+        raw = (raw_material or "").strip()
+        if raw in {"", "Não sei informar"}:
+            return ""
+        ident = parse_material_identity(raw)
+        if ident.polymer in {"", "DESCONHECIDO", "NAO_SEI"}:
+            return ""
+        return ident.label
+
+    def _remembered_profile_for(self, raw_material: str) -> str | None:
+        key = self._material_memory_key(raw_material)
+        if not key:
+            return None
+        return self._last_profile_by_material.get(key)
+
+    def _record_material_memory(
+        self,
+        raw_material: str,
+        profile_name: str | None = None,
+        *,
+        update_global: bool = False,
+        save: bool = True,
+    ) -> None:
+        self._last_material_readiness = (
+            self.material_readiness_var.get()
+            if self.material_readiness_var.get() in {"carregado", "planejado"}
+            else "carregado"
+        )
+        key = self._material_memory_key(raw_material)
+        if key:
+            if update_global:
+                self._last_physical_material = raw_material.strip()
+            if profile_name and profile_name.strip():
+                self._last_profile_by_material[key] = profile_name.strip()
+        if save:
+            self._save_preferences()
+
+    def _record_section2_memory_from_active(self, *, save: bool = True) -> None:
+        self._last_material_readiness = (
+            self.material_readiness_var.get()
+            if self.material_readiness_var.get() in {"carregado", "planejado"}
+            else "carregado"
+        )
+        if self.project is None:
+            raw_mat = self.physical_material_var.get().strip()
+            if self._material_memory_key(raw_mat):
+                self._last_physical_material = raw_mat
+            if save:
+                self._save_preferences()
+            return
+        active = active_filament_slots(self.project)
+        if len(active) <= 1:
+            raw_mat = self.physical_material_var.get().strip()
+            if self._material_memory_key(raw_mat):
+                self._last_physical_material = raw_mat
+        by_name = {p.name: p for p in self.filament_profiles}
+        for idx, fil in enumerate(self.project.filaments):
+            slot = fil.slot
+            if slot not in active:
+                continue
+            raw_target = self.slot_target_vars[slot].get().strip() if slot in self.slot_target_vars else ""
+            if len(active) <= 1 and raw_target in {"", "Não sei informar"}:
+                raw_target = self.physical_material_var.get().strip()
+            key = self._material_memory_key(raw_target)
+            if not key:
+                continue
+            prof_name = self.filament_vars[idx].get().strip() if idx < len(self.filament_vars) else ""
+            prof = by_name.get(prof_name)
+            if prof is not None and self.install is not None:
+                if extract_profile_material_identity(prof, self.install) == parse_material_identity(raw_target):
+                    self._last_profile_by_material[key] = prof.name
+        if save:
+            self._save_preferences()
+
+    def _on_physical_material_var_written(self):
+        if self._programmatic_material_update:
+            return
+        self._manual_slot_profiles.clear()
+        self.physical_filament_confirmed_var.set(False)
+        for var in self.slot_confirmed_vars.values():
+            var.set(False)
+
+    def _on_material_readiness_changed(self):
+        self._sync_readiness_label()
         if not self._programmatic_material_update:
+            self._last_material_readiness = (
+                self.material_readiness_var.get()
+                if self.material_readiness_var.get() in {"carregado", "planejado"}
+                else "carregado"
+            )
             self.physical_filament_confirmed_var.set(False)
             for var in self.slot_confirmed_vars.values():
                 var.set(False)
+            self._save_preferences()
             self._update_context_preview()
 
     def _apply_material_selection_for_slot(self, slot: int, raw_target: str) -> None:
@@ -1145,7 +1258,13 @@ class MakerElegooApp(tk.Tk):
             if issue_var is not None:
                 issue_var.set("")
             return
-        sel = select_material_profile(parse_material_identity(raw_target), tuple(self.filament_profiles), self.install)
+        preferred_name = self._remembered_profile_for(raw_target)
+        sel = select_material_profile(
+            parse_material_identity(raw_target),
+            tuple(self.filament_profiles),
+            self.install,
+            preferred_profile_name=preferred_name,
+        )
         self._programmatic_material_update = True
         try:
             if sel.profile is not None:
@@ -1165,6 +1284,7 @@ class MakerElegooApp(tk.Tk):
     def _on_slot_target_changed(self, slot: int):
         if self._programmatic_material_update:
             return
+        self._manual_slot_profiles.discard(slot)
         if slot in self.slot_confirmed_vars:
             self.slot_confirmed_vars[slot].set(False)
         self.physical_filament_confirmed_var.set(False)
@@ -1177,11 +1297,22 @@ class MakerElegooApp(tk.Tk):
     def _on_slot_profile_manually_changed(self, slot: int):
         if self._programmatic_material_update:
             return
+        self._manual_slot_profiles.add(slot)
         if slot in self.slot_confirmed_vars:
             self.slot_confirmed_vars[slot].set(False)
         self.physical_filament_confirmed_var.set(False)
         self._profiles_changed()
         self._refresh_slot_issue(slot)
+        issue = self.slot_issue_vars[slot].get() if slot in self.slot_issue_vars else ""
+        if not issue and self.project:
+            raw_target = self.slot_target_vars[slot].get().strip() if slot in self.slot_target_vars else ""
+            if len(active_filament_slots(self.project)) <= 1 and raw_target in {"", "Não sei informar"}:
+                raw_target = self.physical_material_var.get().strip()
+            idx = next((i for i, f in enumerate(self.project.filaments) if f.slot == slot), None)
+            if idx is not None and idx < len(self.filament_vars) and self._material_memory_key(raw_target):
+                prof_name = self.filament_vars[idx].get().strip()
+                if prof_name:
+                    self._record_material_memory(raw_target, prof_name)
         self._render_section2_slots()
         self._update_context_preview()
 
@@ -1226,7 +1357,111 @@ class MakerElegooApp(tk.Tk):
             for s in active
         )
         self.physical_filament_confirmed_var.set(all_ok)
+        if all_ok:
+            self._record_section2_memory_from_active()
         self._update_context_preview()
+
+    def _confirm_all_section2(self):
+        """Revisa e marca todas as confirmações válidas da Seção 2 em um único clique."""
+        if self.project is None:
+            raw_mat = self.physical_material_var.get().strip()
+            if raw_mat in {"", "Não sei informar"}:
+                self.physical_filament_confirmed_var.set(False)
+                self.status_var.set("Escolha o material físico antes de confirmar tudo.")
+                return
+            self.physical_filament_confirmed_var.set(True)
+            self._on_physical_filament_changed()
+            self.status_var.set("Seção 2 confirmada; agora escolha e analise um projeto 3MF.")
+            return
+
+        if not self.install:
+            self.status_var.set("Localize o ELEGOO Slicer antes de confirmar os perfis.")
+            return
+
+        active = active_filament_slots(self.project)
+        if len(active) <= 1:
+            raw_mat = self.physical_material_var.get().strip()
+            if raw_mat in {"", "Não sei informar"}:
+                self.physical_filament_confirmed_var.set(False)
+                for var in self.slot_confirmed_vars.values():
+                    var.set(False)
+                msg = "Escolha o material físico na Seção 2 antes de confirmar tudo."
+                self.status_var.set(msg)
+                messagebox.showwarning("Confirmar tudo", msg, parent=self)
+                self._render_section2_slots()
+                self._update_context_preview()
+                return
+            slot = active[0] if active else None
+            if slot is not None:
+                self._programmatic_material_update = True
+                try:
+                    if slot in self.slot_target_vars:
+                        self.slot_target_vars[slot].set(raw_mat)
+                finally:
+                    self._programmatic_material_update = False
+                idx = next((i for i, f in enumerate(self.project.filaments) if f.slot == slot), 0)
+                cur_prof = next((p for p in self.filament_profiles if p.name == self.filament_vars[idx].get()), None) if idx < len(self.filament_vars) else None
+                target_ident = parse_material_identity(raw_mat)
+                remembered = self._remembered_profile_for(raw_mat)
+                valid_cur = cur_prof is not None and extract_profile_material_identity(cur_prof, self.install) == target_ident
+                if not valid_cur or (slot not in self._manual_slot_profiles and remembered and cur_prof.name != remembered):
+                    self._apply_material_selection_for_slot(slot, raw_mat)
+                self._refresh_slot_issue(slot)
+                issue = self.slot_issue_vars[slot].get() if slot in self.slot_issue_vars else ""
+                if issue:
+                    self.physical_filament_confirmed_var.set(False)
+                    if slot in self.slot_confirmed_vars:
+                        self.slot_confirmed_vars[slot].set(False)
+                    self.status_var.set(issue)
+                    self._render_section2_slots()
+                    self._update_context_preview()
+                    messagebox.showwarning("Confirmar tudo — Perfil Pendente", issue, parent=self)
+                    return
+                if slot in self.slot_confirmed_vars:
+                    self.slot_confirmed_vars[slot].set(True)
+            self.physical_filament_confirmed_var.set(True)
+            self._record_section2_memory_from_active()
+            self._render_section2_slots()
+            self._update_context_preview()
+            self.status_var.set("Todas as confirmações da Seção 2 marcadas após revisão.")
+            return
+
+        # Multisslot: valida cada slot ativo individualmente; só confirma tudo se todos forem válidos
+        errors: list[str] = []
+        for slot in active:
+            raw_target = self.slot_target_vars[slot].get().strip() if slot in self.slot_target_vars else ""
+            if raw_target in {"", "Não sei informar"}:
+                if slot in self.slot_confirmed_vars:
+                    self.slot_confirmed_vars[slot].set(False)
+                errors.append(f"Slot {slot}: informe o material antes de confirmar.")
+                continue
+            idx = next((i for i, f in enumerate(self.project.filaments) if f.slot == slot), 0)
+            cur_prof = next((p for p in self.filament_profiles if p.name == self.filament_vars[idx].get()), None) if idx < len(self.filament_vars) else None
+            target_ident = parse_material_identity(raw_target)
+            if cur_prof is None or extract_profile_material_identity(cur_prof, self.install) != target_ident:
+                self._apply_material_selection_for_slot(slot, raw_target)
+            self._refresh_slot_issue(slot)
+            issue = self.slot_issue_vars[slot].get() if slot in self.slot_issue_vars else ""
+            if issue:
+                if slot in self.slot_confirmed_vars:
+                    self.slot_confirmed_vars[slot].set(False)
+                errors.append(issue)
+            elif slot in self.slot_confirmed_vars:
+                self.slot_confirmed_vars[slot].set(True)
+
+        all_ok = not errors and all(
+            slot in self.slot_confirmed_vars and self.slot_confirmed_vars[slot].get()
+            for slot in active
+        )
+        self.physical_filament_confirmed_var.set(all_ok)
+        self._render_section2_slots()
+        self._update_context_preview()
+        if all_ok:
+            self._record_section2_memory_from_active()
+            self.status_var.set("Todos os slots da Seção 2 confirmados após revisão.")
+        else:
+            self.status_var.set(errors[0])
+            messagebox.showwarning("Confirmar tudo — Pendências", "\n".join(errors), parent=self)
 
     def _render_section2_slots(self):
         frame = getattr(self, "section2_slots_frame", None)
@@ -1374,7 +1609,14 @@ class MakerElegooApp(tk.Tk):
                 idx = next((i for i, f in enumerate(self.project.filaments) if f.slot == slot), 0)
                 cur_prof = next((p for p in self.filament_profiles if p.name == self.filament_vars[idx].get()), None)
                 target_ident = parse_material_identity(raw_mat)
-                if cur_prof is not None and extract_profile_material_identity(cur_prof, self.install) == target_ident:
+                remembered_name = self._remembered_profile_for(raw_mat)
+                valid_cur = cur_prof is not None and extract_profile_material_identity(cur_prof, self.install) == target_ident
+                prefer_existing = valid_cur and (
+                    slot in self._manual_slot_profiles
+                    or (remembered_name is not None and cur_prof.name == remembered_name)
+                    or (remembered_name is None)
+                )
+                if prefer_existing:
                     if slot in self.slot_issue_vars:
                         self.slot_issue_vars[slot].set("")
                     if slot in self.slot_confirmed_vars:
@@ -1389,6 +1631,9 @@ class MakerElegooApp(tk.Tk):
                         self.status_var.set(issue)
                     elif slot in self.slot_confirmed_vars:
                         self.slot_confirmed_vars[slot].set(bool(self.physical_filament_confirmed_var.get()))
+        if self._material_memory_key(raw_mat):
+            if self.project is None or len(active_filament_slots(self.project)) <= 1:
+                self._record_section2_memory_from_active()
         self._render_section2_slots()
         self._update_context_preview()
 
@@ -1476,6 +1721,13 @@ class MakerElegooApp(tk.Tk):
             "ai_model": self.ai_model_var.get(),
             "update_repo": self.update_repo_var.get().strip() or DEFAULT_UPDATE_REPO,
             "auto_check_updates": "1" if self.auto_check_updates_var.get() else "0",
+            "last_physical_material": self._last_physical_material,
+            "last_material_readiness": (
+                self.material_readiness_var.get()
+                if self.material_readiness_var.get() in {"carregado", "planejado"}
+                else "carregado"
+            ),
+            "last_profile_by_material": save_material_memory(self._last_profile_by_material),
         })
 
     def _choose_slicer(self):
@@ -1586,12 +1838,20 @@ class MakerElegooApp(tk.Tk):
             self.orientation_analysis = None
             self.orientation_plan = None
             self.result_banner_var.set("")
-            # Nunca presumir filamento físico == 3MF ao analisar novo projeto
+            # Nunca auto-confirmar; restaura último material apenas para projetos de 1 slot
+            self._manual_slot_profiles.clear()
+            active_slots = active_filament_slots(self.project)
+            mat_vals = tuple(self.physical_material_combo["values"]) if hasattr(self, "physical_material_combo") else ()
+            remembered_mat = (
+                self._last_physical_material
+                if (len(active_slots) <= 1 and self._last_physical_material and self._last_physical_material in mat_vals)
+                else "Não sei informar"
+            )
             self._programmatic_material_update = True
             try:
-                self.material_readiness_var.set("carregado")
                 self.physical_filament_confirmed_var.set(False)
-                self.physical_material_var.set("Não sei informar")
+                self.physical_material_var.set(remembered_mat)
+                self._sync_readiness_label()
             finally:
                 self._programmatic_material_update = False
             self._clear_ai_approval()
@@ -1704,11 +1964,44 @@ class MakerElegooApp(tk.Tk):
                 ttk.Label(self.filament_frame, text=f"Filamento {slot}: {filament.material} {filament.color}{unused_tag}").grid(
                     row=row, column=0, sticky="w", padx=(0, 12), pady=3
                 )
-                sel = (
-                    select_material_profile(parse_material_identity(filament.material), tuple(self.filament_profiles), self.install)
-                    if self.install else None
-                )
                 is_unused = bool(used_slots and str(slot) not in used_slots)
+                parsed_src = parse_material_identity(filament.material)
+                mat_vals = tuple(self.physical_material_combo["values"]) if hasattr(self, "physical_material_combo") else ()
+                if len(active) <= 1 and slot in active:
+                    cur_phys = self.physical_material_var.get().strip()
+                    init_target = cur_phys if cur_phys and cur_phys != "Não sei informar" else "Não sei informar"
+                elif parsed_src.label in mat_vals:
+                    init_target = parsed_src.label
+                elif parsed_src.polymer != "DESCONHECIDO":
+                    init_target = parsed_src.label
+                else:
+                    init_target = "Não sei informar"
+
+                if len(active) <= 1 and slot in active and init_target == "Não sei informar":
+                    sel = (
+                        select_material_profile(
+                            parsed_src,
+                            tuple(self.filament_profiles),
+                            self.install,
+                            preferred_profile_name=self._remembered_profile_for(filament.material),
+                        )
+                        if self.install else None
+                    )
+                else:
+                    target_for_lookup = parse_material_identity(init_target) if init_target != "Não sei informar" else parsed_src
+                    pref_name = self._remembered_profile_for(
+                        init_target if init_target != "Não sei informar" else filament.material
+                    )
+                    sel = (
+                        select_material_profile(
+                            target_for_lookup,
+                            tuple(self.filament_profiles),
+                            self.install,
+                            preferred_profile_name=pref_name,
+                        )
+                        if self.install else None
+                    )
+
                 initial_name = (
                     sel.profile.name
                     if (sel and sel.profile is not None)
@@ -1722,23 +2015,15 @@ class MakerElegooApp(tk.Tk):
                 ).grid(row=row, column=1, sticky="ew", pady=3)
                 self.filament_vars.append(variable)
 
-                # Em 1 slot ativo, não presumimos pelo 3MF; em multisslot preservamos sugestão por slot sem confirmar
-                parsed_src = parse_material_identity(filament.material)
-                mat_vals = tuple(self.physical_material_combo["values"]) if hasattr(self, "physical_material_combo") else ()
-                if len(active) <= 1 and slot in active:
-                    init_target = "Não sei informar"
-                elif parsed_src.label in mat_vals:
-                    init_target = parsed_src.label
-                elif parsed_src.polymer != "DESCONHECIDO":
-                    init_target = parsed_src.label
-                else:
-                    init_target = "Não sei informar"
-
                 t_var = tk.StringVar(value=init_target)
                 t_var.trace_add("write", lambda *_, s=slot: self._on_slot_target_changed(s))
                 self.slot_target_vars[slot] = t_var
                 self.slot_confirmed_vars[slot] = tk.BooleanVar(value=False)
-                self.slot_issue_vars[slot] = tk.StringVar(value=issue_msg if slot in active and len(active) > 1 else "")
+                should_show_issue = bool(issue_msg) and (
+                    (len(active) > 1 and slot in active)
+                    or (len(active) <= 1 and slot in active and init_target != "Não sei informar")
+                )
+                self.slot_issue_vars[slot] = tk.StringVar(value=issue_msg if should_show_issue else "")
         finally:
             self._programmatic_material_update = False
         self._render_section2_slots()
@@ -2287,6 +2572,7 @@ class MakerElegooApp(tk.Tk):
             )
             self.status_var.set(mat_errors[0])
             return
+        self._record_section2_memory_from_active()
         try:
             scale_percent, target_height_mm = self._parse_scale_request()
         except ScaleError as exc:
