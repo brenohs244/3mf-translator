@@ -11,5 +11,8 @@ dist/
 *.gcode
 *.log
 *.tmp
+*.db
+*.db-wal
+*.db-shm
 PROJETOS ESTUDO/
 
